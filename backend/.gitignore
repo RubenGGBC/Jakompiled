@@ -1,1 +1,2 @@
-tests/*.wasm
+tests/**/*.wasm
+tests/**/*.o

@@ -68,7 +68,7 @@ Código: parche [`0004`](../patches/jak-project/0004-goalc-WebAssembly-backend-f
 | Elemento | En wasm |
 |---|---|
 | Memoria GOAL | `env.mem` importada; puntero GOAL `p` → `load/store (i32.wrap p)` con `offset` inmediato = `WASM_EE_MAIN_MEM_BASE` (16 MB) + campo |
-| Funciones | Exportadas con su nombre `goalc`; tipo `(i64 × n) → i64` |
+| Funciones | Exportadas con su nombre `goalc`; tipo `(i64 × 8) → i64` para todas (ver 3.3) |
 | Llamada a función | Cargar el valor del símbolo → el objeto `function` contiene el índice en `env.table` → `call_indirect` |
 | `s7`, `#t`, `#f` | Global `env.s7`; `#f` = `s7`, `#t` = `s7 + 4` (Jak 2) |
 | Símbolos | Un global importado `sym.<nombre>` con la dirección GOAL del símbolo; el valor está en `símbolo − 1` (Jak 2) |
@@ -95,7 +95,7 @@ Así queda la función recursiva `t-fact` después del optimizador:
 
 ### Validación: oráculo x86
 
-[`backend/oracle/goal_oracle.cpp`](../backend/oracle/goal_oracle.cpp) arranca el runtime nativo de OpenGOAL (kernel de Jak 2, sin ISO). Carga [`tests/basic.gc`](../backend/tests/basic.gc) con el `goalc` original (x86, sin parches) y evalúa los 71 casos de [`basic.cases`](../backend/tests/basic.cases). [`run_tests.mjs`](../backend/run_tests.mjs) ejecuta los mismos casos en wasm y compara con [`basic.oracle-x86.txt`](../backend/tests/basic.oracle-x86.txt):
+[`backend/oracle/goal_oracle.cpp`](../backend/oracle/goal_oracle.cpp) arranca el runtime nativo de OpenGOAL (kernel de Jak 2, sin ISO). Carga [`tests/unit/basic.gc`](../backend/tests/unit/basic.gc) con el `goalc` original (x86, sin parches) y evalúa los 71 casos de [`basic.cases`](../backend/tests/unit/basic.cases). [`run_tests.mjs`](../backend/run_tests.mjs) ejecuta los mismos casos en wasm y compara con [`basic.oracle-x86.txt`](../backend/tests/unit/basic.oracle-x86.txt):
 
 ```
 == comparación con x86 (goalc nativo)
@@ -106,23 +106,80 @@ Así queda la función recursiva `t-fact` después del optimizador:
 
 Los casos incluyen desbordamientos de 32 y 64 bits, desplazamientos de 63 y 64 posiciones, recursión hasta `20!`, NaN en conversiones y comparaciones, `±3e9 → int` y `-0.0 = 0.0`. El oráculo detectó un error en mis propias expectativas: había supuesto que `*` era de 64 bits.
 
-### Pendiente en la fase 3
-
-| Tarea | Estado |
-|---|---|
-| Aritmética entera, llamadas, load/store | ✅ |
-| Floats, comparaciones, control de flujo | ✅ |
-| Datos estáticos del objeto (cadenas, estructuras, pares), `IR_StaticVarAddr` | Pendiente: requiere emitir el segmento de datos junto al módulo |
-| Llamadas a funciones C del runtime (`format`, `print`...) | Pendiente: integración con el runtime web |
-| Registros `vf` → SIMD128 (`IR_VFMath*`, `IR_SplatVF`, `IR_BlendVF`...) | Pendiente |
-| Pila (`new 'stack`, `IR_GetStackAddr`, `IR_RegValAddr`), behaviors (`self`/`pp`) | Pendiente |
-| Modelo de enlace real en `klink` (instanciar el módulo al cargar el objeto) | Pendiente |
-| Suspend/resume con JSPI dentro del runtime (`-sJSPI` + pthreads) | Pendiente; coste ya medido (3.1) |
-| `asm-func` del kernel (`gkernel.gc`) escritas a mano para wasm | Pendiente |
-
 ### Reproducir
 
 ```sh
 web/build_runtime.sh                     # también compila Binaryen y goalc-wasm
 JAK_PROJECT=web/work/jak-project backend/test.sh
+```
+
+## 3.3 GOAL en wasm dentro del runtime, en el navegador
+
+> **Resultado: el primer código GOAL compilado a WebAssembly se ejecuta dentro del runtime de OpenGOAL en Chromium.** `goalc-wasm` genera un objeto GOAL normal con el módulo wasm dentro. El runtime lo carga por el IOP como un DGO más, `klink` lo enlaza, se instancia el módulo y se ejecuta su código, que llama a funciones C del runtime:
+
+```
+[jakompiled] hello: instantiating 670 byte wasm module
+[GOAL/wasm] hola desde GOAL compilado a WebAssembly
+[GOAL/wasm] (+ 2 3) = 5, (hello-fact 10) = 3628800
+[GOAL/wasm] cadena estática: "jakompiled" (suma de bytes 1056)
+[GOAL/wasm] flotante: 3.5000
+```
+
+Programa: [`backend/tests/runtime/hello.gc`](../backend/tests/runtime/hello.gc). Prueba: [`backend/test_runtime.sh`](../backend/test_runtime.sh), que lo empaqueta como `KERNEL.CGO` y arranca el runtime en Chromium headless. Después el arranque se detiene con `Kernel version mismatch`, como se espera: el objeto de prueba no es el kernel real.
+
+### Objetos GOAL para wasm
+
+El objeto `.o` conserva el formato v3 de OpenGOAL, así que `klink` lo enlaza sin cambios: estáticos, etiquetas de tipo y símbolos dentro de los datos. Lo que cambia es el contenido del "código":
+
+```
+segmento top-level                       segmento main
+┌─────────────────────────────┐          ┌─────────────────────────────┐
+│ [tipo function]             │          │ [tipo function]             │
+│ índice en tabla │ ─offset──┐│          │ índice en tabla │ 0          │  ← 8 bytes por función
+│ ...estáticos...           │ │          │ ...                         │
+│ AWJK │ tamaño │ módulo wasm◄┘          │ estáticos (cadenas, etc.)   │
+└─────────────────────────────┘          └─────────────────────────────┘
+```
+
+- **Función = 8 bytes.** El índice de su código en la tabla wasm, que rellena `__link`, y, solo en la de nivel superior, la distancia hasta el módulo incrustado.
+- **Módulo al final del segmento top-level.** Así su tamaño no desplaza nada, y se libera junto con ese segmento tras ejecutar el objeto. `goalc-wasm` hace dos pasadas: primero calcula la disposición del objeto y luego genera el wasm con esos offsets.
+- **Direcciones dentro del objeto:** `seg.main` / `seg.debug` / `seg.top-level` (importadas) + offset fijo. Las referencias a símbolos se resuelven por nombre al instanciar (`sym.<nombre>` → `intern_from_c`), sin tablas de enlace en el código.
+- **`__link`:** exportada por cada módulo. Hace `table.grow(ref.func f)` de cada función y escribe el índice en su objeto `function`.
+
+### ABI: una sola firma para todas las funciones GOAL
+
+Se cambia `(i64 × n) → i64` por **`(i64 × 8) → i64` para todas**, y el llamador rellena con ceros. En x86, llamar a una función con más o menos argumentos de los que espera funciona, porque los registros sobrantes se ignoran, y GOAL lo usa: métodos, conversiones de tipo de función y `run-function-in-process`, que siempre pasa 6. Wasm comprueba la firma exacta en cada `call_indirect` y abortaría. Los 71 casos del oráculo siguen iguales a x86 con la nueva ABI.
+
+### Llamadas entre C y GOAL
+
+- **C → GOAL** (`call_goal`, `call_goal_on_stack`, mips2c): el objeto `function` contiene un índice de tabla, que para Emscripten es un puntero a función C. Llamar a GOAL desde C es una llamada indirecta normal a `u64(*)(u64 × 8)`, sin JS ni ensamblador ([`web/asm_funcs_web.cpp`](../patches/jak-project/)).
+- **GOAL → C** (`format`, `print`, `malloc`...): en nativo, cada función C registrada lleva un stub de código máquina que salta a ella con los registros de GOAL. En wasm, `GOAL_C_FN(f)` genera por plantilla un adaptador `u64(u64 × 8)` a partir de la firma real de `f`: convierte cada argumento y extiende el resultado como en x86. Las funciones variádicas (`format`) usan `GOAL_C_STACK_FN`, que pasa los 8 argumentos como array. En nativo ambas macros son `(void*)f`, así que el código generado no cambia.
+- **517 registros convertidos** de forma mecánica en los 4 juegos (`kscheme`, `kmachine`, `ksound`).
+
+### Parches
+
+| Parche | Contenido |
+|---|---|
+| `0005` | `goalc`: objetos GOAL para wasm (stubs, estáticos, módulo incrustado, `__link`), ABI de 8 argumentos |
+| `0006` | Runtime: instanciar el código wasm al enlazar (`klink` de Jak 2), llamadas C ↔ GOAL, `GOAL_C_FN` |
+
+### Pendiente en la fase 3
+
+| Tarea | Estado |
+|---|---|
+| Aritmética, floats, control de flujo, llamadas, memoria | ✅ (3.2) |
+| Datos estáticos y enlace real en `klink` | ✅ (3.3) |
+| Llamadas a funciones C del runtime | ✅ (3.3) |
+| Registros `vf` → SIMD128 | Pendiente |
+| Pila de GOAL (`new 'stack`, `IR_GetStackAddr`), behaviors (`self`/`pp`), `arg3_is_pp` | Pendiente |
+| Compilar el kernel GOAL real (`KERNEL.CGO`: `gcommon`, `gkernel`...) con el backend | Siguiente objetivo; incluye las `asm-func` del kernel |
+| Suspend/resume con JSPI dentro del runtime | Pendiente; coste medido (3.1) |
+| Jak 1 y Jak 3 en `klink` | Pendiente (solo Jak 2 enlaza wasm) |
+
+### Reproducir
+
+```sh
+web/build_runtime.sh
+JAK_PROJECT=web/work/jak-project backend/test.sh            # tests unitarios + oráculo x86
+JAK_PROJECT=web/work/jak-project backend/test_runtime.sh    # GOAL/wasm dentro del runtime, en Chromium
 ```

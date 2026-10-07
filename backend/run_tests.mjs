@@ -11,6 +11,9 @@ const SYM_AREA = S7 + 0x1000;
 const FUNC_AREA = 0x200000;
 const HEAP = 0x300000;
 
+// todas las funciones GOAL tienen el tipo (i64 x 8) -> i64: se rellenan los argumentos con 0
+const pad8 = (args) => [...args, ...Array(8 - args.length).fill(0n)];
+
 const bytes = readFileSync(process.argv[2]);
 const module = new WebAssembly.Module(bytes);
 const memory = new WebAssembly.Memory({ initial: (EE_BASE + 128 * 1024 * 1024) / 65536, maximum: 65536 });
@@ -43,14 +46,14 @@ for (const name of exportNames) {
 
 // el código de nivel superior define las funciones y los globales en sus símbolos
 const topLevel = exportNames.find((n) => n.includes("top-level"));
-ex[topLevel]();
+ex[topLevel](...pad8([]));
 const symValue = (name) => dv.getUint32(g(symbol(name) - 1), true);
 
 // ---- utilidades
 const f32bits = (x) => { const b = new DataView(new ArrayBuffer(4)); b.setFloat32(0, x, true); return BigInt(b.getUint32(0, true)); };
 const bitsf32 = (v) => { const b = new DataView(new ArrayBuffer(4)); b.setUint32(0, Number(BigInt.asUintN(32, v)), true); return b.getFloat32(0, true); };
 const I = (x) => BigInt(x);
-const call = (name, ...args) => ex[name](...args.map((a) => (typeof a === "bigint" ? a : BigInt(a))));
+const call = (name, ...args) => ex[name](...pad8(args.map((a) => (typeof a === "bigint" ? a : BigInt(a)))));
 const f32 = Math.fround;
 
 let pass = 0, fail = 0;
@@ -118,7 +121,7 @@ if (process.argv[3]) {
     const [, fn, argText, nativeText] = m;
     const args = [...argText.matchAll(/\(the-as float #x([0-9a-f]+)\)|(-?\d+)/g)].map((a) =>
       a[1] !== undefined ? BigInt("0x" + a[1]) : BigInt(a[2]));
-    const wasm = BigInt.asIntN(64, ex[fn](...args));
+    const wasm = BigInt.asIntN(64, ex[fn](...pad8(args)));
     const native = BigInt(nativeText);
     if (wasm === native) same++;
     else {

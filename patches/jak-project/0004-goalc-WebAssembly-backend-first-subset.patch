@@ -1,7 +1,7 @@
 From 03543419775d5d66bc4838e2648267bddbb485d2 Mon Sep 17 00:00:00 2001
 From: Jakompiled <itsrufer@gmail.com>
 Date: Wed, 7 Oct 2026 15:36:48 +0000
-Subject: [PATCH 4/4] goalc: WebAssembly backend (first subset)
+Subject: [PATCH 4/6] goalc: WebAssembly backend (first subset)
 
 Translates goalc IR to wasm with Binaryen, without register allocation:
 every IRegister becomes a wasm local and basic blocks are structured by

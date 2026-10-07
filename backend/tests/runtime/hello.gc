@@ -1,0 +1,23 @@
+;;-*-Lisp-*-
+;; Fase 3: primer código GOAL compilado a wasm que corre dentro del runtime en el navegador.
+;; Se empaqueta como KERNEL.CGO: el runtime lo carga, klink lo enlaza, se instancia el módulo
+;; wasm y se ejecuta su código de nivel superior, que llama a funciones C del runtime (_format).
+;; El destino 0 de format escribe directamente en stdout.
+
+(define-extern hello-fact (function int int))
+(defun hello-fact ((n int))
+  (if (<= n 1) 1 (* n (hello-fact (+ n -1)))))
+
+(defun hello-sum-string ((s string))
+  "Suma los bytes de una cadena estática (prueba los datos estáticos del objeto)."
+  (let ((sum 0)
+        (p (-> s data)))
+    (while (nonzero? (-> p 0))
+      (+! sum (-> p 0))
+      (set! p (&-> p 1)))
+    sum))
+
+(_format 0 "[GOAL/wasm] hola desde GOAL compilado a WebAssembly~%")
+(_format 0 "[GOAL/wasm] (+ 2 3) = ~D, (hello-fact 10) = ~D~%" (+ 2 3) (hello-fact 10))
+(_format 0 "[GOAL/wasm] cadena estática: ~A (suma de bytes ~D)~%" "jakompiled" (hello-sum-string "jakompiled"))
+(_format 0 "[GOAL/wasm] flotante: ~f~%" (* 0.5 7.0))

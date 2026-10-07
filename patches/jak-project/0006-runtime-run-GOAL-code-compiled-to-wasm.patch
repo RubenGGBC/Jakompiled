@@ -1,0 +1,2319 @@
+From a1e4c095a4e7b6e139836539a52ddf3860d1939a Mon Sep 17 00:00:00 2001
+From: Jakompiled <itsrufer@gmail.com>
+Date: Wed, 7 Oct 2026 16:15:43 +0000
+Subject: [PATCH 6/6] runtime: run GOAL code compiled to wasm
+
+- klink (Jak 2) instantiates the wasm module embedded in each object and
+  runs its __link export (web/goal_wasm_link.cpp)
+- call_goal and friends call GOAL functions through the wasm table
+- C functions registered for GOAL go through GOAL_C_FN / GOAL_C_STACK_FN
+  adapters with the GOAL function type (game/kernel/common/goal_c_fn.h);
+  natively both are (void*)f, 517 registrations converted mechanically
+---
+ game/CMakeLists.txt            |   3 +-
+ game/kernel/common/goal_c_fn.h |  92 +++++++++++++++++++
+ game/kernel/jak1/kmachine.cpp  |  65 +++++++-------
+ game/kernel/jak1/kscheme.cpp   | 144 +++++++++++++++++-------------
+ game/kernel/jak1/ksound.cpp    |  13 +--
+ game/kernel/jak2/klink.cpp     |  12 +++
+ game/kernel/jak2/kmachine.cpp  | 125 +++++++++++++-------------
+ game/kernel/jak2/kscheme.cpp   | 156 +++++++++++++++++---------------
+ game/kernel/jak2/ksound.cpp    |  11 +--
+ game/kernel/jak3/kmachine.cpp  | 127 +++++++++++++-------------
+ game/kernel/jak3/kscheme.cpp   | 158 ++++++++++++++++++---------------
+ game/kernel/jak3/ksound.cpp    |  11 +--
+ game/kernel/jakx/kmachine.cpp  | 133 +++++++++++++--------------
+ game/kernel/jakx/kscheme.cpp   | 158 ++++++++++++++++++---------------
+ game/kernel/jakx/ksound.cpp    |  11 +--
+ web/CMakeLists.txt             |   2 +
+ web/asm_funcs_web.cpp          |  71 +++++++++------
+ web/goal_wasm_link.cpp         | 103 +++++++++++++++++++++
+ 18 files changed, 847 insertions(+), 548 deletions(-)
+ create mode 100644 game/kernel/common/goal_c_fn.h
+ create mode 100644 web/goal_wasm_link.cpp
+
+diff --git a/game/CMakeLists.txt b/game/CMakeLists.txt
+index c3906e12..25bcae96 100644
+--- a/game/CMakeLists.txt
++++ b/game/CMakeLists.txt
+@@ -11,7 +11,8 @@ endif()
+ 
+ if(EMSCRIPTEN)
+     # Jakompiled web: no native code to jump into, the GOAL call trampolines are stubs
+-    set(OG_ASM_FUNCS_FILE ${CMAKE_CURRENT_LIST_DIR}/../web/asm_funcs_web.cpp)
++    set(OG_ASM_FUNCS_FILE ${CMAKE_CURRENT_LIST_DIR}/../web/asm_funcs_web.cpp
++                          ${CMAKE_CURRENT_LIST_DIR}/../web/goal_wasm_link.cpp)
+ elseif(ARM64_ARCH)
+     # Add your ARM64-specific configuration or build options here
+     set(OG_ASM_FUNCS_FILE kernel/asm_funcs_arm64.s)
+diff --git a/game/kernel/common/goal_c_fn.h b/game/kernel/common/goal_c_fn.h
+new file mode 100644
+index 00000000..96c292e6
+--- /dev/null
++++ b/game/kernel/common/goal_c_fn.h
+@@ -0,0 +1,92 @@
++#pragma once
++
++/*!
++ * @file goal_c_fn.h
++ * Wrapping C functions so GOAL code can call them.
++ *
++ * Native: the GOAL function object holds a small machine code stub that jumps to the C function
++ * with the GOAL argument registers, so any C signature works. GOAL_C_FN(f) is just (void*)f.
++ *
++ * Jakompiled web: every GOAL function has the wasm type (i64 x 8) -> i64 and is called with
++ * call_indirect, which checks the exact type. GOAL_C_FN(f) is an adapter with that type, generated
++ * from f's real signature, and the function object holds its index in the wasm table.
++ */
++
++#include <cstring>
++#include <type_traits>
++#include <utility>
++
++#include "common/common_types.h"
++
++#ifdef __EMSCRIPTEN__
++namespace goal_c_fn {
++
++// A GOAL argument is a 64-bit register: C parameters take its low bytes (ints, floats, Ptr<T>...)
++template <typename T>
++T from_goal(u64 v) {
++  static_assert(sizeof(T) <= sizeof(u64) && std::is_trivially_copyable_v<T>,
++                "C functions called from GOAL take register-sized arguments");
++  T result;
++  memcpy(&result, &v, sizeof(T));
++  return result;
++}
++
++template <typename T>
++u64 to_goal(T v) {
++  if constexpr (std::is_integral_v<T> && std::is_signed_v<T>) {
++    return (u64)(s64)v;
++  } else {
++    static_assert(sizeof(T) <= sizeof(u64) && std::is_trivially_copyable_v<T>,
++                  "C functions called from GOAL return register-sized values");
++    u64 result = 0;
++    memcpy(&result, &v, sizeof(T));
++    return result;
++  }
++}
++
++template <auto F>
++struct Adapter;
++
++template <typename R, typename... A, R (*F)(A...)>
++struct Adapter<F> {
++  static_assert(sizeof...(A) <= 8, "GOAL passes at most 8 arguments");
++  template <size_t... I>
++  static u64 invoke(const u64* args, std::index_sequence<I...>) {
++    if constexpr (std::is_void_v<R>) {
++      F(from_goal<A>(args[I])...);
++      return 0;
++    } else {
++      return to_goal<R>(F(from_goal<A>(args[I])...));
++    }
++  }
++  static u64 call(u64 a0, u64 a1, u64 a2, u64 a3, u64 a4, u64 a5, u64 a6, u64 a7) {
++    const u64 args[8] = {a0, a1, a2, a3, a4, a5, a6, a7};
++    return invoke(args, std::index_sequence_for<A...>{});
++  }
++};
++
++// "stack arg" functions receive the 8 GOAL arguments as an array (varargs, e.g. format)
++template <auto F>
++struct StackAdapter;
++
++template <typename R, typename P, R (*F)(P*)>
++struct StackAdapter<F> {
++  static u64 call(u64 a0, u64 a1, u64 a2, u64 a3, u64 a4, u64 a5, u64 a6, u64 a7) {
++    u64 args[8] = {a0, a1, a2, a3, a4, a5, a6, a7};
++    if constexpr (std::is_void_v<R>) {
++      F((P*)args);
++      return 0;
++    } else {
++      return to_goal<R>(F((P*)args));
++    }
++  }
++};
++
++}  // namespace goal_c_fn
++
++#define GOAL_C_FN(f) ((void*)&goal_c_fn::Adapter<f>::call)
++#define GOAL_C_STACK_FN(f) ((void*)&goal_c_fn::StackAdapter<f>::call)
++#else
++#define GOAL_C_FN(f) ((void*)(f))
++#define GOAL_C_STACK_FN(f) ((void*)(f))
++#endif
+diff --git a/game/kernel/jak1/kmachine.cpp b/game/kernel/jak1/kmachine.cpp
+index 459a2156..7816c59c 100644
+--- a/game/kernel/jak1/kmachine.cpp
++++ b/game/kernel/jak1/kmachine.cpp
+@@ -7,6 +7,7 @@
+ #endif
+ 
+ #include "kmachine.h"
++#include "game/kernel/common/goal_c_fn.h"
+ 
+ #include <string>
+ 
+@@ -553,9 +554,9 @@ void InitMachine_PCPort() {
+   // Game specific functions
+   // Called from the game thread at each frame to tell the PC rendering code which levels to start
+   // loading. The loader internally handles locking.
+-  make_function_symbol_from_c("__pc-set-levels", (void*)pc_set_levels);
++  make_function_symbol_from_c("__pc-set-levels", GOAL_C_FN(pc_set_levels));
+ 
+-  make_function_symbol_from_c("pc-discord-rpc-update", (void*)update_discord_rpc);
++  make_function_symbol_from_c("pc-discord-rpc-update", GOAL_C_FN(update_discord_rpc));
+ 
+   // setup string constants
+   // TODO - these may be able to be moved into `init_common_pc_port_functions` but it's trickier
+@@ -576,36 +577,36 @@ void InitMachine_PCPort() {
+  * which should prepare the game engine.
+  */
+ void InitMachineScheme() {
+-  make_function_symbol_from_c("put-display-env", (void*)PutDisplayEnv);       // used in drawable
+-  make_function_symbol_from_c("syncv", (void*)sceGsSyncV);                    // used in drawable
+-  make_function_symbol_from_c("sync-path", (void*)sceGsSyncPath);             // used
+-  make_function_symbol_from_c("reset-path", (void*)sceGsResetPath);           // used in dma
+-  make_function_symbol_from_c("reset-graph", (void*)sceGsResetGraph);         // used
+-  make_function_symbol_from_c("dma-sync", (void*)sceDmaSync);                 // used
+-  make_function_symbol_from_c("gs-put-imr", (void*)sceGsPutIMR);              // unused
+-  make_function_symbol_from_c("gs-get-imr", (void*)sceGsGetIMR);              // unused
+-  make_function_symbol_from_c("gs-store-image", (void*)sceGsExecStoreImage);  // used
+-  make_function_symbol_from_c("flush-cache", (void*)FlushCache);              // used
+-  make_function_symbol_from_c("cpad-open", (void*)CPadOpen);                  // used
+-  make_function_symbol_from_c("cpad-get-data", (void*)CPadGetData);           // used
+-  make_function_symbol_from_c("install-handler", (void*)InstallHandler);      // used
+-  make_function_symbol_from_c("install-debug-handler", (void*)InstallDebugHandler);       // used
+-  make_function_symbol_from_c("file-stream-open", (void*)kopen);                          // used
+-  make_function_symbol_from_c("file-stream-close", (void*)kclose);                        // used
+-  make_function_symbol_from_c("file-stream-length", (void*)klength);                      // used
+-  make_function_symbol_from_c("file-stream-seek", (void*)kseek);                          // unused
+-  make_function_symbol_from_c("file-stream-read", (void*)kread);                          // used
+-  make_function_symbol_from_c("file-stream-write", (void*)kwrite);                        // used
+-  make_function_symbol_from_c("scf-get-language", (void*)DecodeLanguage);                 // used
+-  make_function_symbol_from_c("scf-get-time", (void*)DecodeTime);                         // used
+-  make_function_symbol_from_c("scf-get-aspect", (void*)DecodeAspect);                     // used
+-  make_function_symbol_from_c("scf-get-volume", (void*)DecodeVolume);                     // used
+-  make_function_symbol_from_c("scf-get-territory", (void*)DecodeTerritory);               // used
+-  make_function_symbol_from_c("scf-get-timeout", (void*)DecodeTimeout);                   // used
+-  make_function_symbol_from_c("scf-get-inactive-timeout", (void*)DecodeInactiveTimeout);  // used
+-  make_function_symbol_from_c("dma-to-iop", (void*)dma_to_iop);                           // unused
+-  make_function_symbol_from_c("kernel-shutdown", (void*)jak1::KernelShutdown);  // used TODO jak1
+-  make_function_symbol_from_c("aybabtu", (void*)sceCdMmode);                    // used
++  make_function_symbol_from_c("put-display-env", GOAL_C_FN(PutDisplayEnv));       // used in drawable
++  make_function_symbol_from_c("syncv", GOAL_C_FN(sceGsSyncV));                    // used in drawable
++  make_function_symbol_from_c("sync-path", GOAL_C_FN(sceGsSyncPath));             // used
++  make_function_symbol_from_c("reset-path", GOAL_C_FN(sceGsResetPath));           // used in dma
++  make_function_symbol_from_c("reset-graph", GOAL_C_FN(sceGsResetGraph));         // used
++  make_function_symbol_from_c("dma-sync", GOAL_C_FN(sceDmaSync));                 // used
++  make_function_symbol_from_c("gs-put-imr", GOAL_C_FN(sceGsPutIMR));              // unused
++  make_function_symbol_from_c("gs-get-imr", GOAL_C_FN(sceGsGetIMR));              // unused
++  make_function_symbol_from_c("gs-store-image", GOAL_C_FN(sceGsExecStoreImage));  // used
++  make_function_symbol_from_c("flush-cache", GOAL_C_FN(FlushCache));              // used
++  make_function_symbol_from_c("cpad-open", GOAL_C_FN(CPadOpen));                  // used
++  make_function_symbol_from_c("cpad-get-data", GOAL_C_FN(CPadGetData));           // used
++  make_function_symbol_from_c("install-handler", GOAL_C_FN(InstallHandler));      // used
++  make_function_symbol_from_c("install-debug-handler", GOAL_C_FN(InstallDebugHandler));       // used
++  make_function_symbol_from_c("file-stream-open", GOAL_C_FN(kopen));                          // used
++  make_function_symbol_from_c("file-stream-close", GOAL_C_FN(kclose));                        // used
++  make_function_symbol_from_c("file-stream-length", GOAL_C_FN(klength));                      // used
++  make_function_symbol_from_c("file-stream-seek", GOAL_C_FN(kseek));                          // unused
++  make_function_symbol_from_c("file-stream-read", GOAL_C_FN(kread));                          // used
++  make_function_symbol_from_c("file-stream-write", GOAL_C_FN(kwrite));                        // used
++  make_function_symbol_from_c("scf-get-language", GOAL_C_FN(DecodeLanguage));                 // used
++  make_function_symbol_from_c("scf-get-time", GOAL_C_FN(DecodeTime));                         // used
++  make_function_symbol_from_c("scf-get-aspect", GOAL_C_FN(DecodeAspect));                     // used
++  make_function_symbol_from_c("scf-get-volume", GOAL_C_FN(DecodeVolume));                     // used
++  make_function_symbol_from_c("scf-get-territory", GOAL_C_FN(DecodeTerritory));               // used
++  make_function_symbol_from_c("scf-get-timeout", GOAL_C_FN(DecodeTimeout));                   // used
++  make_function_symbol_from_c("scf-get-inactive-timeout", GOAL_C_FN(DecodeInactiveTimeout));  // used
++  make_function_symbol_from_c("dma-to-iop", GOAL_C_FN(dma_to_iop));                           // unused
++  make_function_symbol_from_c("kernel-shutdown", GOAL_C_FN(jak1::KernelShutdown));  // used TODO jak1
++  make_function_symbol_from_c("aybabtu", GOAL_C_FN(sceCdMmode));                    // used
+ 
+   InitMachine_PCPort();
+   InitSoundScheme();
+diff --git a/game/kernel/jak1/kscheme.cpp b/game/kernel/jak1/kscheme.cpp
+index 1ec481cc..77993256 100644
+--- a/game/kernel/jak1/kscheme.cpp
++++ b/game/kernel/jak1/kscheme.cpp
+@@ -1,4 +1,5 @@
+ #include "kscheme.h"
++#include "game/kernel/common/goal_c_fn.h"
+ 
+ #include <cstring>
+ 
+@@ -287,6 +288,14 @@ void _arg_call_arm64();
+ Ptr<Function> make_function_from_c_systemv(void* func, bool arg3_is_pp) {
+   auto mem = Ptr<u8>(alloc_heap_object(s7.offset + FIX_SYM_GLOBAL_HEAP,
+                                        *(s7 + FIX_SYM_FUNCTION_TYPE), 0x40, UNKNOWN_PP));
++#ifdef __EMSCRIPTEN__
++  // Jakompiled web: func is a GOAL_C_FN adapter; the function object holds its wasm
++  // table index (and a zero word, like the stubs emitted by goalc for wasm).
++  (void)arg3_is_pp;
++  mem.cast<u32>().c()[0] = (u32)(uintptr_t)func;
++  mem.cast<u32>().c()[1] = 0;
++  return mem.cast<Function>();
++#endif
+   auto f = (uint64_t)func;
+   auto target_function = (u8*)&f;
+ #ifndef __aarch64__
+@@ -426,6 +435,13 @@ Ptr<Function> make_stack_arg_function_from_c_systemv(void* func) {
+   // allocate a function object on the global heap
+   auto mem = Ptr<u8>(alloc_heap_object(s7.offset + FIX_SYM_GLOBAL_HEAP,
+                                        *(s7 + FIX_SYM_FUNCTION_TYPE), 0x40, UNKNOWN_PP));
++#ifdef __EMSCRIPTEN__
++  // Jakompiled web: func is a GOAL_C_FN adapter; the function object holds its wasm
++  // table index (and a zero word, like the stubs emitted by goalc for wasm).
++  mem.cast<u32>().c()[0] = (u32)(uintptr_t)func;
++  mem.cast<u32>().c()[1] = 0;
++  return mem.cast<Function>();
++#endif
+   auto f = (uint64_t)func;
+   auto target_function = (u8*)&f;
+ #ifndef __aarch64__
+@@ -1495,12 +1511,12 @@ s32 InitHeapAndSymbol() {
+   set_fixed_symbol(FIX_SYM_NOTHING_FUNC, "nothing", make_nothing_func().offset);
+   set_fixed_symbol(FIX_SYM_ZERO_FUNC, "zero-func", make_zero_func().offset);
+   set_fixed_symbol(FIX_SYM_ASIZE_OF_BASIC_FUNC, "asize-of-basic-func",
+-                   make_function_from_c((void*)asize_of_basic).offset);
++                   make_function_from_c(GOAL_C_FN(asize_of_basic)).offset);
+   // NOTE: this is a typo in the game too.
+   set_fixed_symbol(FIX_SYM_COPY_BASIC_FUNC, "asize-of-basic-func",
+-                   make_function_from_c((void*)copy_basic, true).offset);
++                   make_function_from_c(GOAL_C_FN(copy_basic), true).offset);
+   set_fixed_symbol(FIX_SYM_DEL_BASIC_FUNC, "delete-basic",
+-                   make_function_from_c((void*)delete_basic).offset);
++                   make_function_from_c(GOAL_C_FN(delete_basic)).offset);
+ 
+   // heap symbols
+   set_fixed_symbol(FIX_SYM_GLOBAL_HEAP, "global", kglobalheap.offset);
+@@ -1523,37 +1539,37 @@ s32 InitHeapAndSymbol() {
+   set_fixed_symbol(FIX_SYM_TOP_LEVEL, "top-level", *(s7 + FIX_SYM_NOTHING_FUNC));
+ 
+   // OBJECT type
+-  auto new_illegal_func = make_function_from_c((void*)new_illegal);
+-  auto delete_illegal_func = make_function_from_c((void*)delete_illegal);
+-  auto print_object_func = make_function_from_c((void*)print_object);
+-  auto inspect_object_func = make_function_from_c((void*)inspect_object);
++  auto new_illegal_func = make_function_from_c(GOAL_C_FN(new_illegal));
++  auto delete_illegal_func = make_function_from_c(GOAL_C_FN(delete_illegal));
++  auto print_object_func = make_function_from_c(GOAL_C_FN(print_object));
++  auto inspect_object_func = make_function_from_c(GOAL_C_FN(inspect_object));
+   set_fixed_type(FIX_SYM_OBJECT_TYPE, "object", (s7 + FIX_SYM_OBJECT_TYPE).cast<Symbol>(),
+                  pack_type_flag(9, 0, 4), print_object_func.offset, inspect_object_func.offset);
+   auto object_type = Ptr<Type>(*(s7 + FIX_SYM_OBJECT_TYPE));
+   object_type->new_method = new_illegal_func;
+   object_type->delete_method = delete_illegal_func;
+   object_type->asize_of_method.offset = *(s7 + FIX_SYM_ZERO_FUNC);
+-  auto copy_fixed_function = make_function_from_c((void*)copy_fixed);
++  auto copy_fixed_function = make_function_from_c(GOAL_C_FN(copy_fixed));
+   object_type->copy_method = copy_fixed_function;
+ 
+   // STRUCTURE type
+-  auto print_structure_func = make_function_from_c((void*)print_structure);
+-  auto inspect_structure_func = make_function_from_c((void*)inspect_structure);
++  auto print_structure_func = make_function_from_c(GOAL_C_FN(print_structure));
++  auto inspect_structure_func = make_function_from_c(GOAL_C_FN(inspect_structure));
+   set_fixed_type(FIX_SYM_STRUCTURE_TYPE, "structure", (s7 + FIX_SYM_OBJECT_TYPE).cast<Symbol>(),
+                  pack_type_flag(9, 0, 4), print_structure_func.offset,
+                  inspect_structure_func.offset);
+-  auto new_structure_func = make_function_from_c((void*)new_structure);
+-  auto delete_structure_func = make_function_from_c((void*)delete_structure);
++  auto new_structure_func = make_function_from_c(GOAL_C_FN(new_structure));
++  auto delete_structure_func = make_function_from_c(GOAL_C_FN(delete_structure));
+   auto structureType = Ptr<Type>(*(s7 + FIX_SYM_STRUCTURE_TYPE));
+   structureType->new_method = new_structure_func;
+   structureType->delete_method = delete_structure_func;
+ 
+   // BASIC type
+-  auto print_basic_func = make_function_from_c((void*)print_basic);
+-  auto inspect_basic_function = make_function_from_c((void*)inspect_basic);
++  auto print_basic_func = make_function_from_c(GOAL_C_FN(print_basic));
++  auto inspect_basic_function = make_function_from_c(GOAL_C_FN(inspect_basic));
+   set_fixed_type(FIX_SYM_BASIC_TYPE, "basic", (s7 + FIX_SYM_STRUCTURE_TYPE).cast<Symbol>(),
+                  pack_type_flag(9, 0, 4), print_basic_func.offset, inspect_basic_function.offset);
+-  auto new_basic_func = make_function_from_c((void*)new_basic, true);
++  auto new_basic_func = make_function_from_c(GOAL_C_FN(new_basic), true);
+   auto basicType = Ptr<Type>(*(s7 + FIX_SYM_BASIC_TYPE));
+   basicType->new_method = new_basic_func;
+   basicType->delete_method.offset = *(s7 + FIX_SYM_DEL_BASIC_FUNC);
+@@ -1561,8 +1577,8 @@ s32 InitHeapAndSymbol() {
+   basicType->copy_method.offset = *(s7 + FIX_SYM_COPY_BASIC_FUNC);
+ 
+   // SYMBOL type
+-  auto print_symbol_func = make_function_from_c((void*)print_symbol);
+-  auto inspect_symbol_func = make_function_from_c((void*)inspect_symbol);
++  auto print_symbol_func = make_function_from_c(GOAL_C_FN(print_symbol));
++  auto inspect_symbol_func = make_function_from_c(GOAL_C_FN(inspect_symbol));
+   set_fixed_type(FIX_SYM_SYMBOL_TYPE, "symbol", (s7 + FIX_SYM_BASIC_TYPE).cast<Symbol>(),
+                  pack_type_flag(9, 0, 8), print_symbol_func.offset, inspect_symbol_func.offset);
+   auto symbolType = Ptr<Type>(*(s7 + FIX_SYM_SYMBOL_TYPE));
+@@ -1570,35 +1586,35 @@ s32 InitHeapAndSymbol() {
+   symbolType->delete_method = delete_illegal_func;
+ 
+   // TYPE type
+-  auto print_type_func = make_function_from_c((void*)print_type);
+-  auto inspect_type_func = make_function_from_c((void*)inspect_type);
++  auto print_type_func = make_function_from_c(GOAL_C_FN(print_type));
++  auto inspect_type_func = make_function_from_c(GOAL_C_FN(inspect_type));
+   set_fixed_type(FIX_SYM_TYPE_TYPE, "type", (s7 + FIX_SYM_BASIC_TYPE).cast<Symbol>(),
+                  pack_type_flag(9, 0, 0x38), print_type_func.offset, inspect_type_func.offset);
+   auto typeType = Ptr<Type>(*(s7 + FIX_SYM_TYPE_TYPE));
+-  auto new_type_func = make_function_from_c((void*)new_type);
++  auto new_type_func = make_function_from_c(GOAL_C_FN(new_type));
+   typeType->new_method = new_type_func;
+   typeType->delete_method = delete_illegal_func;
+ 
+   // STRING type
+-  auto print_string_func = make_function_from_c((void*)print_string);
+-  auto inspect_string_func = make_function_from_c((void*)inspect_string);
++  auto print_string_func = make_function_from_c(GOAL_C_FN(print_string));
++  auto inspect_string_func = make_function_from_c(GOAL_C_FN(inspect_string));
+   set_fixed_type(FIX_SYM_STRING_TYPE, "string", (s7 + FIX_SYM_BASIC_TYPE).cast<Symbol>(),
+                  pack_type_flag(9, 0, 8), print_string_func.offset, inspect_string_func.offset);
+ 
+   // FUNCTION type
+-  auto print_function_func = make_function_from_c((void*)print_function);
++  auto print_function_func = make_function_from_c(GOAL_C_FN(print_function));
+   set_fixed_type(FIX_SYM_FUNCTION_TYPE, "function", (s7 + FIX_SYM_BASIC_TYPE).cast<Symbol>(),
+                  pack_type_flag(9, 0, 4), print_function_func.offset, 0);
+ 
+   // VU FUNCTION type
+-  auto print_vu_function_func = make_function_from_c((void*)print_vu_function);
+-  auto inspect_vu_function_func = make_function_from_c((void*)inspect_vu_function);
++  auto print_vu_function_func = make_function_from_c(GOAL_C_FN(print_vu_function));
++  auto inspect_vu_function_func = make_function_from_c(GOAL_C_FN(inspect_vu_function));
+   set_fixed_type(FIX_SYM_VU_FUNCTION_TYPE, "vu-function",
+                  (s7 + FIX_SYM_STRUCTURE_TYPE).cast<Symbol>(), pack_type_flag(9, 0, 0x10),
+                  print_vu_function_func.offset, inspect_vu_function_func.offset);
+ 
+   // LINK BLOCK type
+-  auto inspect_link_block_func = make_function_from_c((void*)inspect_link_block);
++  auto inspect_link_block_func = make_function_from_c(GOAL_C_FN(inspect_link_block));
+   set_fixed_type(FIX_SYM_LINK_BLOCK, "link-block", (s7 + FIX_SYM_BASIC_TYPE).cast<Symbol>(),
+                  pack_type_flag(9, 0, 0xc), 0, inspect_link_block_func.offset);
+   auto linkBlockType = Ptr<Type>(*(s7 + FIX_SYM_LINK_BLOCK));
+@@ -1606,7 +1622,7 @@ s32 InitHeapAndSymbol() {
+   linkBlockType->delete_method = delete_illegal_func;
+ 
+   // KHEAP
+-  auto inspect_kheap_func = make_function_from_c((void*)inspect_kheap);
++  auto inspect_kheap_func = make_function_from_c(GOAL_C_FN(inspect_kheap));
+   set_fixed_type(FIX_SYM_KHEAP, "kheap", (s7 + FIX_SYM_STRUCTURE_TYPE).cast<Symbol>(),
+                  pack_type_flag(9, 0, 0x10), 0, inspect_kheap_func.offset);
+ 
+@@ -1615,13 +1631,13 @@ s32 InitHeapAndSymbol() {
+                  pack_type_flag(9, 0, 0x10), 0, 0);
+ 
+   // PAIR
+-  auto print_pair_func = make_function_from_c((void*)print_pair);
+-  auto inspect_pair_func = make_function_from_c((void*)inspect_pair);
++  auto print_pair_func = make_function_from_c(GOAL_C_FN(print_pair));
++  auto inspect_pair_func = make_function_from_c(GOAL_C_FN(inspect_pair));
+   set_fixed_type(FIX_SYM_PAIR_TYPE, "pair", (s7 + FIX_SYM_OBJECT_TYPE).cast<Symbol>(),
+                  pack_type_flag(9, 0, 8), print_pair_func.offset, inspect_pair_func.offset);
+   auto pairType = Ptr<Type>(*(s7 + FIX_SYM_PAIR_TYPE));
+-  auto new_pair_func = make_function_from_c((void*)new_pair);
+-  auto delete_pair_func = make_function_from_c((void*)delete_pair);
++  auto new_pair_func = make_function_from_c(GOAL_C_FN(new_pair));
++  auto delete_pair_func = make_function_from_c(GOAL_C_FN(delete_pair));
+   pairType->new_method = new_pair_func;
+   pairType->delete_method = delete_pair_func;
+ 
+@@ -1644,21 +1660,21 @@ s32 InitHeapAndSymbol() {
+                  pack_type_flag(9, 0, 4), 0, 0);
+ 
+   // NUMERIC TYPES
+-  auto print_integer_func = make_function_from_c((void*)print_integer);
+-  auto inspect_integer_func = make_function_from_c((void*)inspect_integer);
++  auto print_integer_func = make_function_from_c(GOAL_C_FN(print_integer));
++  auto inspect_integer_func = make_function_from_c(GOAL_C_FN(inspect_integer));
+   set_fixed_type(FIX_SYM_NUMBER_TYPE, "number", (s7 + FIX_SYM_OBJECT_TYPE).cast<Symbol>(),
+                  pack_type_flag(9, 0, 8), print_integer_func.offset, inspect_integer_func.offset);
+ 
+-  auto print_float_func = make_function_from_c((void*)print_float);
+-  auto inspect_float_func = make_function_from_c((void*)inspect_float);
++  auto print_float_func = make_function_from_c(GOAL_C_FN(print_float));
++  auto inspect_float_func = make_function_from_c(GOAL_C_FN(inspect_float));
+   set_fixed_type(FIX_SYM_FLOAT_TYPE, "float", (s7 + FIX_SYM_NUMBER_TYPE).cast<Symbol>(),
+                  pack_type_flag(9, 0, 4), print_float_func.offset, inspect_float_func.offset);
+ 
+   set_fixed_type(FIX_SYM_INTEGER_TYPE, "integer", (s7 + FIX_SYM_NUMBER_TYPE).cast<Symbol>(),
+                  pack_type_flag(9, 0, 8), 0, 0);
+ 
+-  auto print_binteger_func = make_function_from_c((void*)print_binteger);
+-  auto inspect_binteger_func = make_function_from_c((void*)inspect_binteger);
++  auto print_binteger_func = make_function_from_c(GOAL_C_FN(print_binteger));
++  auto inspect_binteger_func = make_function_from_c(GOAL_C_FN(inspect_binteger));
+   set_fixed_type(FIX_SYM_BINTEGER_TYPE, "binteger", (s7 + FIX_SYM_INTEGER_TYPE).cast<Symbol>(),
+                  pack_type_flag(9, 0, 8), print_binteger_func.offset, inspect_binteger_func.offset);
+ 
+@@ -1689,31 +1705,31 @@ s32 InitHeapAndSymbol() {
+                  pack_type_flag(9, 0, 0x10), 0, 0);
+ 
+   // Object new macro
+-  auto goal_new_object_func = make_function_from_c((void*)alloc_heap_object, true);
++  auto goal_new_object_func = make_function_from_c(GOAL_C_FN(alloc_heap_object), true);
+   object_type->new_method = goal_new_object_func;
+ 
+   // Stuff that isn't in a fixed spot:
+-  make_function_symbol_from_c("string->symbol", (void*)intern);
+-  make_function_symbol_from_c("print", (void*)sprint);
+-  make_function_symbol_from_c("inspect", (void*)inspect_object);
++  make_function_symbol_from_c("string->symbol", GOAL_C_FN(intern));
++  make_function_symbol_from_c("print", GOAL_C_FN(sprint));
++  make_function_symbol_from_c("inspect", GOAL_C_FN(inspect_object));
+ 
+   // loads
+-  make_function_symbol_from_c("load", (void*)load);
+-  make_function_symbol_from_c("loado", (void*)loado);
+-  make_function_symbol_from_c("unload", (void*)unload);
+-  make_stack_arg_function_symbol_from_c("_format", (void*)format_impl_jak1);
++  make_function_symbol_from_c("load", GOAL_C_FN(load));
++  make_function_symbol_from_c("loado", GOAL_C_FN(loado));
++  make_function_symbol_from_c("unload", GOAL_C_FN(unload));
++  make_stack_arg_function_symbol_from_c("_format", GOAL_C_STACK_FN(format_impl_jak1));
+ 
+   // allocations
+-  make_function_symbol_from_c("malloc", (void*)alloc_heap_memory);
+-  make_function_symbol_from_c("kmalloc", (void*)goal_malloc);
+-  make_function_symbol_from_c("new-dynamic-structure", (void*)new_dynamic_structure);
++  make_function_symbol_from_c("malloc", GOAL_C_FN(alloc_heap_memory));
++  make_function_symbol_from_c("kmalloc", GOAL_C_FN(goal_malloc));
++  make_function_symbol_from_c("new-dynamic-structure", GOAL_C_FN(new_dynamic_structure));
+ 
+   // type system
+-  make_function_symbol_from_c("method-set!", (void*)method_set);
++  make_function_symbol_from_c("method-set!", GOAL_C_FN(method_set));
+ 
+   // dgo
+-  make_stack_arg_function_symbol_from_c("link", (void*)link_and_exec_wrapper);
+-  make_function_symbol_from_c("dgo-load", (void*)load_and_link_dgo);
++  make_stack_arg_function_symbol_from_c("link", GOAL_C_STACK_FN(link_and_exec_wrapper));
++  make_function_symbol_from_c("dgo-load", GOAL_C_FN(load_and_link_dgo));
+ 
+   // forward declare
+   make_raw_function_symbol_from_c("ultimate-memcpy", 0);
+@@ -1722,18 +1738,18 @@ s32 InitHeapAndSymbol() {
+   make_raw_function_symbol_from_c("symlink3", 0);
+ 
+   // game stuff
+-  make_stack_arg_function_symbol_from_c("link-begin", (void*)link_begin);
+-  make_function_symbol_from_c("link-resume", (void*)link_resume);
+-  make_function_symbol_from_c("mc-run", (void*)MC_run);
+-  make_function_symbol_from_c("mc-format", (void*)MC_format);
+-  make_function_symbol_from_c("mc-unformat", (void*)MC_unformat);
+-  make_function_symbol_from_c("mc-create-file", (void*)MC_createfile);
+-  make_function_symbol_from_c("mc-save", (void*)MC_save);
+-  make_function_symbol_from_c("mc-load", (void*)MC_load);
+-  make_function_symbol_from_c("mc-check-result", (void*)MC_check_result);
+-  make_function_symbol_from_c("mc-get-slot-info", (void*)MC_get_status);
+-  make_function_symbol_from_c("mc-makefile", (void*)MC_makefile);
+-  make_function_symbol_from_c("kset-language", (void*)MC_set_language);
++  make_stack_arg_function_symbol_from_c("link-begin", GOAL_C_STACK_FN(link_begin));
++  make_function_symbol_from_c("link-resume", GOAL_C_FN(link_resume));
++  make_function_symbol_from_c("mc-run", GOAL_C_FN(MC_run));
++  make_function_symbol_from_c("mc-format", GOAL_C_FN(MC_format));
++  make_function_symbol_from_c("mc-unformat", GOAL_C_FN(MC_unformat));
++  make_function_symbol_from_c("mc-create-file", GOAL_C_FN(MC_createfile));
++  make_function_symbol_from_c("mc-save", GOAL_C_FN(MC_save));
++  make_function_symbol_from_c("mc-load", GOAL_C_FN(MC_load));
++  make_function_symbol_from_c("mc-check-result", GOAL_C_FN(MC_check_result));
++  make_function_symbol_from_c("mc-get-slot-info", GOAL_C_FN(MC_get_status));
++  make_function_symbol_from_c("mc-makefile", GOAL_C_FN(MC_makefile));
++  make_function_symbol_from_c("kset-language", GOAL_C_FN(MC_set_language));
+ 
+   // set *debug-segment*
+   auto ds_symbol = intern_from_c("*debug-segment*");
+@@ -1786,7 +1802,7 @@ s32 InitHeapAndSymbol() {
+   jak1::InitMachineScheme();
+ 
+   // testing stuff:
+-  make_function_symbol_from_c("test-function", (void*)test_function);
++  make_function_symbol_from_c("test-function", GOAL_C_FN(test_function));
+ 
+   return 0;
+ }
+diff --git a/game/kernel/jak1/ksound.cpp b/game/kernel/jak1/ksound.cpp
+index 43340724..116ee1fd 100644
+--- a/game/kernel/jak1/ksound.cpp
++++ b/game/kernel/jak1/ksound.cpp
+@@ -1,4 +1,5 @@
+ #include "ksound.h"
++#include "game/kernel/common/goal_c_fn.h"
+ 
+ #include "game/kernel/common/kdgo.h"
+ #include "game/kernel/common/ksound.h"
+@@ -9,13 +10,13 @@ namespace jak1 {
+  * Set up some functions which are somewhat related to sound.
+  */
+ void InitSoundScheme() {
+-  make_function_symbol_from_c("rpc-call", (void*)RpcCall_wrapper);
+-  make_function_symbol_from_c("rpc-busy?", (void*)RpcBusy);
+-  make_function_symbol_from_c("test-load-dgo-c", (void*)LoadDGOTest);
+-  make_stack_arg_function_symbol_from_c("rpc-call", (void*)RpcCall_wrapper);
++  make_function_symbol_from_c("rpc-call", GOAL_C_FN(RpcCall_wrapper));
++  make_function_symbol_from_c("rpc-busy?", GOAL_C_FN(RpcBusy));
++  make_function_symbol_from_c("test-load-dgo-c", GOAL_C_FN(LoadDGOTest));
++  make_stack_arg_function_symbol_from_c("rpc-call", GOAL_C_STACK_FN(RpcCall_wrapper));
+ 
+   // PC port interns
+-  make_function_symbol_from_c("pc-sound-set-flava-hack", (void*)set_flava_hack);
+-  make_function_symbol_from_c("pc-sound-set-fade-hack", (void*)set_fade_hack);
++  make_function_symbol_from_c("pc-sound-set-flava-hack", GOAL_C_FN(set_flava_hack));
++  make_function_symbol_from_c("pc-sound-set-fade-hack", GOAL_C_FN(set_fade_hack));
+ }
+ }  // namespace jak1
+\ No newline at end of file
+diff --git a/game/kernel/jak2/klink.cpp b/game/kernel/jak2/klink.cpp
+index edab0764..17bcbc9d 100644
+--- a/game/kernel/jak2/klink.cpp
++++ b/game/kernel/jak2/klink.cpp
+@@ -546,6 +546,13 @@ uint32_t link_control::jak2_work_v2() {
+   return 1;
+ }
+ 
++#ifdef __EMSCRIPTEN__
++namespace jakompiled {
++// web/goal_wasm_link.cpp
++void link_wasm_object(const ObjectFileHeader* ofh, const char* name);
++}  // namespace jakompiled
++#endif
++
+ /*!
+  * Complete linking. This will execute the top-level code for v3 object files, if requested.
+  */
+@@ -577,6 +584,11 @@ void link_control::jak2_finish(bool jump_from_c_to_goal) {
+       }
+     }
+ 
++#ifdef __EMSCRIPTEN__
++    // Jakompiled web: instantiate the object's wasm code
++    jakompiled::link_wasm_object(ofh, m_object_name);
++#endif
++
+     // execute top level!
+     if (m_entry.offset && (m_flags & LINK_FLAG_EXECUTE)) {
+       if (jump_from_c_to_goal) {
+diff --git a/game/kernel/jak2/kmachine.cpp b/game/kernel/jak2/kmachine.cpp
+index 258472f8..8622ff56 100644
+--- a/game/kernel/jak2/kmachine.cpp
++++ b/game/kernel/jak2/kmachine.cpp
+@@ -1,4 +1,5 @@
+ #include "kmachine.h"
++#include "game/kernel/common/goal_c_fn.h"
+ 
+ #include <bitset>
+ #include <cstring>
+@@ -541,77 +542,77 @@ void InitMachine_PCPort() {
+       },
+       make_string_from_c);
+ 
+-  make_function_symbol_from_c("__pc-set-levels", (void*)kmachine_extras::pc_set_levels);
++  make_function_symbol_from_c("__pc-set-levels", GOAL_C_FN(kmachine_extras::pc_set_levels));
+   make_function_symbol_from_c("__pc-set-active-levels",
+-                              (void*)kmachine_extras::pc_set_active_levels);
+-  make_function_symbol_from_c("__pc-get-tex-remap", (void*)lookup_jak2_texture_dest_offset);
++                              GOAL_C_FN(kmachine_extras::pc_set_active_levels));
++  make_function_symbol_from_c("__pc-get-tex-remap", GOAL_C_FN(lookup_jak2_texture_dest_offset));
+   make_function_symbol_from_c("pc-init-autosplitter-struct",
+-                              (void*)kmachine_extras::init_autosplit_struct);
++                              GOAL_C_FN(kmachine_extras::init_autosplit_struct));
+ 
+   // discord rich presence
+-  make_function_symbol_from_c("pc-discord-rpc-update", (void*)kmachine_extras::update_discord_rpc);
++  make_function_symbol_from_c("pc-discord-rpc-update", GOAL_C_FN(kmachine_extras::update_discord_rpc));
+ 
+   // debugging tools
+-  make_function_symbol_from_c("alloc-vagdir-names", (void*)kmachine_extras::alloc_vagdir_names);
++  make_function_symbol_from_c("alloc-vagdir-names", GOAL_C_FN(kmachine_extras::alloc_vagdir_names));
+ 
+   // external RPCs
+   make_function_symbol_from_c("pc-fetch-external-speedrun-times",
+-                              (void*)kmachine_extras::pc_fetch_external_speedrun_times);
++                              GOAL_C_FN(kmachine_extras::pc_fetch_external_speedrun_times));
+   make_function_symbol_from_c("pc-fetch-external-race-times",
+-                              (void*)kmachine_extras::pc_fetch_external_race_times);
++                              GOAL_C_FN(kmachine_extras::pc_fetch_external_race_times));
+   make_function_symbol_from_c("pc-fetch-external-highscores",
+-                              (void*)kmachine_extras::pc_fetch_external_highscores);
++                              GOAL_C_FN(kmachine_extras::pc_fetch_external_highscores));
+   make_function_symbol_from_c("pc-get-external-speedrun-time",
+-                              (void*)kmachine_extras::pc_get_external_speedrun_time);
++                              GOAL_C_FN(kmachine_extras::pc_get_external_speedrun_time));
+   make_function_symbol_from_c("pc-get-external-race-time",
+-                              (void*)kmachine_extras::pc_get_external_race_time);
++                              GOAL_C_FN(kmachine_extras::pc_get_external_race_time));
+   make_function_symbol_from_c("pc-get-external-highscore",
+-                              (void*)kmachine_extras::pc_get_external_highscore);
++                              GOAL_C_FN(kmachine_extras::pc_get_external_highscore));
+   make_function_symbol_from_c("pc-get-num-external-speedrun-times",
+-                              (void*)kmachine_extras::pc_get_num_external_speedrun_times);
++                              GOAL_C_FN(kmachine_extras::pc_get_num_external_speedrun_times));
+   make_function_symbol_from_c("pc-get-num-external-race-times",
+-                              (void*)kmachine_extras::pc_get_num_external_race_times);
++                              GOAL_C_FN(kmachine_extras::pc_get_num_external_race_times));
+   make_function_symbol_from_c("pc-get-num-external-highscores",
+-                              (void*)kmachine_extras::pc_get_num_external_highscores);
++                              GOAL_C_FN(kmachine_extras::pc_get_num_external_highscores));
+ 
+   // speedrunning stuff
+   make_function_symbol_from_c("pc-sr-mode-get-practice-entries-amount",
+-                              (void*)kmachine_extras::pc_sr_mode_get_practice_entries_amount);
++                              GOAL_C_FN(kmachine_extras::pc_sr_mode_get_practice_entries_amount));
+   make_function_symbol_from_c("pc-sr-mode-get-practice-entry-name",
+-                              (void*)kmachine_extras::pc_sr_mode_get_practice_entry_name);
++                              GOAL_C_FN(kmachine_extras::pc_sr_mode_get_practice_entry_name));
+   make_function_symbol_from_c("pc-sr-mode-get-practice-entry-continue-point",
+-                              (void*)kmachine_extras::pc_sr_mode_get_practice_entry_continue_point);
++                              GOAL_C_FN(kmachine_extras::pc_sr_mode_get_practice_entry_continue_point));
+   make_function_symbol_from_c(
+       "pc-sr-mode-get-practice-entry-history-success",
+-      (void*)kmachine_extras::pc_sr_mode_get_practice_entry_history_success);
++      GOAL_C_FN(kmachine_extras::pc_sr_mode_get_practice_entry_history_success));
+   make_function_symbol_from_c(
+       "pc-sr-mode-get-practice-entry-history-attempts",
+-      (void*)kmachine_extras::pc_sr_mode_get_practice_entry_history_attempts);
++      GOAL_C_FN(kmachine_extras::pc_sr_mode_get_practice_entry_history_attempts));
+   make_function_symbol_from_c(
+       "pc-sr-mode-get-practice-entry-session-success",
+-      (void*)kmachine_extras::pc_sr_mode_get_practice_entry_session_success);
++      GOAL_C_FN(kmachine_extras::pc_sr_mode_get_practice_entry_session_success));
+   make_function_symbol_from_c(
+       "pc-sr-mode-get-practice-entry-session-attempts",
+-      (void*)kmachine_extras::pc_sr_mode_get_practice_entry_session_attempts);
++      GOAL_C_FN(kmachine_extras::pc_sr_mode_get_practice_entry_session_attempts));
+   make_function_symbol_from_c("pc-sr-mode-get-practice-entry-avg-time",
+-                              (void*)kmachine_extras::pc_sr_mode_get_practice_entry_avg_time);
++                              GOAL_C_FN(kmachine_extras::pc_sr_mode_get_practice_entry_avg_time));
+   make_function_symbol_from_c("pc-sr-mode-get-practice-entry-fastest-time",
+-                              (void*)kmachine_extras::pc_sr_mode_get_practice_entry_fastest_time);
++                              GOAL_C_FN(kmachine_extras::pc_sr_mode_get_practice_entry_fastest_time));
+   make_function_symbol_from_c("pc-sr-mode-record-practice-entry-attempt!",
+-                              (void*)kmachine_extras::pc_sr_mode_record_practice_entry_attempt);
++                              GOAL_C_FN(kmachine_extras::pc_sr_mode_record_practice_entry_attempt));
+   make_function_symbol_from_c("pc-sr-mode-init-practice-info!",
+-                              (void*)kmachine_extras::pc_sr_mode_init_practice_info);
++                              GOAL_C_FN(kmachine_extras::pc_sr_mode_init_practice_info));
+   make_function_symbol_from_c("pc-sr-mode-get-custom-category-amount",
+-                              (void*)kmachine_extras::pc_sr_mode_get_custom_category_amount);
++                              GOAL_C_FN(kmachine_extras::pc_sr_mode_get_custom_category_amount));
+   make_function_symbol_from_c("pc-sr-mode-get-custom-category-name",
+-                              (void*)kmachine_extras::pc_sr_mode_get_custom_category_name);
++                              GOAL_C_FN(kmachine_extras::pc_sr_mode_get_custom_category_name));
+   make_function_symbol_from_c(
+       "pc-sr-mode-get-custom-category-continue-point",
+-      (void*)kmachine_extras::pc_sr_mode_get_custom_category_continue_point);
++      GOAL_C_FN(kmachine_extras::pc_sr_mode_get_custom_category_continue_point));
+   make_function_symbol_from_c("pc-sr-mode-init-custom-category-info!",
+-                              (void*)kmachine_extras::pc_sr_mode_init_custom_category_info);
++                              GOAL_C_FN(kmachine_extras::pc_sr_mode_init_custom_category_info));
+   make_function_symbol_from_c("pc-sr-mode-dump-new-custom-category",
+-                              (void*)kmachine_extras::pc_sr_mode_dump_new_custom_category);
++                              GOAL_C_FN(kmachine_extras::pc_sr_mode_dump_new_custom_category));
+ 
+   // setup string constants
+   auto user_dir_path = file_util::get_user_config_dir();
+@@ -653,37 +654,37 @@ u32 sceGsSyncPath(u32 mode, u32 timeout) {
+ void aybabtu() {}
+ 
+ void InitMachineScheme() {
+-  make_function_symbol_from_c("put-display-env", (void*)PutDisplayEnv);
+-  make_function_symbol_from_c("syncv", (void*)sceGsSyncV);
+-  make_function_symbol_from_c("sync-path", (void*)sceGsSyncPath);
+-  make_function_symbol_from_c("reset-path", (void*)ee::sceGsResetPath);
+-  make_function_symbol_from_c("reset-graph", (void*)sceGsResetGraph);
+-  make_function_symbol_from_c("dma-sync", (void*)sceDmaSync);
+-  make_function_symbol_from_c("gs-put-imr", (void*)sceGsPutIMR);
+-  make_function_symbol_from_c("gs-get-imr", (void*)sceGsGetIMR);
+-  make_function_symbol_from_c("gs-store-image", (void*)sceGsExecStoreImage);
+-  make_function_symbol_from_c("flush-cache", (void*)FlushCache);
+-  make_function_symbol_from_c("cpad-open", (void*)CPadOpen);
+-  make_function_symbol_from_c("cpad-get-data", (void*)CPadGetData);
+-  make_function_symbol_from_c("mouse-get-data", (void*)MouseGetData);
+-  make_function_symbol_from_c("install-handler", (void*)InstallHandler);
+-  make_function_symbol_from_c("install-debug-handler", (void*)InstallDebugHandler);
+-  make_function_symbol_from_c("file-stream-open", (void*)kopen);
+-  make_function_symbol_from_c("file-stream-close", (void*)kclose);
+-  make_function_symbol_from_c("file-stream-length", (void*)klength);
+-  make_function_symbol_from_c("file-stream-seek", (void*)kseek);
+-  make_function_symbol_from_c("file-stream-read", (void*)kread);
+-  make_function_symbol_from_c("file-stream-write", (void*)kwrite);
+-  make_function_symbol_from_c("scf-get-language", (void*)DecodeLanguage);
+-  make_function_symbol_from_c("scf-get-time", (void*)DecodeTime);
+-  make_function_symbol_from_c("scf-get-aspect", (void*)DecodeAspect);
+-  make_function_symbol_from_c("scf-get-volume", (void*)DecodeVolume);
+-  make_function_symbol_from_c("scf-get-territory", (void*)DecodeTerritory);
+-  make_function_symbol_from_c("scf-get-timeout", (void*)DecodeTimeout);
+-  make_function_symbol_from_c("scf-get-inactive-timeout", (void*)DecodeInactiveTimeout);
+-  make_function_symbol_from_c("dma-to-iop", (void*)dma_to_iop);
+-  make_function_symbol_from_c("kernel-shutdown", (void*)KernelShutdown);
+-  make_function_symbol_from_c("aybabtu", (void*)aybabtu);  // was nothing function
++  make_function_symbol_from_c("put-display-env", GOAL_C_FN(PutDisplayEnv));
++  make_function_symbol_from_c("syncv", GOAL_C_FN(sceGsSyncV));
++  make_function_symbol_from_c("sync-path", GOAL_C_FN(sceGsSyncPath));
++  make_function_symbol_from_c("reset-path", GOAL_C_FN(ee::sceGsResetPath));
++  make_function_symbol_from_c("reset-graph", GOAL_C_FN(sceGsResetGraph));
++  make_function_symbol_from_c("dma-sync", GOAL_C_FN(sceDmaSync));
++  make_function_symbol_from_c("gs-put-imr", GOAL_C_FN(sceGsPutIMR));
++  make_function_symbol_from_c("gs-get-imr", GOAL_C_FN(sceGsGetIMR));
++  make_function_symbol_from_c("gs-store-image", GOAL_C_FN(sceGsExecStoreImage));
++  make_function_symbol_from_c("flush-cache", GOAL_C_FN(FlushCache));
++  make_function_symbol_from_c("cpad-open", GOAL_C_FN(CPadOpen));
++  make_function_symbol_from_c("cpad-get-data", GOAL_C_FN(CPadGetData));
++  make_function_symbol_from_c("mouse-get-data", GOAL_C_FN(MouseGetData));
++  make_function_symbol_from_c("install-handler", GOAL_C_FN(InstallHandler));
++  make_function_symbol_from_c("install-debug-handler", GOAL_C_FN(InstallDebugHandler));
++  make_function_symbol_from_c("file-stream-open", GOAL_C_FN(kopen));
++  make_function_symbol_from_c("file-stream-close", GOAL_C_FN(kclose));
++  make_function_symbol_from_c("file-stream-length", GOAL_C_FN(klength));
++  make_function_symbol_from_c("file-stream-seek", GOAL_C_FN(kseek));
++  make_function_symbol_from_c("file-stream-read", GOAL_C_FN(kread));
++  make_function_symbol_from_c("file-stream-write", GOAL_C_FN(kwrite));
++  make_function_symbol_from_c("scf-get-language", GOAL_C_FN(DecodeLanguage));
++  make_function_symbol_from_c("scf-get-time", GOAL_C_FN(DecodeTime));
++  make_function_symbol_from_c("scf-get-aspect", GOAL_C_FN(DecodeAspect));
++  make_function_symbol_from_c("scf-get-volume", GOAL_C_FN(DecodeVolume));
++  make_function_symbol_from_c("scf-get-territory", GOAL_C_FN(DecodeTerritory));
++  make_function_symbol_from_c("scf-get-timeout", GOAL_C_FN(DecodeTimeout));
++  make_function_symbol_from_c("scf-get-inactive-timeout", GOAL_C_FN(DecodeInactiveTimeout));
++  make_function_symbol_from_c("dma-to-iop", GOAL_C_FN(dma_to_iop));
++  make_function_symbol_from_c("kernel-shutdown", GOAL_C_FN(KernelShutdown));
++  make_function_symbol_from_c("aybabtu", GOAL_C_FN(aybabtu));  // was nothing function
+ 
+   InitMachine_PCPort();
+ 
+diff --git a/game/kernel/jak2/kscheme.cpp b/game/kernel/jak2/kscheme.cpp
+index 1eecaa43..653125f8 100644
+--- a/game/kernel/jak2/kscheme.cpp
++++ b/game/kernel/jak2/kscheme.cpp
+@@ -1,5 +1,6 @@
+ 
+ #include "kscheme.h"
++#include "game/kernel/common/goal_c_fn.h"
+ 
+ #include <cstdio>
+ #include <cstring>
+@@ -307,6 +308,14 @@ void _stack_call_arm64();
+ Ptr<Function> make_function_from_c_systemv(void* func, bool arg3_is_pp) {
+   auto mem = Ptr<u8>(alloc_heap_object(s7.offset + FIX_SYM_GLOBAL_HEAP,
+                                        u32_in_fixed_sym(FIX_SYM_FUNCTION_TYPE), 0x40, UNKNOWN_PP));
++#ifdef __EMSCRIPTEN__
++  // Jakompiled web: func is a GOAL_C_FN adapter; the function object holds its wasm
++  // table index (and a zero word, like the stubs emitted by goalc for wasm).
++  (void)arg3_is_pp;
++  mem.cast<u32>().c()[0] = (u32)(uintptr_t)func;
++  mem.cast<u32>().c()[1] = 0;
++  return mem.cast<Function>();
++#endif
+   auto f = (uint64_t)func;
+   auto target_function = (u8*)&f;
+ #ifndef __aarch64__
+@@ -424,6 +433,13 @@ Ptr<Function> make_stack_arg_function_from_c_systemv(void* func) {
+   // allocate a function object on the global heap
+   auto mem = Ptr<u8>(alloc_heap_object(s7.offset + FIX_SYM_GLOBAL_HEAP,
+                                        u32_in_fixed_sym(FIX_SYM_FUNCTION_TYPE), 0x40, UNKNOWN_PP));
++#ifdef __EMSCRIPTEN__
++  // Jakompiled web: func is a GOAL_C_FN adapter; the function object holds its wasm
++  // table index (and a zero word, like the stubs emitted by goalc for wasm).
++  mem.cast<u32>().c()[0] = (u32)(uintptr_t)func;
++  mem.cast<u32>().c()[1] = 0;
++  return mem.cast<Function>();
++#endif
+   auto f = (uint64_t)func;
+   auto target_function = (u8*)&f;
+ #ifndef __aarch64__
+@@ -1513,11 +1529,11 @@ int InitHeapAndSymbol() {
+   set_fixed_symbol(FIX_SYM_NOTHING_FUNC, "nothing", make_nothing_func().offset);
+   set_fixed_symbol(FIX_SYM_ZERO_FUNC, "zero-func", make_zero_func().offset);
+   set_fixed_symbol(FIX_SYM_ASIZE_OF_BASIC_FUNC, "asize-of-basic-func",
+-                   make_function_from_c((void*)asize_of_basic).offset);
++                   make_function_from_c(GOAL_C_FN(asize_of_basic)).offset);
+   set_fixed_symbol(FIX_SYM_COPY_BASIC_FUNC, "asize-of-basic-func",
+-                   make_function_from_c((void*)copy_basic, true).offset);
++                   make_function_from_c(GOAL_C_FN(copy_basic), true).offset);
+   set_fixed_symbol(FIX_SYM_DELETE_BASIC, "delete-basic",
+-                   make_function_from_c((void*)delete_basic).offset);
++                   make_function_from_c(GOAL_C_FN(delete_basic)).offset);
+   set_fixed_symbol(FIX_SYM_GLOBAL_HEAP, "global", kglobalheap.offset);
+   set_fixed_symbol(FIX_SYM_DEBUG, "debug", kdebugheap.offset);
+   set_fixed_symbol(FIX_SYM_STATIC, "static", s7.offset + FIX_SYM_STATIC);
+@@ -1537,10 +1553,10 @@ int InitHeapAndSymbol() {
+   set_fixed_symbol(FIX_SYM_QUOTE, "quote", s7.offset + FIX_SYM_QUOTE);
+ 
+   // set up types
+-  auto new_illegal_func = make_function_from_c((void*)new_illegal);
+-  auto delete_illegal_func = make_function_from_c((void*)delete_illegal);
+-  auto print_object_func = make_function_from_c((void*)print_object);
+-  auto inspect_object_func = make_function_from_c((void*)inspect_object);
++  auto new_illegal_func = make_function_from_c(GOAL_C_FN(new_illegal));
++  auto delete_illegal_func = make_function_from_c(GOAL_C_FN(delete_illegal));
++  auto print_object_func = make_function_from_c(GOAL_C_FN(print_object));
++  auto inspect_object_func = make_function_from_c(GOAL_C_FN(inspect_object));
+ 
+   // OBJECT
+   set_fixed_type(FIX_SYM_OBJECT_TYPE, "object", get_fixed_type_symbol(FIX_SYM_OBJECT_TYPE),
+@@ -1549,71 +1565,71 @@ int InitHeapAndSymbol() {
+   object_type->new_method = Ptr<Function>(u32_in_fixed_sym(FIX_SYM_NOTHING_FUNC));  // new for jak 2
+   object_type->delete_method = delete_illegal_func;
+   object_type->asize_of_method = Ptr<Function>(u32_in_fixed_sym(FIX_SYM_NOTHING_FUNC));
+-  object_type->copy_method = make_function_from_c((void*)copy_fixed);
++  object_type->copy_method = make_function_from_c(GOAL_C_FN(copy_fixed));
+ 
+   // STRUCTURE
+   auto structure_type =
+       set_fixed_type(FIX_SYM_STRUCTURE, "structure", get_fixed_type_symbol(FIX_SYM_OBJECT_TYPE),
+-                     pack_type_flag(9, 0, 4), make_function_from_c((void*)print_structure).offset,
+-                     make_function_from_c((void*)inspect_structure).offset);
+-  structure_type->new_method = make_function_from_c((void*)new_structure);
+-  structure_type->delete_method = make_function_from_c((void*)delete_structure);
++                     pack_type_flag(9, 0, 4), make_function_from_c(GOAL_C_FN(print_structure)).offset,
++                     make_function_from_c(GOAL_C_FN(inspect_structure)).offset);
++  structure_type->new_method = make_function_from_c(GOAL_C_FN(new_structure));
++  structure_type->delete_method = make_function_from_c(GOAL_C_FN(delete_structure));
+ 
+   // BASIC
+   auto basic_type =
+       set_fixed_type(FIX_SYM_BASIC, "basic", get_fixed_type_symbol(FIX_SYM_STRUCTURE),
+-                     pack_type_flag(9, 0, 4), make_function_from_c((void*)print_basic).offset,
+-                     make_function_from_c((void*)inspect_basic).offset);
+-  basic_type->new_method = make_function_from_c((void*)new_basic, true);
++                     pack_type_flag(9, 0, 4), make_function_from_c(GOAL_C_FN(print_basic)).offset,
++                     make_function_from_c(GOAL_C_FN(inspect_basic)).offset);
++  basic_type->new_method = make_function_from_c(GOAL_C_FN(new_basic), true);
+   basic_type->delete_method = Ptr<Function>(u32_in_fixed_sym(FIX_SYM_DELETE_BASIC));
+   basic_type->asize_of_method = Ptr<Function>(u32_in_fixed_sym(FIX_SYM_ASIZE_OF_BASIC_FUNC));
+   basic_type->copy_method = Ptr<Function>(u32_in_fixed_sym(FIX_SYM_COPY_BASIC_FUNC));
+ 
+   // SYMBOL
+   set_fixed_type(FIX_SYM_SYMBOL_TYPE, "symbol", get_fixed_type_symbol(FIX_SYM_OBJECT_TYPE),
+-                 pack_type_flag(9, 0, 4), make_function_from_c((void*)print_symbol).offset,
+-                 make_function_from_c((void*)inspect_symbol).offset);
++                 pack_type_flag(9, 0, 4), make_function_from_c(GOAL_C_FN(print_symbol)).offset,
++                 make_function_from_c(GOAL_C_FN(inspect_symbol)).offset);
+   auto sym_type = Ptr<Type>(u32_in_fixed_sym(FIX_SYM_SYMBOL_TYPE));
+   sym_type->new_method = new_illegal_func;
+   sym_type->delete_method = delete_illegal_func;
+ 
+   // TYPE
+   set_fixed_type(FIX_SYM_TYPE_TYPE, "type", get_fixed_type_symbol(FIX_SYM_BASIC),
+-                 pack_type_flag(9, 0, 0x38), make_function_from_c((void*)print_type).offset,
+-                 make_function_from_c((void*)inspect_type).offset);
++                 pack_type_flag(9, 0, 0x38), make_function_from_c(GOAL_C_FN(print_type)).offset,
++                 make_function_from_c(GOAL_C_FN(inspect_type)).offset);
+   auto type_type = Ptr<Type>(u32_in_fixed_sym(FIX_SYM_TYPE_TYPE));
+-  type_type->new_method = make_function_from_c((void*)new_type);
++  type_type->new_method = make_function_from_c(GOAL_C_FN(new_type));
+   type_type->delete_method = delete_illegal_func;
+ 
+   // STRING
+   set_fixed_type(FIX_SYM_STRING_TYPE, "string", get_fixed_type_symbol(FIX_SYM_BASIC),
+-                 pack_type_flag(9, 0, 8), make_function_from_c((void*)print_string).offset,
+-                 make_function_from_c((void*)inspect_string).offset);
++                 pack_type_flag(9, 0, 8), make_function_from_c(GOAL_C_FN(print_string)).offset,
++                 make_function_from_c(GOAL_C_FN(inspect_string)).offset);
+ 
+   // FUNCTION
+   set_fixed_type(FIX_SYM_FUNCTION_TYPE, "function", get_fixed_type_symbol(FIX_SYM_BASIC),
+-                 pack_type_flag(9, 0, 4), make_function_from_c((void*)print_function).offset, 0);
++                 pack_type_flag(9, 0, 4), make_function_from_c(GOAL_C_FN(print_function)).offset, 0);
+   auto function_type = Ptr<Type>(u32_in_fixed_sym(FIX_SYM_FUNCTION_TYPE));
+   function_type->new_method = new_illegal_func;
+   function_type->delete_method = delete_illegal_func;
+ 
+   // VU FUNCTION
+   set_fixed_type(FIX_SYM_VU_FUNCTION, "vu-function", get_fixed_type_symbol(FIX_SYM_STRUCTURE),
+-                 pack_type_flag(9, 0, 0x16), make_function_from_c((void*)print_vu_function).offset,
+-                 make_function_from_c((void*)inspect_vu_function).offset);
++                 pack_type_flag(9, 0, 0x16), make_function_from_c(GOAL_C_FN(print_vu_function)).offset,
++                 make_function_from_c(GOAL_C_FN(inspect_vu_function)).offset);
+   Ptr<Type>(u32_in_fixed_sym(FIX_SYM_VU_FUNCTION))->delete_method = delete_illegal_func;
+ 
+   // LINK BLOCK
+   set_fixed_type(FIX_SYM_LINK_BLOCK, "link-block", get_fixed_type_symbol(FIX_SYM_BASIC),
+                  pack_type_flag(9, 0, 0xc), 0,
+-                 make_function_from_c((void*)inspect_link_block).offset);
++                 make_function_from_c(GOAL_C_FN(inspect_link_block)).offset);
+   auto link_block_type = Ptr<Type>(u32_in_fixed_sym(FIX_SYM_LINK_BLOCK));
+   link_block_type->new_method = new_illegal_func;
+   link_block_type->delete_method = delete_illegal_func;
+ 
+   // KHEAP
+   set_fixed_type(FIX_SYM_HEAP, "kheap", get_fixed_type_symbol(FIX_SYM_STRUCTURE),
+-                 pack_type_flag(9, 0, 0x10), 0, make_function_from_c((void*)inspect_kheap).offset);
++                 pack_type_flag(9, 0, 0x10), 0, make_function_from_c(GOAL_C_FN(inspect_kheap)).offset);
+ 
+   // ARRAY
+   set_fixed_type(FIX_SYM_ARRAY, "array", get_fixed_type_symbol(FIX_SYM_BASIC),
+@@ -1621,12 +1637,12 @@ int InitHeapAndSymbol() {
+ 
+   // PAIR
+   set_fixed_type(FIX_SYM_PAIR_TYPE, "pair", get_fixed_type_symbol(FIX_SYM_OBJECT_TYPE),
+-                 pack_type_flag(9, 0, 8), make_function_from_c((void*)print_pair).offset,
+-                 make_function_from_c((void*)inspect_pair).offset);
++                 pack_type_flag(9, 0, 8), make_function_from_c(GOAL_C_FN(print_pair)).offset,
++                 make_function_from_c(GOAL_C_FN(inspect_pair)).offset);
+   Ptr<Type>(u32_in_fixed_sym(FIX_SYM_PAIR_TYPE))->new_method =
+-      make_function_from_c((void*)new_pair);
++      make_function_from_c(GOAL_C_FN(new_pair));
+   Ptr<Type>(u32_in_fixed_sym(FIX_SYM_PAIR_TYPE))->delete_method =
+-      make_function_from_c((void*)delete_pair);
++      make_function_from_c(GOAL_C_FN(delete_pair));
+ 
+   // KERNEL
+   set_fixed_type(FIX_SYM_PROCESS_TREE, "process-tree", get_fixed_type_symbol(FIX_SYM_BASIC),
+@@ -1649,20 +1665,20 @@ int InitHeapAndSymbol() {
+ 
+   // NUMERIC
+   set_fixed_type(FIX_SYM_NUMBER, "number", get_fixed_type_symbol(FIX_SYM_OBJECT_TYPE),
+-                 pack_type_flag(9, 0, 8), make_function_from_c((void*)print_integer).offset,
+-                 make_function_from_c((void*)inspect_integer).offset);
++                 pack_type_flag(9, 0, 8), make_function_from_c(GOAL_C_FN(print_integer)).offset,
++                 make_function_from_c(GOAL_C_FN(inspect_integer)).offset);
+   Ptr<Type>(u32_in_fixed_sym(FIX_SYM_NUMBER))->new_method = new_illegal_func;
+ 
+   set_fixed_type(FIX_SYM_FLOAT, "float", get_fixed_type_symbol(FIX_SYM_NUMBER),
+-                 pack_type_flag(9, 0, 4), make_function_from_c((void*)print_float).offset,
+-                 make_function_from_c((void*)inspect_float).offset);
++                 pack_type_flag(9, 0, 4), make_function_from_c(GOAL_C_FN(print_float)).offset,
++                 make_function_from_c(GOAL_C_FN(inspect_float)).offset);
+ 
+   set_fixed_type(FIX_SYM_INTEGER, "integer", get_fixed_type_symbol(FIX_SYM_NUMBER),
+                  pack_type_flag(9, 0, 8), 0, 0);
+ 
+   set_fixed_type(FIX_SYM_BINTEGER, "binteger", get_fixed_type_symbol(FIX_SYM_INTEGER),
+-                 pack_type_flag(9, 0, 8), make_function_from_c((void*)print_binteger).offset,
+-                 make_function_from_c((void*)inspect_binteger).offset);
++                 pack_type_flag(9, 0, 8), make_function_from_c(GOAL_C_FN(print_binteger)).offset,
++                 make_function_from_c(GOAL_C_FN(inspect_binteger)).offset);
+ 
+   set_fixed_type(FIX_SYM_SINTEGER, "sinteger", get_fixed_type_symbol(FIX_SYM_INTEGER),
+                  pack_type_flag(9, 0, 8), 0, 0);
+@@ -1691,43 +1707,43 @@ int InitHeapAndSymbol() {
+                  pack_type_flag(9, 0, 16), 0, 0);
+ 
+   Ptr<Type>(u32_in_fixed_sym(FIX_SYM_OBJECT_TYPE))->new_method =
+-      make_function_from_c((void*)alloc_heap_object, true);
+-
+-  make_function_symbol_from_c("string->symbol", (void*)intern);
+-  make_function_symbol_from_c("print", (void*)sprint);
+-  make_function_symbol_from_c("inspect", (void*)inspect_object);
+-  make_function_symbol_from_c("load", (void*)load);
+-  make_function_symbol_from_c("loadb", (void*)loadb);
+-  make_function_symbol_from_c("loado", (void*)loado);
+-  make_function_symbol_from_c("unload", (void*)unload);
+-  make_stack_arg_function_symbol_from_c("_format", (void*)format_impl_jak2);
+-  make_function_symbol_from_c("malloc", (void*)alloc_heap_memory);
+-  make_function_symbol_from_c("kmalloc", (void*)goal_malloc);
+-  make_function_symbol_from_c("kmemopen", (void*)kmemopen);
+-  make_function_symbol_from_c("kmemclose", (void*)kmemclose);
+-  make_function_symbol_from_c("new-dynamic-structure", (void*)new_dynamic_structure);
+-  make_function_symbol_from_c("method-set!", (void*)method_set);
+-  make_stack_arg_function_symbol_from_c("link", (void*)link_and_exec_wrapper);
+-  make_function_symbol_from_c("link-busy?", (void*)link_busy);
+-  make_function_symbol_from_c("link-reset", (void*)link_reset);
+-  make_function_symbol_from_c("dgo-load", (void*)load_and_link_dgo);
++      make_function_from_c(GOAL_C_FN(alloc_heap_object), true);
++
++  make_function_symbol_from_c("string->symbol", GOAL_C_FN(intern));
++  make_function_symbol_from_c("print", GOAL_C_FN(sprint));
++  make_function_symbol_from_c("inspect", GOAL_C_FN(inspect_object));
++  make_function_symbol_from_c("load", GOAL_C_FN(load));
++  make_function_symbol_from_c("loadb", GOAL_C_FN(loadb));
++  make_function_symbol_from_c("loado", GOAL_C_FN(loado));
++  make_function_symbol_from_c("unload", GOAL_C_FN(unload));
++  make_stack_arg_function_symbol_from_c("_format", GOAL_C_STACK_FN(format_impl_jak2));
++  make_function_symbol_from_c("malloc", GOAL_C_FN(alloc_heap_memory));
++  make_function_symbol_from_c("kmalloc", GOAL_C_FN(goal_malloc));
++  make_function_symbol_from_c("kmemopen", GOAL_C_FN(kmemopen));
++  make_function_symbol_from_c("kmemclose", GOAL_C_FN(kmemclose));
++  make_function_symbol_from_c("new-dynamic-structure", GOAL_C_FN(new_dynamic_structure));
++  make_function_symbol_from_c("method-set!", GOAL_C_FN(method_set));
++  make_stack_arg_function_symbol_from_c("link", GOAL_C_STACK_FN(link_and_exec_wrapper));
++  make_function_symbol_from_c("link-busy?", GOAL_C_FN(link_busy));
++  make_function_symbol_from_c("link-reset", GOAL_C_FN(link_reset));
++  make_function_symbol_from_c("dgo-load", GOAL_C_FN(load_and_link_dgo));
+   make_raw_function_symbol_from_c("ultimate-memcpy", 0);
+   make_raw_function_symbol_from_c("memcpy-and-rellink", 0);
+   make_raw_function_symbol_from_c("symlink2", 0);
+   make_raw_function_symbol_from_c("symlink3", 0);
+-  make_stack_arg_function_symbol_from_c("link-begin", (void*)link_begin);
+-  make_function_symbol_from_c("link-resume", (void*)link_resume);
+-  make_function_symbol_from_c("sql-query", (void*)sql_query_sync);
+-  make_function_symbol_from_c("mc-run", (void*)MC_run);
+-  make_function_symbol_from_c("mc-format", (void*)MC_format);
+-  make_function_symbol_from_c("mc-unformat", (void*)MC_unformat);
+-  make_function_symbol_from_c("mc-create-file", (void*)MC_createfile);
+-  make_function_symbol_from_c("mc-save", (void*)MC_save);
+-  make_function_symbol_from_c("mc-load", (void*)MC_load);
+-  make_function_symbol_from_c("mc-check-result", (void*)MC_check_result);
+-  make_function_symbol_from_c("mc-get-slot-info", (void*)MC_get_status);
+-  make_function_symbol_from_c("mc-makefile", (void*)MC_makefile);
+-  make_function_symbol_from_c("kset-language", (void*)MC_set_language);
++  make_stack_arg_function_symbol_from_c("link-begin", GOAL_C_STACK_FN(link_begin));
++  make_function_symbol_from_c("link-resume", GOAL_C_FN(link_resume));
++  make_function_symbol_from_c("sql-query", GOAL_C_FN(sql_query_sync));
++  make_function_symbol_from_c("mc-run", GOAL_C_FN(MC_run));
++  make_function_symbol_from_c("mc-format", GOAL_C_FN(MC_format));
++  make_function_symbol_from_c("mc-unformat", GOAL_C_FN(MC_unformat));
++  make_function_symbol_from_c("mc-create-file", GOAL_C_FN(MC_createfile));
++  make_function_symbol_from_c("mc-save", GOAL_C_FN(MC_save));
++  make_function_symbol_from_c("mc-load", GOAL_C_FN(MC_load));
++  make_function_symbol_from_c("mc-check-result", GOAL_C_FN(MC_check_result));
++  make_function_symbol_from_c("mc-get-slot-info", GOAL_C_FN(MC_get_status));
++  make_function_symbol_from_c("mc-makefile", GOAL_C_FN(MC_makefile));
++  make_function_symbol_from_c("kset-language", GOAL_C_FN(MC_set_language));
+ 
+   auto ds_symbol = intern_from_c("*debug-segment*");
+   if (DebugSegment) {
+diff --git a/game/kernel/jak2/ksound.cpp b/game/kernel/jak2/ksound.cpp
+index 1ec43e45..90227a03 100644
+--- a/game/kernel/jak2/ksound.cpp
++++ b/game/kernel/jak2/ksound.cpp
+@@ -1,4 +1,5 @@
+ #include "ksound.h"
++#include "game/kernel/common/goal_c_fn.h"
+ 
+ #include "game/kernel/common/kdgo.h"
+ #include "game/kernel/common/ksound.h"
+@@ -9,12 +10,12 @@ namespace jak2 {
+  * Set up some functions which are somewhat related to sound.
+  */
+ void InitSoundScheme() {
+-  make_function_symbol_from_c("rpc-busy?", (void*)RpcBusy);
+-  make_function_symbol_from_c("test-load-dgo-c", (void*)LoadDGOTest);
+-  make_stack_arg_function_symbol_from_c("rpc-call", (void*)RpcCall_wrapper);
++  make_function_symbol_from_c("rpc-busy?", GOAL_C_FN(RpcBusy));
++  make_function_symbol_from_c("test-load-dgo-c", GOAL_C_FN(LoadDGOTest));
++  make_stack_arg_function_symbol_from_c("rpc-call", GOAL_C_STACK_FN(RpcCall_wrapper));
+ 
+   // PC port interns
+-  make_function_symbol_from_c("pc-sound-set-flava-hack", (void*)set_flava_hack);
+-  make_function_symbol_from_c("pc-sound-set-fade-hack", (void*)set_fade_hack);
++  make_function_symbol_from_c("pc-sound-set-flava-hack", GOAL_C_FN(set_flava_hack));
++  make_function_symbol_from_c("pc-sound-set-fade-hack", GOAL_C_FN(set_fade_hack));
+ }
+ }  // namespace jak2
+\ No newline at end of file
+diff --git a/game/kernel/jak3/kmachine.cpp b/game/kernel/jak3/kmachine.cpp
+index dcb4481a..fde82912 100644
+--- a/game/kernel/jak3/kmachine.cpp
++++ b/game/kernel/jak3/kmachine.cpp
+@@ -1,4 +1,5 @@
+ #include "kmachine.h"
++#include "game/kernel/common/goal_c_fn.h"
+ 
+ #include <cstring>
+ 
+@@ -427,77 +428,77 @@ void InitMachine_PCPort() {
+       },
+       make_string_from_c);
+ 
+-  make_function_symbol_from_c("__pc-set-levels", (void*)kmachine_extras::pc_set_levels);
++  make_function_symbol_from_c("__pc-set-levels", GOAL_C_FN(kmachine_extras::pc_set_levels));
+   make_function_symbol_from_c("__pc-set-active-levels",
+-                              (void*)kmachine_extras::pc_set_active_levels);
+-  make_function_symbol_from_c("__pc-get-tex-remap", (void*)lookup_jak3_texture_dest_offset);
++                              GOAL_C_FN(kmachine_extras::pc_set_active_levels));
++  make_function_symbol_from_c("__pc-get-tex-remap", GOAL_C_FN(lookup_jak3_texture_dest_offset));
+   make_function_symbol_from_c("pc-init-autosplitter-struct",
+-                              (void*)kmachine_extras::init_autosplit_struct);
++                              GOAL_C_FN(kmachine_extras::init_autosplit_struct));
+ 
+   // discord rich presence
+-  make_function_symbol_from_c("pc-discord-rpc-update", (void*)kmachine_extras::update_discord_rpc);
++  make_function_symbol_from_c("pc-discord-rpc-update", GOAL_C_FN(kmachine_extras::update_discord_rpc));
+ 
+   // debugging tools
+-  make_function_symbol_from_c("alloc-vagdir-names", (void*)kmachine_extras::alloc_vagdir_names);
++  make_function_symbol_from_c("alloc-vagdir-names", GOAL_C_FN(kmachine_extras::alloc_vagdir_names));
+ 
+   // external RPCs
+   make_function_symbol_from_c("pc-fetch-external-speedrun-times",
+-                              (void*)kmachine_extras::pc_fetch_external_speedrun_times);
++                              GOAL_C_FN(kmachine_extras::pc_fetch_external_speedrun_times));
+   make_function_symbol_from_c("pc-fetch-external-race-times",
+-                              (void*)kmachine_extras::pc_fetch_external_race_times);
++                              GOAL_C_FN(kmachine_extras::pc_fetch_external_race_times));
+   make_function_symbol_from_c("pc-fetch-external-highscores",
+-                              (void*)kmachine_extras::pc_fetch_external_highscores);
++                              GOAL_C_FN(kmachine_extras::pc_fetch_external_highscores));
+   make_function_symbol_from_c("pc-get-external-speedrun-time",
+-                              (void*)kmachine_extras::pc_get_external_speedrun_time);
++                              GOAL_C_FN(kmachine_extras::pc_get_external_speedrun_time));
+   make_function_symbol_from_c("pc-get-external-race-time",
+-                              (void*)kmachine_extras::pc_get_external_race_time);
++                              GOAL_C_FN(kmachine_extras::pc_get_external_race_time));
+   make_function_symbol_from_c("pc-get-external-highscore",
+-                              (void*)kmachine_extras::pc_get_external_highscore);
++                              GOAL_C_FN(kmachine_extras::pc_get_external_highscore));
+   make_function_symbol_from_c("pc-get-num-external-speedrun-times",
+-                              (void*)kmachine_extras::pc_get_num_external_speedrun_times);
++                              GOAL_C_FN(kmachine_extras::pc_get_num_external_speedrun_times));
+   make_function_symbol_from_c("pc-get-num-external-race-times",
+-                              (void*)kmachine_extras::pc_get_num_external_race_times);
++                              GOAL_C_FN(kmachine_extras::pc_get_num_external_race_times));
+   make_function_symbol_from_c("pc-get-num-external-highscores",
+-                              (void*)kmachine_extras::pc_get_num_external_highscores);
++                              GOAL_C_FN(kmachine_extras::pc_get_num_external_highscores));
+ 
+   // speedrunning stuff
+   make_function_symbol_from_c("pc-sr-mode-get-practice-entries-amount",
+-                              (void*)kmachine_extras::pc_sr_mode_get_practice_entries_amount);
++                              GOAL_C_FN(kmachine_extras::pc_sr_mode_get_practice_entries_amount));
+   make_function_symbol_from_c("pc-sr-mode-get-practice-entry-name",
+-                              (void*)kmachine_extras::pc_sr_mode_get_practice_entry_name);
++                              GOAL_C_FN(kmachine_extras::pc_sr_mode_get_practice_entry_name));
+   make_function_symbol_from_c("pc-sr-mode-get-practice-entry-continue-point",
+-                              (void*)kmachine_extras::pc_sr_mode_get_practice_entry_continue_point);
++                              GOAL_C_FN(kmachine_extras::pc_sr_mode_get_practice_entry_continue_point));
+   make_function_symbol_from_c(
+       "pc-sr-mode-get-practice-entry-history-success",
+-      (void*)kmachine_extras::pc_sr_mode_get_practice_entry_history_success);
++      GOAL_C_FN(kmachine_extras::pc_sr_mode_get_practice_entry_history_success));
+   make_function_symbol_from_c(
+       "pc-sr-mode-get-practice-entry-history-attempts",
+-      (void*)kmachine_extras::pc_sr_mode_get_practice_entry_history_attempts);
++      GOAL_C_FN(kmachine_extras::pc_sr_mode_get_practice_entry_history_attempts));
+   make_function_symbol_from_c(
+       "pc-sr-mode-get-practice-entry-session-success",
+-      (void*)kmachine_extras::pc_sr_mode_get_practice_entry_session_success);
++      GOAL_C_FN(kmachine_extras::pc_sr_mode_get_practice_entry_session_success));
+   make_function_symbol_from_c(
+       "pc-sr-mode-get-practice-entry-session-attempts",
+-      (void*)kmachine_extras::pc_sr_mode_get_practice_entry_session_attempts);
++      GOAL_C_FN(kmachine_extras::pc_sr_mode_get_practice_entry_session_attempts));
+   make_function_symbol_from_c("pc-sr-mode-get-practice-entry-avg-time",
+-                              (void*)kmachine_extras::pc_sr_mode_get_practice_entry_avg_time);
++                              GOAL_C_FN(kmachine_extras::pc_sr_mode_get_practice_entry_avg_time));
+   make_function_symbol_from_c("pc-sr-mode-get-practice-entry-fastest-time",
+-                              (void*)kmachine_extras::pc_sr_mode_get_practice_entry_fastest_time);
++                              GOAL_C_FN(kmachine_extras::pc_sr_mode_get_practice_entry_fastest_time));
+   make_function_symbol_from_c("pc-sr-mode-record-practice-entry-attempt!",
+-                              (void*)kmachine_extras::pc_sr_mode_record_practice_entry_attempt);
++                              GOAL_C_FN(kmachine_extras::pc_sr_mode_record_practice_entry_attempt));
+   make_function_symbol_from_c("pc-sr-mode-init-practice-info!",
+-                              (void*)kmachine_extras::pc_sr_mode_init_practice_info);
++                              GOAL_C_FN(kmachine_extras::pc_sr_mode_init_practice_info));
+   make_function_symbol_from_c("pc-sr-mode-get-custom-category-amount",
+-                              (void*)kmachine_extras::pc_sr_mode_get_custom_category_amount);
++                              GOAL_C_FN(kmachine_extras::pc_sr_mode_get_custom_category_amount));
+   make_function_symbol_from_c("pc-sr-mode-get-custom-category-name",
+-                              (void*)kmachine_extras::pc_sr_mode_get_custom_category_name);
++                              GOAL_C_FN(kmachine_extras::pc_sr_mode_get_custom_category_name));
+   make_function_symbol_from_c(
+       "pc-sr-mode-get-custom-category-continue-point",
+-      (void*)kmachine_extras::pc_sr_mode_get_custom_category_continue_point);
++      GOAL_C_FN(kmachine_extras::pc_sr_mode_get_custom_category_continue_point));
+   make_function_symbol_from_c("pc-sr-mode-init-custom-category-info!",
+-                              (void*)kmachine_extras::pc_sr_mode_init_custom_category_info);
++                              GOAL_C_FN(kmachine_extras::pc_sr_mode_init_custom_category_info));
+   make_function_symbol_from_c("pc-sr-mode-dump-new-custom-category",
+-                              (void*)kmachine_extras::pc_sr_mode_dump_new_custom_category);
++                              GOAL_C_FN(kmachine_extras::pc_sr_mode_dump_new_custom_category));
+ 
+   // setup string constants
+   auto user_dir_path = file_util::get_user_config_dir();
+@@ -512,38 +513,38 @@ void InitMachine_PCPort() {
+ // End PC Stuff
+ 
+ void InitMachineScheme() {
+-  make_function_symbol_from_c("put-display-env", (void*)PutDisplayEnv);
+-  make_function_symbol_from_c("syncv", (void*)sceGsSyncV);
+-  make_function_symbol_from_c("sync-path", (void*)sceGsSyncPath);
+-  make_function_symbol_from_c("reset-path", (void*)sceGsResetPath);
+-  make_function_symbol_from_c("reset-graph", (void*)sceGsResetGraph);
+-  make_function_symbol_from_c("dma-sync", (void*)sceDmaSync);
+-  make_function_symbol_from_c("gs-put-imr", (void*)sceGsPutIMR);
+-  make_function_symbol_from_c("gs-get-imr", (void*)sceGsGetIMR);
+-  make_function_symbol_from_c("gs-store-image", (void*)sceGsExecStoreImage);
+-  make_function_symbol_from_c("flush-cache", (void*)FlushCache);
+-  make_function_symbol_from_c("cpad-open", (void*)CPadOpen);
+-  make_function_symbol_from_c("cpad-get-data", (void*)CPadGetData);
+-  make_function_symbol_from_c("mouse-get-data", (void*)MouseGetData);
+-  make_function_symbol_from_c("keybd-get-data", (void*)KeybdGetData);
+-  make_function_symbol_from_c("install-handler", (void*)InstallHandler);
+-  make_function_symbol_from_c("install-debug-handler", (void*)InstallDebugHandler);
+-  make_function_symbol_from_c("file-stream-open", (void*)kopen);
+-  make_function_symbol_from_c("file-stream-close", (void*)kclose);
+-  make_function_symbol_from_c("file-stream-length", (void*)klength);
+-  make_function_symbol_from_c("file-stream-seek", (void*)kseek);
+-  make_function_symbol_from_c("file-stream-read", (void*)kread);
+-  make_function_symbol_from_c("file-stream-write", (void*)kwrite);
+-  make_function_symbol_from_c("scf-get-language", (void*)DecodeLanguage);
+-  make_function_symbol_from_c("scf-get-time", (void*)DecodeTime);
+-  make_function_symbol_from_c("scf-get-aspect", (void*)DecodeAspect);
+-  make_function_symbol_from_c("scf-get-volume", (void*)DecodeVolume);
+-  make_function_symbol_from_c("scf-get-territory", (void*)DecodeTerritory);
+-  make_function_symbol_from_c("scf-get-timeout", (void*)DecodeTimeout);
+-  make_function_symbol_from_c("scf-get-inactive-timeout", (void*)DecodeInactiveTimeout);
+-  make_function_symbol_from_c("dma-to-iop", (void*)dma_to_iop);
+-  make_function_symbol_from_c("kernel-shutdown", (void*)KernelShutdown);
+-  make_function_symbol_from_c("aybabtu", (void*)aybabtu);  // was nothing
++  make_function_symbol_from_c("put-display-env", GOAL_C_FN(PutDisplayEnv));
++  make_function_symbol_from_c("syncv", GOAL_C_FN(sceGsSyncV));
++  make_function_symbol_from_c("sync-path", GOAL_C_FN(sceGsSyncPath));
++  make_function_symbol_from_c("reset-path", GOAL_C_FN(sceGsResetPath));
++  make_function_symbol_from_c("reset-graph", GOAL_C_FN(sceGsResetGraph));
++  make_function_symbol_from_c("dma-sync", GOAL_C_FN(sceDmaSync));
++  make_function_symbol_from_c("gs-put-imr", GOAL_C_FN(sceGsPutIMR));
++  make_function_symbol_from_c("gs-get-imr", GOAL_C_FN(sceGsGetIMR));
++  make_function_symbol_from_c("gs-store-image", GOAL_C_FN(sceGsExecStoreImage));
++  make_function_symbol_from_c("flush-cache", GOAL_C_FN(FlushCache));
++  make_function_symbol_from_c("cpad-open", GOAL_C_FN(CPadOpen));
++  make_function_symbol_from_c("cpad-get-data", GOAL_C_FN(CPadGetData));
++  make_function_symbol_from_c("mouse-get-data", GOAL_C_FN(MouseGetData));
++  make_function_symbol_from_c("keybd-get-data", GOAL_C_FN(KeybdGetData));
++  make_function_symbol_from_c("install-handler", GOAL_C_FN(InstallHandler));
++  make_function_symbol_from_c("install-debug-handler", GOAL_C_FN(InstallDebugHandler));
++  make_function_symbol_from_c("file-stream-open", GOAL_C_FN(kopen));
++  make_function_symbol_from_c("file-stream-close", GOAL_C_FN(kclose));
++  make_function_symbol_from_c("file-stream-length", GOAL_C_FN(klength));
++  make_function_symbol_from_c("file-stream-seek", GOAL_C_FN(kseek));
++  make_function_symbol_from_c("file-stream-read", GOAL_C_FN(kread));
++  make_function_symbol_from_c("file-stream-write", GOAL_C_FN(kwrite));
++  make_function_symbol_from_c("scf-get-language", GOAL_C_FN(DecodeLanguage));
++  make_function_symbol_from_c("scf-get-time", GOAL_C_FN(DecodeTime));
++  make_function_symbol_from_c("scf-get-aspect", GOAL_C_FN(DecodeAspect));
++  make_function_symbol_from_c("scf-get-volume", GOAL_C_FN(DecodeVolume));
++  make_function_symbol_from_c("scf-get-territory", GOAL_C_FN(DecodeTerritory));
++  make_function_symbol_from_c("scf-get-timeout", GOAL_C_FN(DecodeTimeout));
++  make_function_symbol_from_c("scf-get-inactive-timeout", GOAL_C_FN(DecodeInactiveTimeout));
++  make_function_symbol_from_c("dma-to-iop", GOAL_C_FN(dma_to_iop));
++  make_function_symbol_from_c("kernel-shutdown", GOAL_C_FN(KernelShutdown));
++  make_function_symbol_from_c("aybabtu", GOAL_C_FN(aybabtu));  // was nothing
+ 
+   InitMachine_PCPort();
+ 
+diff --git a/game/kernel/jak3/kscheme.cpp b/game/kernel/jak3/kscheme.cpp
+index 0c9e9e7e..f9801f17 100644
+--- a/game/kernel/jak3/kscheme.cpp
++++ b/game/kernel/jak3/kscheme.cpp
+@@ -1,4 +1,5 @@
+ #include "kscheme.h"
++#include "game/kernel/common/goal_c_fn.h"
+ 
+ #include <unordered_map>
+ 
+@@ -294,6 +295,14 @@ void _stack_call_arm64();
+ Ptr<Function> make_function_from_c_systemv(void* func, bool arg3_is_pp) {
+   auto mem = Ptr<u8>(alloc_heap_object(s7.offset + FIX_SYM_GLOBAL_HEAP,
+                                        u32_in_fixed_sym(FIX_SYM_FUNCTION_TYPE), 0x40, UNKNOWN_PP));
++#ifdef __EMSCRIPTEN__
++  // Jakompiled web: func is a GOAL_C_FN adapter; the function object holds its wasm
++  // table index (and a zero word, like the stubs emitted by goalc for wasm).
++  (void)arg3_is_pp;
++  mem.cast<u32>().c()[0] = (u32)(uintptr_t)func;
++  mem.cast<u32>().c()[1] = 0;
++  return mem.cast<Function>();
++#endif
+   auto f = (uint64_t)func;
+   auto target_function = (u8*)&f;
+ #ifndef __aarch64__
+@@ -411,6 +420,13 @@ Ptr<Function> make_stack_arg_function_from_c_systemv(void* func) {
+   // allocate a function object on the global heap
+   auto mem = Ptr<u8>(alloc_heap_object(s7.offset + FIX_SYM_GLOBAL_HEAP,
+                                        u32_in_fixed_sym(FIX_SYM_FUNCTION_TYPE), 0x40, UNKNOWN_PP));
++#ifdef __EMSCRIPTEN__
++  // Jakompiled web: func is a GOAL_C_FN adapter; the function object holds its wasm
++  // table index (and a zero word, like the stubs emitted by goalc for wasm).
++  mem.cast<u32>().c()[0] = (u32)(uintptr_t)func;
++  mem.cast<u32>().c()[1] = 0;
++  return mem.cast<Function>();
++#endif
+   auto f = (uint64_t)func;
+   auto target_function = (u8*)&f;
+ #ifndef __aarch64__
+@@ -1580,11 +1596,11 @@ int InitHeapAndSymbol() {
+   set_fixed_symbol(FIX_SYM_NOTHING_FUNC, "nothing", make_nothing_func().offset);
+   set_fixed_symbol(FIX_SYM_ZERO_FUNC, "zero-func", make_zero_func().offset);
+   set_fixed_symbol(FIX_SYM_ASIZE_OF_BASIC_FUNC, "asize-of-basic-func",
+-                   make_function_from_c((void*)asize_of_basic).offset);
++                   make_function_from_c(GOAL_C_FN(asize_of_basic)).offset);
+   set_fixed_symbol(FIX_SYM_COPY_BASIC_FUNC, "asize-of-basic-func",  // typo in name here again.
+-                   make_function_from_c((void*)copy_basic, true).offset);
++                   make_function_from_c(GOAL_C_FN(copy_basic), true).offset);
+   set_fixed_symbol(FIX_SYM_DELETE_BASIC, "delete-basic",
+-                   make_function_from_c((void*)delete_basic).offset);
++                   make_function_from_c(GOAL_C_FN(delete_basic)).offset);
+   set_fixed_symbol(FIX_SYM_GLOBAL_HEAP, "global", kglobalheap.offset);
+   set_fixed_symbol(FIX_SYM_DEBUG, "debug", kdebugheap.offset);
+   set_fixed_symbol(FIX_SYM_STATIC, "static", s7.offset + FIX_SYM_STATIC);
+@@ -1715,10 +1731,10 @@ int InitHeapAndSymbol() {
+                    s7.offset + FIX_SYM_TRUE);
+   set_fixed_symbol(FIX_SYM_NETWORK_BOOTSTRAP, "network-bootstrap", 0);
+ 
+-  auto new_illegal_func = make_function_from_c((void*)new_illegal);
+-  auto delete_illegal_func = make_function_from_c((void*)delete_illegal);
+-  auto print_object_func = make_function_from_c((void*)print_object);
+-  auto inspect_object_func = make_function_from_c((void*)inspect_object);
++  auto new_illegal_func = make_function_from_c(GOAL_C_FN(new_illegal));
++  auto delete_illegal_func = make_function_from_c(GOAL_C_FN(delete_illegal));
++  auto print_object_func = make_function_from_c(GOAL_C_FN(print_object));
++  auto inspect_object_func = make_function_from_c(GOAL_C_FN(inspect_object));
+ 
+   set_fixed_type(FIX_SYM_OBJECT_TYPE, "object", get_fixed_type_symbol(FIX_SYM_OBJECT_TYPE),
+                  pack_type_flag(9, 0, 4), print_object_func.offset, inspect_object_func.offset);
+@@ -1729,73 +1745,73 @@ int InitHeapAndSymbol() {
+       Ptr<Function>(u32_in_fixed_sym(FIX_SYM_ZERO_FUNC));  // changed to zero!
+   object_type->length_method =
+       Ptr<Function>(u32_in_fixed_sym(FIX_SYM_ZERO_FUNC));  // changed to zero!
+-  object_type->copy_method = make_function_from_c((void*)copy_fixed);
++  object_type->copy_method = make_function_from_c(GOAL_C_FN(copy_fixed));
+ 
+   auto structure_type =
+       set_fixed_type(FIX_SYM_STRUCTURE, "structure", get_fixed_type_symbol(FIX_SYM_OBJECT_TYPE),
+-                     pack_type_flag(9, 0, 4), make_function_from_c((void*)print_structure).offset,
+-                     make_function_from_c((void*)inspect_structure).offset);
+-  structure_type->new_method = make_function_from_c((void*)new_structure);
+-  structure_type->delete_method = make_function_from_c((void*)delete_structure);
++                     pack_type_flag(9, 0, 4), make_function_from_c(GOAL_C_FN(print_structure)).offset,
++                     make_function_from_c(GOAL_C_FN(inspect_structure)).offset);
++  structure_type->new_method = make_function_from_c(GOAL_C_FN(new_structure));
++  structure_type->delete_method = make_function_from_c(GOAL_C_FN(delete_structure));
+ 
+   auto basic_type =
+       set_fixed_type(FIX_SYM_BASIC, "basic", get_fixed_type_symbol(FIX_SYM_STRUCTURE),
+-                     pack_type_flag(9, 0, 4), make_function_from_c((void*)print_basic).offset,
+-                     make_function_from_c((void*)inspect_basic).offset);
+-  basic_type->new_method = make_function_from_c((void*)new_basic, true);
++                     pack_type_flag(9, 0, 4), make_function_from_c(GOAL_C_FN(print_basic)).offset,
++                     make_function_from_c(GOAL_C_FN(inspect_basic)).offset);
++  basic_type->new_method = make_function_from_c(GOAL_C_FN(new_basic), true);
+   basic_type->delete_method = Ptr<Function>(u32_in_fixed_sym(FIX_SYM_DELETE_BASIC));
+   basic_type->asize_of_method = Ptr<Function>(u32_in_fixed_sym(FIX_SYM_ASIZE_OF_BASIC_FUNC));
+   basic_type->copy_method = Ptr<Function>(u32_in_fixed_sym(FIX_SYM_COPY_BASIC_FUNC));
+ 
+   set_fixed_type(FIX_SYM_SYMBOL_TYPE, "symbol", get_fixed_type_symbol(FIX_SYM_OBJECT_TYPE),
+-                 pack_type_flag(9, 0, 4), make_function_from_c((void*)print_symbol).offset,
+-                 make_function_from_c((void*)inspect_symbol).offset);
++                 pack_type_flag(9, 0, 4), make_function_from_c(GOAL_C_FN(print_symbol)).offset,
++                 make_function_from_c(GOAL_C_FN(inspect_symbol)).offset);
+   auto sym_type = Ptr<Type>(u32_in_fixed_sym(FIX_SYM_SYMBOL_TYPE));
+   sym_type->new_method = new_illegal_func;
+   sym_type->delete_method = delete_illegal_func;
+ 
+   set_fixed_type(FIX_SYM_TYPE_TYPE, "type", get_fixed_type_symbol(FIX_SYM_BASIC),
+-                 pack_type_flag(9, 0, 0x38), make_function_from_c((void*)print_type).offset,
+-                 make_function_from_c((void*)inspect_type).offset);
++                 pack_type_flag(9, 0, 0x38), make_function_from_c(GOAL_C_FN(print_type)).offset,
++                 make_function_from_c(GOAL_C_FN(inspect_type)).offset);
+   auto type_type = Ptr<Type>(u32_in_fixed_sym(FIX_SYM_TYPE_TYPE));
+-  type_type->new_method = make_function_from_c((void*)new_type);
++  type_type->new_method = make_function_from_c(GOAL_C_FN(new_type));
+   type_type->delete_method = delete_illegal_func;
+ 
+   set_fixed_type(FIX_SYM_STRING_TYPE, "string", get_fixed_type_symbol(FIX_SYM_BASIC),
+-                 pack_type_flag(9, 0, 8), make_function_from_c((void*)print_string).offset,
+-                 make_function_from_c((void*)inspect_string).offset);
++                 pack_type_flag(9, 0, 8), make_function_from_c(GOAL_C_FN(print_string)).offset,
++                 make_function_from_c(GOAL_C_FN(inspect_string)).offset);
+ 
+   set_fixed_type(FIX_SYM_FUNCTION_TYPE, "function", get_fixed_type_symbol(FIX_SYM_BASIC),
+-                 pack_type_flag(9, 0, 4), make_function_from_c((void*)print_function).offset, 0);
++                 pack_type_flag(9, 0, 4), make_function_from_c(GOAL_C_FN(print_function)).offset, 0);
+   auto function_type = Ptr<Type>(u32_in_fixed_sym(FIX_SYM_FUNCTION_TYPE));
+   function_type->new_method = new_illegal_func;
+   function_type->delete_method = delete_illegal_func;
+ 
+   set_fixed_type(FIX_SYM_VU_FUNCTION, "vu-function", get_fixed_type_symbol(FIX_SYM_STRUCTURE),
+-                 pack_type_flag(9, 0, 0x10), make_function_from_c((void*)print_vu_function).offset,
+-                 make_function_from_c((void*)inspect_vu_function).offset);
++                 pack_type_flag(9, 0, 0x10), make_function_from_c(GOAL_C_FN(print_vu_function)).offset,
++                 make_function_from_c(GOAL_C_FN(inspect_vu_function)).offset);
+   Ptr<Type>(u32_in_fixed_sym(FIX_SYM_VU_FUNCTION))->delete_method = delete_illegal_func;
+ 
+   set_fixed_type(FIX_SYM_LINK_BLOCK, "link-block", get_fixed_type_symbol(FIX_SYM_BASIC),
+                  pack_type_flag(9, 0, 0xc), 0,
+-                 make_function_from_c((void*)inspect_link_block).offset);
++                 make_function_from_c(GOAL_C_FN(inspect_link_block)).offset);
+   auto link_block_type = Ptr<Type>(u32_in_fixed_sym(FIX_SYM_LINK_BLOCK));
+   link_block_type->new_method = new_illegal_func;
+   link_block_type->delete_method = delete_illegal_func;
+ 
+   set_fixed_type(FIX_SYM_HEAP, "kheap", get_fixed_type_symbol(FIX_SYM_STRUCTURE),
+-                 pack_type_flag(9, 0, 0x10), 0, make_function_from_c((void*)inspect_kheap).offset);
++                 pack_type_flag(9, 0, 0x10), 0, make_function_from_c(GOAL_C_FN(inspect_kheap)).offset);
+ 
+   set_fixed_type(FIX_SYM_ARRAY, "array", get_fixed_type_symbol(FIX_SYM_BASIC),
+                  pack_type_flag(9, 0, 0x10), 0, 0);
+ 
+   set_fixed_type(FIX_SYM_PAIR_TYPE, "pair", get_fixed_type_symbol(FIX_SYM_OBJECT_TYPE),
+-                 pack_type_flag(9, 0, 8), make_function_from_c((void*)print_pair).offset,
+-                 make_function_from_c((void*)inspect_pair).offset);
++                 pack_type_flag(9, 0, 8), make_function_from_c(GOAL_C_FN(print_pair)).offset,
++                 make_function_from_c(GOAL_C_FN(inspect_pair)).offset);
+   Ptr<Type>(u32_in_fixed_sym(FIX_SYM_PAIR_TYPE))->new_method =
+-      make_function_from_c((void*)new_pair);
++      make_function_from_c(GOAL_C_FN(new_pair));
+   Ptr<Type>(u32_in_fixed_sym(FIX_SYM_PAIR_TYPE))->delete_method =
+-      make_function_from_c((void*)delete_pair);
++      make_function_from_c(GOAL_C_FN(delete_pair));
+ 
+   set_fixed_type(FIX_SYM_PROCESS_TREE, "process-tree", get_fixed_type_symbol(FIX_SYM_BASIC),
+                  pack_type_flag(0xe, 0, 0x24), 0, 0);
+@@ -1814,20 +1830,20 @@ int InitHeapAndSymbol() {
+   Ptr<Type>(u32_in_fixed_sym(FIX_SYM_POINTER))->new_method = new_illegal_func;
+ 
+   set_fixed_type(FIX_SYM_NUMBER, "number", get_fixed_type_symbol(FIX_SYM_OBJECT_TYPE),
+-                 pack_type_flag(9, 0, 8), make_function_from_c((void*)print_integer).offset,
+-                 make_function_from_c((void*)inspect_integer).offset);
++                 pack_type_flag(9, 0, 8), make_function_from_c(GOAL_C_FN(print_integer)).offset,
++                 make_function_from_c(GOAL_C_FN(inspect_integer)).offset);
+   Ptr<Type>(u32_in_fixed_sym(FIX_SYM_NUMBER))->new_method = new_illegal_func;
+ 
+   set_fixed_type(FIX_SYM_FLOAT, "float", get_fixed_type_symbol(FIX_SYM_NUMBER),
+-                 pack_type_flag(9, 0, 4), make_function_from_c((void*)print_float).offset,
+-                 make_function_from_c((void*)inspect_float).offset);
++                 pack_type_flag(9, 0, 4), make_function_from_c(GOAL_C_FN(print_float)).offset,
++                 make_function_from_c(GOAL_C_FN(inspect_float)).offset);
+ 
+   set_fixed_type(FIX_SYM_INTEGER, "integer", get_fixed_type_symbol(FIX_SYM_NUMBER),
+                  pack_type_flag(9, 0, 8), 0, 0);
+ 
+   set_fixed_type(FIX_SYM_BINTEGER, "binteger", get_fixed_type_symbol(FIX_SYM_INTEGER),
+-                 pack_type_flag(9, 0, 8), make_function_from_c((void*)print_binteger).offset,
+-                 make_function_from_c((void*)inspect_binteger).offset);
++                 pack_type_flag(9, 0, 8), make_function_from_c(GOAL_C_FN(print_binteger)).offset,
++                 make_function_from_c(GOAL_C_FN(inspect_binteger)).offset);
+ 
+   set_fixed_type(FIX_SYM_SINTEGER, "sinteger", get_fixed_type_symbol(FIX_SYM_INTEGER),
+                  pack_type_flag(9, 0, 8), 0, 0);
+@@ -1856,43 +1872,43 @@ int InitHeapAndSymbol() {
+                  pack_type_flag(9, 0, 16), 0, 0);
+ 
+   Ptr<Type>(u32_in_fixed_sym(FIX_SYM_OBJECT_TYPE))->new_method =
+-      make_function_from_c((void*)alloc_heap_object, true);
+-
+-  make_function_symbol_from_c("string->symbol", (void*)intern);
+-  make_function_symbol_from_c("symbol->string", (void*)symbol_to_string_from_c);
+-  make_function_symbol_from_c("print", (void*)sprint);
+-  make_function_symbol_from_c("inspect", (void*)inspect_object);
+-  make_function_symbol_from_c("load", (void*)load);
+-  make_function_symbol_from_c("loadb", (void*)loadb);
+-  make_function_symbol_from_c("loado", (void*)loado);
+-  make_function_symbol_from_c("unload", (void*)unload);
+-  make_stack_arg_function_symbol_from_c("_format", (void*)format_impl_jak3);
+-  make_function_symbol_from_c("malloc", (void*)alloc_heap_memory);
+-  make_function_symbol_from_c("kmalloc", (void*)goal_malloc);
+-  make_function_symbol_from_c("kmemopen", (void*)kmemopen);
+-  make_function_symbol_from_c("kmemclose", (void*)kmemclose);
+-  make_function_symbol_from_c("new-dynamic-structure", (void*)new_dynamic_structure);
+-  make_function_symbol_from_c("method-set!", (void*)method_set);
+-  make_stack_arg_function_symbol_from_c("link", (void*)link_and_exec_wrapper);
+-  make_function_symbol_from_c("link-busy?", (void*)link_busy);
+-  make_function_symbol_from_c("link-reset", (void*)link_reset);
+-  make_function_symbol_from_c("dgo-load", (void*)load_and_link_dgo);
++      make_function_from_c(GOAL_C_FN(alloc_heap_object), true);
++
++  make_function_symbol_from_c("string->symbol", GOAL_C_FN(intern));
++  make_function_symbol_from_c("symbol->string", GOAL_C_FN(symbol_to_string_from_c));
++  make_function_symbol_from_c("print", GOAL_C_FN(sprint));
++  make_function_symbol_from_c("inspect", GOAL_C_FN(inspect_object));
++  make_function_symbol_from_c("load", GOAL_C_FN(load));
++  make_function_symbol_from_c("loadb", GOAL_C_FN(loadb));
++  make_function_symbol_from_c("loado", GOAL_C_FN(loado));
++  make_function_symbol_from_c("unload", GOAL_C_FN(unload));
++  make_stack_arg_function_symbol_from_c("_format", GOAL_C_STACK_FN(format_impl_jak3));
++  make_function_symbol_from_c("malloc", GOAL_C_FN(alloc_heap_memory));
++  make_function_symbol_from_c("kmalloc", GOAL_C_FN(goal_malloc));
++  make_function_symbol_from_c("kmemopen", GOAL_C_FN(kmemopen));
++  make_function_symbol_from_c("kmemclose", GOAL_C_FN(kmemclose));
++  make_function_symbol_from_c("new-dynamic-structure", GOAL_C_FN(new_dynamic_structure));
++  make_function_symbol_from_c("method-set!", GOAL_C_FN(method_set));
++  make_stack_arg_function_symbol_from_c("link", GOAL_C_STACK_FN(link_and_exec_wrapper));
++  make_function_symbol_from_c("link-busy?", GOAL_C_FN(link_busy));
++  make_function_symbol_from_c("link-reset", GOAL_C_FN(link_reset));
++  make_function_symbol_from_c("dgo-load", GOAL_C_FN(load_and_link_dgo));
+   make_raw_function_symbol_from_c("ultimate-memcpy", 0);
+   make_raw_function_symbol_from_c("symlink2", 0);
+   make_raw_function_symbol_from_c("symlink3", 0);
+-  make_stack_arg_function_symbol_from_c("link-begin", (void*)link_begin);
+-  make_function_symbol_from_c("link-resume", (void*)link_resume);
+-  make_function_symbol_from_c("sql-query", (void*)sql_query_sync);
+-  make_function_symbol_from_c("mc-run", (void*)MC_run);
+-  make_function_symbol_from_c("mc-format", (void*)MC_format);
+-  make_function_symbol_from_c("mc-unformat", (void*)MC_unformat);
+-  make_function_symbol_from_c("mc-create-file", (void*)MC_createfile);
+-  make_function_symbol_from_c("mc-save", (void*)MC_save);
+-  make_function_symbol_from_c("mc-load", (void*)MC_load);
+-  make_function_symbol_from_c("mc-check-result", (void*)MC_check_result);
+-  make_function_symbol_from_c("mc-get-slot-info", (void*)MC_get_status);
+-  make_function_symbol_from_c("mc-makefile", (void*)MC_makefile);
+-  make_function_symbol_from_c("kset-language", (void*)MC_set_language);
++  make_stack_arg_function_symbol_from_c("link-begin", GOAL_C_STACK_FN(link_begin));
++  make_function_symbol_from_c("link-resume", GOAL_C_FN(link_resume));
++  make_function_symbol_from_c("sql-query", GOAL_C_FN(sql_query_sync));
++  make_function_symbol_from_c("mc-run", GOAL_C_FN(MC_run));
++  make_function_symbol_from_c("mc-format", GOAL_C_FN(MC_format));
++  make_function_symbol_from_c("mc-unformat", GOAL_C_FN(MC_unformat));
++  make_function_symbol_from_c("mc-create-file", GOAL_C_FN(MC_createfile));
++  make_function_symbol_from_c("mc-save", GOAL_C_FN(MC_save));
++  make_function_symbol_from_c("mc-load", GOAL_C_FN(MC_load));
++  make_function_symbol_from_c("mc-check-result", GOAL_C_FN(MC_check_result));
++  make_function_symbol_from_c("mc-get-slot-info", GOAL_C_FN(MC_get_status));
++  make_function_symbol_from_c("mc-makefile", GOAL_C_FN(MC_makefile));
++  make_function_symbol_from_c("kset-language", GOAL_C_FN(MC_set_language));
+ 
+   auto ds_symbol = intern_from_c(-1, 0, "*debug-segment*");
+   if (DebugSegment) {
+diff --git a/game/kernel/jak3/ksound.cpp b/game/kernel/jak3/ksound.cpp
+index 8dae6bd5..8e01190c 100644
+--- a/game/kernel/jak3/ksound.cpp
++++ b/game/kernel/jak3/ksound.cpp
+@@ -1,4 +1,5 @@
+ #include "ksound.h"
++#include "game/kernel/common/goal_c_fn.h"
+ 
+ #include "game/kernel/common/kdgo.h"
+ #include "game/kernel/common/ksound.h"
+@@ -9,12 +10,12 @@ namespace jak3 {
+  * Set up some functions which are somewhat related to sound.
+  */
+ void InitSoundScheme() {
+-  make_function_symbol_from_c("rpc-busy?", (void*)RpcBusy);
+-  make_function_symbol_from_c("test-load-dgo-c", (void*)LoadDGOTest);
+-  make_stack_arg_function_symbol_from_c("rpc-call", (void*)RpcCall_wrapper);
++  make_function_symbol_from_c("rpc-busy?", GOAL_C_FN(RpcBusy));
++  make_function_symbol_from_c("test-load-dgo-c", GOAL_C_FN(LoadDGOTest));
++  make_stack_arg_function_symbol_from_c("rpc-call", GOAL_C_STACK_FN(RpcCall_wrapper));
+ 
+   // PC port interns
+-  make_function_symbol_from_c("pc-sound-set-flava-hack", (void*)set_flava_hack);
+-  make_function_symbol_from_c("pc-sound-set-fade-hack", (void*)set_fade_hack);
++  make_function_symbol_from_c("pc-sound-set-flava-hack", GOAL_C_FN(set_flava_hack));
++  make_function_symbol_from_c("pc-sound-set-fade-hack", GOAL_C_FN(set_fade_hack));
+ }
+ }  // namespace jak3
+\ No newline at end of file
+diff --git a/game/kernel/jakx/kmachine.cpp b/game/kernel/jakx/kmachine.cpp
+index 22817db0..a2339e24 100644
+--- a/game/kernel/jakx/kmachine.cpp
++++ b/game/kernel/jakx/kmachine.cpp
+@@ -1,4 +1,5 @@
+ #include "kmachine.h"
++#include "game/kernel/common/goal_c_fn.h"
+ 
+ #include <cstring>
+ 
+@@ -392,77 +393,77 @@ void InitMachine_PCPort() {
+       },
+       make_string_from_c);
+ 
+-  make_function_symbol_from_c("__pc-set-levels", (void*)kmachine_extras::pc_set_levels);
++  make_function_symbol_from_c("__pc-set-levels", GOAL_C_FN(kmachine_extras::pc_set_levels));
+   make_function_symbol_from_c("__pc-set-active-levels",
+-                              (void*)kmachine_extras::pc_set_active_levels);
+-  make_function_symbol_from_c("__pc-get-tex-remap", (void*)lookup_jakx_texture_dest_offset);
++                              GOAL_C_FN(kmachine_extras::pc_set_active_levels));
++  make_function_symbol_from_c("__pc-get-tex-remap", GOAL_C_FN(lookup_jakx_texture_dest_offset));
+   make_function_symbol_from_c("pc-init-autosplitter-struct",
+-                              (void*)kmachine_extras::init_autosplit_struct);
++                              GOAL_C_FN(kmachine_extras::init_autosplit_struct));
+ 
+   // discord rich presence
+-  make_function_symbol_from_c("pc-discord-rpc-update", (void*)kmachine_extras::update_discord_rpc);
++  make_function_symbol_from_c("pc-discord-rpc-update", GOAL_C_FN(kmachine_extras::update_discord_rpc));
+ 
+   // debugging tools
+-  make_function_symbol_from_c("alloc-vagdir-names", (void*)kmachine_extras::alloc_vagdir_names);
++  make_function_symbol_from_c("alloc-vagdir-names", GOAL_C_FN(kmachine_extras::alloc_vagdir_names));
+ 
+   // external RPCs
+   make_function_symbol_from_c("pc-fetch-external-speedrun-times",
+-                              (void*)kmachine_extras::pc_fetch_external_speedrun_times);
++                              GOAL_C_FN(kmachine_extras::pc_fetch_external_speedrun_times));
+   make_function_symbol_from_c("pc-fetch-external-race-times",
+-                              (void*)kmachine_extras::pc_fetch_external_race_times);
++                              GOAL_C_FN(kmachine_extras::pc_fetch_external_race_times));
+   make_function_symbol_from_c("pc-fetch-external-highscores",
+-                              (void*)kmachine_extras::pc_fetch_external_highscores);
++                              GOAL_C_FN(kmachine_extras::pc_fetch_external_highscores));
+   make_function_symbol_from_c("pc-get-external-speedrun-time",
+-                              (void*)kmachine_extras::pc_get_external_speedrun_time);
++                              GOAL_C_FN(kmachine_extras::pc_get_external_speedrun_time));
+   make_function_symbol_from_c("pc-get-external-race-time",
+-                              (void*)kmachine_extras::pc_get_external_race_time);
++                              GOAL_C_FN(kmachine_extras::pc_get_external_race_time));
+   make_function_symbol_from_c("pc-get-external-highscore",
+-                              (void*)kmachine_extras::pc_get_external_highscore);
++                              GOAL_C_FN(kmachine_extras::pc_get_external_highscore));
+   make_function_symbol_from_c("pc-get-num-external-speedrun-times",
+-                              (void*)kmachine_extras::pc_get_num_external_speedrun_times);
++                              GOAL_C_FN(kmachine_extras::pc_get_num_external_speedrun_times));
+   make_function_symbol_from_c("pc-get-num-external-race-times",
+-                              (void*)kmachine_extras::pc_get_num_external_race_times);
++                              GOAL_C_FN(kmachine_extras::pc_get_num_external_race_times));
+   make_function_symbol_from_c("pc-get-num-external-highscores",
+-                              (void*)kmachine_extras::pc_get_num_external_highscores);
++                              GOAL_C_FN(kmachine_extras::pc_get_num_external_highscores));
+ 
+   // speedrunning stuff
+   make_function_symbol_from_c("pc-sr-mode-get-practice-entries-amount",
+-                              (void*)kmachine_extras::pc_sr_mode_get_practice_entries_amount);
++                              GOAL_C_FN(kmachine_extras::pc_sr_mode_get_practice_entries_amount));
+   make_function_symbol_from_c("pc-sr-mode-get-practice-entry-name",
+-                              (void*)kmachine_extras::pc_sr_mode_get_practice_entry_name);
++                              GOAL_C_FN(kmachine_extras::pc_sr_mode_get_practice_entry_name));
+   make_function_symbol_from_c("pc-sr-mode-get-practice-entry-continue-point",
+-                              (void*)kmachine_extras::pc_sr_mode_get_practice_entry_continue_point);
++                              GOAL_C_FN(kmachine_extras::pc_sr_mode_get_practice_entry_continue_point));
+   make_function_symbol_from_c(
+       "pc-sr-mode-get-practice-entry-history-success",
+-      (void*)kmachine_extras::pc_sr_mode_get_practice_entry_history_success);
++      GOAL_C_FN(kmachine_extras::pc_sr_mode_get_practice_entry_history_success));
+   make_function_symbol_from_c(
+       "pc-sr-mode-get-practice-entry-history-attempts",
+-      (void*)kmachine_extras::pc_sr_mode_get_practice_entry_history_attempts);
++      GOAL_C_FN(kmachine_extras::pc_sr_mode_get_practice_entry_history_attempts));
+   make_function_symbol_from_c(
+       "pc-sr-mode-get-practice-entry-session-success",
+-      (void*)kmachine_extras::pc_sr_mode_get_practice_entry_session_success);
++      GOAL_C_FN(kmachine_extras::pc_sr_mode_get_practice_entry_session_success));
+   make_function_symbol_from_c(
+       "pc-sr-mode-get-practice-entry-session-attempts",
+-      (void*)kmachine_extras::pc_sr_mode_get_practice_entry_session_attempts);
++      GOAL_C_FN(kmachine_extras::pc_sr_mode_get_practice_entry_session_attempts));
+   make_function_symbol_from_c("pc-sr-mode-get-practice-entry-avg-time",
+-                              (void*)kmachine_extras::pc_sr_mode_get_practice_entry_avg_time);
++                              GOAL_C_FN(kmachine_extras::pc_sr_mode_get_practice_entry_avg_time));
+   make_function_symbol_from_c("pc-sr-mode-get-practice-entry-fastest-time",
+-                              (void*)kmachine_extras::pc_sr_mode_get_practice_entry_fastest_time);
++                              GOAL_C_FN(kmachine_extras::pc_sr_mode_get_practice_entry_fastest_time));
+   make_function_symbol_from_c("pc-sr-mode-record-practice-entry-attempt!",
+-                              (void*)kmachine_extras::pc_sr_mode_record_practice_entry_attempt);
++                              GOAL_C_FN(kmachine_extras::pc_sr_mode_record_practice_entry_attempt));
+   make_function_symbol_from_c("pc-sr-mode-init-practice-info!",
+-                              (void*)kmachine_extras::pc_sr_mode_init_practice_info);
++                              GOAL_C_FN(kmachine_extras::pc_sr_mode_init_practice_info));
+   make_function_symbol_from_c("pc-sr-mode-get-custom-category-amount",
+-                              (void*)kmachine_extras::pc_sr_mode_get_custom_category_amount);
++                              GOAL_C_FN(kmachine_extras::pc_sr_mode_get_custom_category_amount));
+   make_function_symbol_from_c("pc-sr-mode-get-custom-category-name",
+-                              (void*)kmachine_extras::pc_sr_mode_get_custom_category_name);
++                              GOAL_C_FN(kmachine_extras::pc_sr_mode_get_custom_category_name));
+   make_function_symbol_from_c(
+       "pc-sr-mode-get-custom-category-continue-point",
+-      (void*)kmachine_extras::pc_sr_mode_get_custom_category_continue_point);
++      GOAL_C_FN(kmachine_extras::pc_sr_mode_get_custom_category_continue_point));
+   make_function_symbol_from_c("pc-sr-mode-init-custom-category-info!",
+-                              (void*)kmachine_extras::pc_sr_mode_init_custom_category_info);
++                              GOAL_C_FN(kmachine_extras::pc_sr_mode_init_custom_category_info));
+   make_function_symbol_from_c("pc-sr-mode-dump-new-custom-category",
+-                              (void*)kmachine_extras::pc_sr_mode_dump_new_custom_category);
++                              GOAL_C_FN(kmachine_extras::pc_sr_mode_dump_new_custom_category));
+ 
+   // setup string constants
+   auto user_dir_path = file_util::get_user_config_dir();
+@@ -477,41 +478,41 @@ void InitMachine_PCPort() {
+ // End PC Stuff
+ 
+ void InitMachineScheme() {
+-  make_function_symbol_from_c("put-display-env", (void*)PutDisplayEnv);
+-  make_function_symbol_from_c("syncv", (void*)sceGsSyncV);
+-  make_function_symbol_from_c("sync-path", (void*)sceGsSyncPath);
+-  make_function_symbol_from_c("reset-path", (void*)sceGsResetPath);
+-  make_function_symbol_from_c("reset-graph", (void*)sceGsResetGraph);
+-  make_function_symbol_from_c("dma-sync", (void*)sceDmaSync);
+-  make_function_symbol_from_c("gs-put-imr", (void*)sceGsPutIMR);
+-  make_function_symbol_from_c("gs-get-imr", (void*)sceGsGetIMR);
+-  make_function_symbol_from_c("gs-store-image", (void*)sceGsExecStoreImage);
+-  make_function_symbol_from_c("flush-cache", (void*)FlushCache);
+-  make_function_symbol_from_c("cpad-open", (void*)CPadOpen);
+-  make_function_symbol_from_c("cpad-get-data", (void*)CPadGetData);
+-  make_function_symbol_from_c("mouse-get-data", (void*)MouseGetData);
+-  make_function_symbol_from_c("keybd-get-data", (void*)KeybdGetData);
+-  make_function_symbol_from_c("install-handler", (void*)InstallHandler);
+-  make_function_symbol_from_c("install-debug-handler", (void*)InstallDebugHandler);
+-  make_function_symbol_from_c("file-stream-open", (void*)kopen);
+-  make_function_symbol_from_c("file-stream-close", (void*)kclose);
+-  make_function_symbol_from_c("file-stream-length", (void*)klength);
+-  make_function_symbol_from_c("file-stream-seek", (void*)kseek);
+-  make_function_symbol_from_c("file-stream-read", (void*)kread);
+-  make_function_symbol_from_c("file-stream-write", (void*)kwrite);
+-  make_function_symbol_from_c("file-stream-mkdir", (void*)kmkdir);
+-  make_function_symbol_from_c("scf-get-language", (void*)DecodeLanguage);
+-  make_function_symbol_from_c("scf-get-time", (void*)DecodeTime);
+-  make_function_symbol_from_c("scf-get-aspect", (void*)DecodeAspect);
+-  make_function_symbol_from_c("scf-get-volume", (void*)DecodeVolume);
+-  make_function_symbol_from_c("scf-get-territory", (void*)DecodeTerritory);
+-  make_function_symbol_from_c("scf-get-timeout", (void*)DecodeTimeout);
+-  make_function_symbol_from_c("scf-get-inactive-timeout", (void*)DecodeInactiveTimeout);
+-  make_function_symbol_from_c("dma-to-iop", (void*)dma_to_iop);
+-  make_function_symbol_from_c("kernel-shutdown", (void*)KernelShutdown);
+-  make_function_symbol_from_c("rpc-call", (void*)RpcCall);
+-  make_function_symbol_from_c("rpc-busy?", (void*)RpcBusy);
+-  make_function_symbol_from_c("test-load-dgo-c", (void*)LoadDGOTest);
++  make_function_symbol_from_c("put-display-env", GOAL_C_FN(PutDisplayEnv));
++  make_function_symbol_from_c("syncv", GOAL_C_FN(sceGsSyncV));
++  make_function_symbol_from_c("sync-path", GOAL_C_FN(sceGsSyncPath));
++  make_function_symbol_from_c("reset-path", GOAL_C_FN(sceGsResetPath));
++  make_function_symbol_from_c("reset-graph", GOAL_C_FN(sceGsResetGraph));
++  make_function_symbol_from_c("dma-sync", GOAL_C_FN(sceDmaSync));
++  make_function_symbol_from_c("gs-put-imr", GOAL_C_FN(sceGsPutIMR));
++  make_function_symbol_from_c("gs-get-imr", GOAL_C_FN(sceGsGetIMR));
++  make_function_symbol_from_c("gs-store-image", GOAL_C_FN(sceGsExecStoreImage));
++  make_function_symbol_from_c("flush-cache", GOAL_C_FN(FlushCache));
++  make_function_symbol_from_c("cpad-open", GOAL_C_FN(CPadOpen));
++  make_function_symbol_from_c("cpad-get-data", GOAL_C_FN(CPadGetData));
++  make_function_symbol_from_c("mouse-get-data", GOAL_C_FN(MouseGetData));
++  make_function_symbol_from_c("keybd-get-data", GOAL_C_FN(KeybdGetData));
++  make_function_symbol_from_c("install-handler", GOAL_C_FN(InstallHandler));
++  make_function_symbol_from_c("install-debug-handler", GOAL_C_FN(InstallDebugHandler));
++  make_function_symbol_from_c("file-stream-open", GOAL_C_FN(kopen));
++  make_function_symbol_from_c("file-stream-close", GOAL_C_FN(kclose));
++  make_function_symbol_from_c("file-stream-length", GOAL_C_FN(klength));
++  make_function_symbol_from_c("file-stream-seek", GOAL_C_FN(kseek));
++  make_function_symbol_from_c("file-stream-read", GOAL_C_FN(kread));
++  make_function_symbol_from_c("file-stream-write", GOAL_C_FN(kwrite));
++  make_function_symbol_from_c("file-stream-mkdir", GOAL_C_FN(kmkdir));
++  make_function_symbol_from_c("scf-get-language", GOAL_C_FN(DecodeLanguage));
++  make_function_symbol_from_c("scf-get-time", GOAL_C_FN(DecodeTime));
++  make_function_symbol_from_c("scf-get-aspect", GOAL_C_FN(DecodeAspect));
++  make_function_symbol_from_c("scf-get-volume", GOAL_C_FN(DecodeVolume));
++  make_function_symbol_from_c("scf-get-territory", GOAL_C_FN(DecodeTerritory));
++  make_function_symbol_from_c("scf-get-timeout", GOAL_C_FN(DecodeTimeout));
++  make_function_symbol_from_c("scf-get-inactive-timeout", GOAL_C_FN(DecodeInactiveTimeout));
++  make_function_symbol_from_c("dma-to-iop", GOAL_C_FN(dma_to_iop));
++  make_function_symbol_from_c("kernel-shutdown", GOAL_C_FN(KernelShutdown));
++  make_function_symbol_from_c("rpc-call", GOAL_C_FN(RpcCall));
++  make_function_symbol_from_c("rpc-busy?", GOAL_C_FN(RpcBusy));
++  make_function_symbol_from_c("test-load-dgo-c", GOAL_C_FN(LoadDGOTest));
+ 
+   InitMachine_PCPort();
+ 
+diff --git a/game/kernel/jakx/kscheme.cpp b/game/kernel/jakx/kscheme.cpp
+index 0db55b45..36d7dca5 100644
+--- a/game/kernel/jakx/kscheme.cpp
++++ b/game/kernel/jakx/kscheme.cpp
+@@ -1,4 +1,5 @@
+ #include "kscheme.h"
++#include "game/kernel/common/goal_c_fn.h"
+ 
+ #include <unordered_map>
+ 
+@@ -294,6 +295,14 @@ void _stack_call_arm64();
+ Ptr<Function> make_function_from_c_systemv(void* func, bool arg3_is_pp) {
+   auto mem = Ptr<u8>(alloc_heap_object(s7.offset + FIX_SYM_GLOBAL_HEAP,
+                                        u32_in_fixed_sym(FIX_SYM_FUNCTION_TYPE), 0x40, UNKNOWN_PP));
++#ifdef __EMSCRIPTEN__
++  // Jakompiled web: func is a GOAL_C_FN adapter; the function object holds its wasm
++  // table index (and a zero word, like the stubs emitted by goalc for wasm).
++  (void)arg3_is_pp;
++  mem.cast<u32>().c()[0] = (u32)(uintptr_t)func;
++  mem.cast<u32>().c()[1] = 0;
++  return mem.cast<Function>();
++#endif
+   auto f = (uint64_t)func;
+   auto target_function = (u8*)&f;
+ #ifndef __aarch64__
+@@ -411,6 +420,13 @@ Ptr<Function> make_stack_arg_function_from_c_systemv(void* func) {
+   // allocate a function object on the global heap
+   auto mem = Ptr<u8>(alloc_heap_object(s7.offset + FIX_SYM_GLOBAL_HEAP,
+                                        u32_in_fixed_sym(FIX_SYM_FUNCTION_TYPE), 0x40, UNKNOWN_PP));
++#ifdef __EMSCRIPTEN__
++  // Jakompiled web: func is a GOAL_C_FN adapter; the function object holds its wasm
++  // table index (and a zero word, like the stubs emitted by goalc for wasm).
++  mem.cast<u32>().c()[0] = (u32)(uintptr_t)func;
++  mem.cast<u32>().c()[1] = 0;
++  return mem.cast<Function>();
++#endif
+   auto f = (uint64_t)func;
+   auto target_function = (u8*)&f;
+ #ifndef __aarch64__
+@@ -1580,11 +1596,11 @@ int InitHeapAndSymbol() {
+   set_fixed_symbol(FIX_SYM_NOTHING_FUNC, "nothing", make_nothing_func().offset);
+   set_fixed_symbol(FIX_SYM_ZERO_FUNC, "zero-func", make_zero_func().offset);
+   set_fixed_symbol(FIX_SYM_ASIZE_OF_BASIC_FUNC, "asize-of-basic-func",
+-                   make_function_from_c((void*)asize_of_basic).offset);
++                   make_function_from_c(GOAL_C_FN(asize_of_basic)).offset);
+   set_fixed_symbol(FIX_SYM_COPY_BASIC_FUNC, "asize-of-basic-func",  // typo in name here again.
+-                   make_function_from_c((void*)copy_basic, true).offset);
++                   make_function_from_c(GOAL_C_FN(copy_basic), true).offset);
+   set_fixed_symbol(FIX_SYM_DELETE_BASIC, "delete-basic",
+-                   make_function_from_c((void*)delete_basic).offset);
++                   make_function_from_c(GOAL_C_FN(delete_basic)).offset);
+   set_fixed_symbol(FIX_SYM_GLOBAL_HEAP, "global", kglobalheap.offset);
+   set_fixed_symbol(FIX_SYM_DEBUG, "debug", kdebugheap.offset);
+   set_fixed_symbol(FIX_SYM_STATIC, "static", s7.offset + FIX_SYM_STATIC);
+@@ -1715,10 +1731,10 @@ int InitHeapAndSymbol() {
+                    s7.offset + FIX_SYM_TRUE);
+   set_fixed_symbol(FIX_SYM_NETWORK_BOOTSTRAP, "network-bootstrap", 0);
+ 
+-  auto new_illegal_func = make_function_from_c((void*)new_illegal);
+-  auto delete_illegal_func = make_function_from_c((void*)delete_illegal);
+-  auto print_object_func = make_function_from_c((void*)print_object);
+-  auto inspect_object_func = make_function_from_c((void*)inspect_object);
++  auto new_illegal_func = make_function_from_c(GOAL_C_FN(new_illegal));
++  auto delete_illegal_func = make_function_from_c(GOAL_C_FN(delete_illegal));
++  auto print_object_func = make_function_from_c(GOAL_C_FN(print_object));
++  auto inspect_object_func = make_function_from_c(GOAL_C_FN(inspect_object));
+ 
+   set_fixed_type(FIX_SYM_OBJECT_TYPE, "object", get_fixed_type_symbol(FIX_SYM_OBJECT_TYPE),
+                  pack_type_flag(9, 0, 4), print_object_func.offset, inspect_object_func.offset);
+@@ -1729,73 +1745,73 @@ int InitHeapAndSymbol() {
+       Ptr<Function>(u32_in_fixed_sym(FIX_SYM_ZERO_FUNC));  // changed to zero!
+   object_type->length_method =
+       Ptr<Function>(u32_in_fixed_sym(FIX_SYM_ZERO_FUNC));  // changed to zero!
+-  object_type->copy_method = make_function_from_c((void*)copy_fixed);
++  object_type->copy_method = make_function_from_c(GOAL_C_FN(copy_fixed));
+ 
+   auto structure_type =
+       set_fixed_type(FIX_SYM_STRUCTURE, "structure", get_fixed_type_symbol(FIX_SYM_OBJECT_TYPE),
+-                     pack_type_flag(9, 0, 4), make_function_from_c((void*)print_structure).offset,
+-                     make_function_from_c((void*)inspect_structure).offset);
+-  structure_type->new_method = make_function_from_c((void*)new_structure);
+-  structure_type->delete_method = make_function_from_c((void*)delete_structure);
++                     pack_type_flag(9, 0, 4), make_function_from_c(GOAL_C_FN(print_structure)).offset,
++                     make_function_from_c(GOAL_C_FN(inspect_structure)).offset);
++  structure_type->new_method = make_function_from_c(GOAL_C_FN(new_structure));
++  structure_type->delete_method = make_function_from_c(GOAL_C_FN(delete_structure));
+ 
+   auto basic_type =
+       set_fixed_type(FIX_SYM_BASIC, "basic", get_fixed_type_symbol(FIX_SYM_STRUCTURE),
+-                     pack_type_flag(9, 0, 4), make_function_from_c((void*)print_basic).offset,
+-                     make_function_from_c((void*)inspect_basic).offset);
+-  basic_type->new_method = make_function_from_c((void*)new_basic, true);
++                     pack_type_flag(9, 0, 4), make_function_from_c(GOAL_C_FN(print_basic)).offset,
++                     make_function_from_c(GOAL_C_FN(inspect_basic)).offset);
++  basic_type->new_method = make_function_from_c(GOAL_C_FN(new_basic), true);
+   basic_type->delete_method = Ptr<Function>(u32_in_fixed_sym(FIX_SYM_DELETE_BASIC));
+   basic_type->asize_of_method = Ptr<Function>(u32_in_fixed_sym(FIX_SYM_ASIZE_OF_BASIC_FUNC));
+   basic_type->copy_method = Ptr<Function>(u32_in_fixed_sym(FIX_SYM_COPY_BASIC_FUNC));
+ 
+   set_fixed_type(FIX_SYM_SYMBOL_TYPE, "symbol", get_fixed_type_symbol(FIX_SYM_OBJECT_TYPE),
+-                 pack_type_flag(9, 0, 4), make_function_from_c((void*)print_symbol).offset,
+-                 make_function_from_c((void*)inspect_symbol).offset);
++                 pack_type_flag(9, 0, 4), make_function_from_c(GOAL_C_FN(print_symbol)).offset,
++                 make_function_from_c(GOAL_C_FN(inspect_symbol)).offset);
+   auto sym_type = Ptr<Type>(u32_in_fixed_sym(FIX_SYM_SYMBOL_TYPE));
+   sym_type->new_method = new_illegal_func;
+   sym_type->delete_method = delete_illegal_func;
+ 
+   set_fixed_type(FIX_SYM_TYPE_TYPE, "type", get_fixed_type_symbol(FIX_SYM_BASIC),
+-                 pack_type_flag(9, 0, 0x38), make_function_from_c((void*)print_type).offset,
+-                 make_function_from_c((void*)inspect_type).offset);
++                 pack_type_flag(9, 0, 0x38), make_function_from_c(GOAL_C_FN(print_type)).offset,
++                 make_function_from_c(GOAL_C_FN(inspect_type)).offset);
+   auto type_type = Ptr<Type>(u32_in_fixed_sym(FIX_SYM_TYPE_TYPE));
+-  type_type->new_method = make_function_from_c((void*)new_type);
++  type_type->new_method = make_function_from_c(GOAL_C_FN(new_type));
+   type_type->delete_method = delete_illegal_func;
+ 
+   set_fixed_type(FIX_SYM_STRING_TYPE, "string", get_fixed_type_symbol(FIX_SYM_BASIC),
+-                 pack_type_flag(9, 0, 8), make_function_from_c((void*)print_string).offset,
+-                 make_function_from_c((void*)inspect_string).offset);
++                 pack_type_flag(9, 0, 8), make_function_from_c(GOAL_C_FN(print_string)).offset,
++                 make_function_from_c(GOAL_C_FN(inspect_string)).offset);
+ 
+   set_fixed_type(FIX_SYM_FUNCTION_TYPE, "function", get_fixed_type_symbol(FIX_SYM_BASIC),
+-                 pack_type_flag(9, 0, 4), make_function_from_c((void*)print_function).offset, 0);
++                 pack_type_flag(9, 0, 4), make_function_from_c(GOAL_C_FN(print_function)).offset, 0);
+   auto function_type = Ptr<Type>(u32_in_fixed_sym(FIX_SYM_FUNCTION_TYPE));
+   function_type->new_method = new_illegal_func;
+   function_type->delete_method = delete_illegal_func;
+ 
+   set_fixed_type(FIX_SYM_VU_FUNCTION, "vu-function", get_fixed_type_symbol(FIX_SYM_STRUCTURE),
+-                 pack_type_flag(9, 0, 0x10), make_function_from_c((void*)print_vu_function).offset,
+-                 make_function_from_c((void*)inspect_vu_function).offset);
++                 pack_type_flag(9, 0, 0x10), make_function_from_c(GOAL_C_FN(print_vu_function)).offset,
++                 make_function_from_c(GOAL_C_FN(inspect_vu_function)).offset);
+   Ptr<Type>(u32_in_fixed_sym(FIX_SYM_VU_FUNCTION))->delete_method = delete_illegal_func;
+ 
+   set_fixed_type(FIX_SYM_LINK_BLOCK, "link-block", get_fixed_type_symbol(FIX_SYM_BASIC),
+                  pack_type_flag(9, 0, 0xc), 0,
+-                 make_function_from_c((void*)inspect_link_block).offset);
++                 make_function_from_c(GOAL_C_FN(inspect_link_block)).offset);
+   auto link_block_type = Ptr<Type>(u32_in_fixed_sym(FIX_SYM_LINK_BLOCK));
+   link_block_type->new_method = new_illegal_func;
+   link_block_type->delete_method = delete_illegal_func;
+ 
+   set_fixed_type(FIX_SYM_HEAP, "kheap", get_fixed_type_symbol(FIX_SYM_STRUCTURE),
+-                 pack_type_flag(9, 0, 0x10), 0, make_function_from_c((void*)inspect_kheap).offset);
++                 pack_type_flag(9, 0, 0x10), 0, make_function_from_c(GOAL_C_FN(inspect_kheap)).offset);
+ 
+   set_fixed_type(FIX_SYM_ARRAY, "array", get_fixed_type_symbol(FIX_SYM_BASIC),
+                  pack_type_flag(9, 0, 0x10), 0, 0);
+ 
+   set_fixed_type(FIX_SYM_PAIR_TYPE, "pair", get_fixed_type_symbol(FIX_SYM_OBJECT_TYPE),
+-                 pack_type_flag(9, 0, 8), make_function_from_c((void*)print_pair).offset,
+-                 make_function_from_c((void*)inspect_pair).offset);
++                 pack_type_flag(9, 0, 8), make_function_from_c(GOAL_C_FN(print_pair)).offset,
++                 make_function_from_c(GOAL_C_FN(inspect_pair)).offset);
+   Ptr<Type>(u32_in_fixed_sym(FIX_SYM_PAIR_TYPE))->new_method =
+-      make_function_from_c((void*)new_pair);
++      make_function_from_c(GOAL_C_FN(new_pair));
+   Ptr<Type>(u32_in_fixed_sym(FIX_SYM_PAIR_TYPE))->delete_method =
+-      make_function_from_c((void*)delete_pair);
++      make_function_from_c(GOAL_C_FN(delete_pair));
+ 
+   set_fixed_type(FIX_SYM_PROCESS_TREE, "process-tree", get_fixed_type_symbol(FIX_SYM_BASIC),
+                  pack_type_flag(0xe, 0, 0x24), 0, 0);
+@@ -1814,20 +1830,20 @@ int InitHeapAndSymbol() {
+   Ptr<Type>(u32_in_fixed_sym(FIX_SYM_POINTER))->new_method = new_illegal_func;
+ 
+   set_fixed_type(FIX_SYM_NUMBER, "number", get_fixed_type_symbol(FIX_SYM_OBJECT_TYPE),
+-                 pack_type_flag(9, 0, 8), make_function_from_c((void*)print_integer).offset,
+-                 make_function_from_c((void*)inspect_integer).offset);
++                 pack_type_flag(9, 0, 8), make_function_from_c(GOAL_C_FN(print_integer)).offset,
++                 make_function_from_c(GOAL_C_FN(inspect_integer)).offset);
+   Ptr<Type>(u32_in_fixed_sym(FIX_SYM_NUMBER))->new_method = new_illegal_func;
+ 
+   set_fixed_type(FIX_SYM_FLOAT, "float", get_fixed_type_symbol(FIX_SYM_NUMBER),
+-                 pack_type_flag(9, 0, 4), make_function_from_c((void*)print_float).offset,
+-                 make_function_from_c((void*)inspect_float).offset);
++                 pack_type_flag(9, 0, 4), make_function_from_c(GOAL_C_FN(print_float)).offset,
++                 make_function_from_c(GOAL_C_FN(inspect_float)).offset);
+ 
+   set_fixed_type(FIX_SYM_INTEGER, "integer", get_fixed_type_symbol(FIX_SYM_NUMBER),
+                  pack_type_flag(9, 0, 8), 0, 0);
+ 
+   set_fixed_type(FIX_SYM_BINTEGER, "binteger", get_fixed_type_symbol(FIX_SYM_INTEGER),
+-                 pack_type_flag(9, 0, 8), make_function_from_c((void*)print_binteger).offset,
+-                 make_function_from_c((void*)inspect_binteger).offset);
++                 pack_type_flag(9, 0, 8), make_function_from_c(GOAL_C_FN(print_binteger)).offset,
++                 make_function_from_c(GOAL_C_FN(inspect_binteger)).offset);
+ 
+   set_fixed_type(FIX_SYM_SINTEGER, "sinteger", get_fixed_type_symbol(FIX_SYM_INTEGER),
+                  pack_type_flag(9, 0, 8), 0, 0);
+@@ -1856,43 +1872,43 @@ int InitHeapAndSymbol() {
+                  pack_type_flag(9, 0, 16), 0, 0);
+ 
+   Ptr<Type>(u32_in_fixed_sym(FIX_SYM_OBJECT_TYPE))->new_method =
+-      make_function_from_c((void*)alloc_heap_object, true);
+-
+-  make_function_symbol_from_c("string->symbol", (void*)intern);
+-  make_function_symbol_from_c("symbol->string", (void*)symbol_to_string_from_c);
+-  make_function_symbol_from_c("print", (void*)sprint);
+-  make_function_symbol_from_c("inspect", (void*)inspect_object);
+-  make_function_symbol_from_c("load", (void*)load);
+-  make_function_symbol_from_c("loadb", (void*)loadb);
+-  make_function_symbol_from_c("loado", (void*)loado);
+-  make_function_symbol_from_c("unload", (void*)unload);
+-  make_stack_arg_function_symbol_from_c("_format", (void*)format_impl_jakx);
+-  make_function_symbol_from_c("malloc", (void*)alloc_heap_memory);
+-  make_function_symbol_from_c("kmalloc", (void*)goal_malloc);
+-  make_function_symbol_from_c("kmemopen", (void*)kmemopen);
+-  make_function_symbol_from_c("kmemclose", (void*)kmemclose);
+-  make_function_symbol_from_c("new-dynamic-structure", (void*)new_dynamic_structure);
+-  make_function_symbol_from_c("method-set!", (void*)method_set);
+-  make_stack_arg_function_symbol_from_c("link", (void*)link_and_exec_wrapper);
+-  make_function_symbol_from_c("link-busy?", (void*)link_busy);
+-  make_function_symbol_from_c("link-reset", (void*)link_reset);
+-  make_function_symbol_from_c("dgo-load", (void*)load_and_link_dgo);
++      make_function_from_c(GOAL_C_FN(alloc_heap_object), true);
++
++  make_function_symbol_from_c("string->symbol", GOAL_C_FN(intern));
++  make_function_symbol_from_c("symbol->string", GOAL_C_FN(symbol_to_string_from_c));
++  make_function_symbol_from_c("print", GOAL_C_FN(sprint));
++  make_function_symbol_from_c("inspect", GOAL_C_FN(inspect_object));
++  make_function_symbol_from_c("load", GOAL_C_FN(load));
++  make_function_symbol_from_c("loadb", GOAL_C_FN(loadb));
++  make_function_symbol_from_c("loado", GOAL_C_FN(loado));
++  make_function_symbol_from_c("unload", GOAL_C_FN(unload));
++  make_stack_arg_function_symbol_from_c("_format", GOAL_C_STACK_FN(format_impl_jakx));
++  make_function_symbol_from_c("malloc", GOAL_C_FN(alloc_heap_memory));
++  make_function_symbol_from_c("kmalloc", GOAL_C_FN(goal_malloc));
++  make_function_symbol_from_c("kmemopen", GOAL_C_FN(kmemopen));
++  make_function_symbol_from_c("kmemclose", GOAL_C_FN(kmemclose));
++  make_function_symbol_from_c("new-dynamic-structure", GOAL_C_FN(new_dynamic_structure));
++  make_function_symbol_from_c("method-set!", GOAL_C_FN(method_set));
++  make_stack_arg_function_symbol_from_c("link", GOAL_C_STACK_FN(link_and_exec_wrapper));
++  make_function_symbol_from_c("link-busy?", GOAL_C_FN(link_busy));
++  make_function_symbol_from_c("link-reset", GOAL_C_FN(link_reset));
++  make_function_symbol_from_c("dgo-load", GOAL_C_FN(load_and_link_dgo));
+   make_raw_function_symbol_from_c("ultimate-memcpy", 0);
+   make_raw_function_symbol_from_c("symlink2", 0);
+   make_raw_function_symbol_from_c("symlink3", 0);
+-  make_stack_arg_function_symbol_from_c("link-begin", (void*)link_begin);
+-  make_function_symbol_from_c("link-resume", (void*)link_resume);
+-  make_function_symbol_from_c("sql-query", (void*)sql_query_sync);
+-  make_function_symbol_from_c("mc-run", (void*)MC_run);
+-  make_function_symbol_from_c("mc-format", (void*)MC_format);
+-  make_function_symbol_from_c("mc-unformat", (void*)MC_unformat);
+-  make_function_symbol_from_c("mc-create-file", (void*)MC_createfile);
+-  make_function_symbol_from_c("mc-save", (void*)MC_save);
+-  make_function_symbol_from_c("mc-load", (void*)MC_load);
+-  make_function_symbol_from_c("mc-check-result", (void*)MC_check_result);
+-  make_function_symbol_from_c("mc-get-slot-info", (void*)MC_get_status);
+-  make_function_symbol_from_c("mc-makefile", (void*)MC_makefile);
+-  make_function_symbol_from_c("kset-language", (void*)MC_set_language);
++  make_stack_arg_function_symbol_from_c("link-begin", GOAL_C_STACK_FN(link_begin));
++  make_function_symbol_from_c("link-resume", GOAL_C_FN(link_resume));
++  make_function_symbol_from_c("sql-query", GOAL_C_FN(sql_query_sync));
++  make_function_symbol_from_c("mc-run", GOAL_C_FN(MC_run));
++  make_function_symbol_from_c("mc-format", GOAL_C_FN(MC_format));
++  make_function_symbol_from_c("mc-unformat", GOAL_C_FN(MC_unformat));
++  make_function_symbol_from_c("mc-create-file", GOAL_C_FN(MC_createfile));
++  make_function_symbol_from_c("mc-save", GOAL_C_FN(MC_save));
++  make_function_symbol_from_c("mc-load", GOAL_C_FN(MC_load));
++  make_function_symbol_from_c("mc-check-result", GOAL_C_FN(MC_check_result));
++  make_function_symbol_from_c("mc-get-slot-info", GOAL_C_FN(MC_get_status));
++  make_function_symbol_from_c("mc-makefile", GOAL_C_FN(MC_makefile));
++  make_function_symbol_from_c("kset-language", GOAL_C_FN(MC_set_language));
+ 
+   auto ds_symbol = intern_from_c(-1, 0, "*debug-segment*");
+   if (DebugSegment) {
+diff --git a/game/kernel/jakx/ksound.cpp b/game/kernel/jakx/ksound.cpp
+index cc9f9d4d..788558bb 100644
+--- a/game/kernel/jakx/ksound.cpp
++++ b/game/kernel/jakx/ksound.cpp
+@@ -1,4 +1,5 @@
+ #include "ksound.h"
++#include "game/kernel/common/goal_c_fn.h"
+ 
+ #include "game/kernel/common/kdgo.h"
+ #include "game/kernel/common/ksound.h"
+@@ -9,12 +10,12 @@ namespace jakx {
+  * Set up some functions which are somewhat related to sound.
+  */
+ void InitSoundScheme() {
+-  make_function_symbol_from_c("rpc-busy?", (void*)RpcBusy);
+-  make_function_symbol_from_c("test-load-dgo-c", (void*)LoadDGOTest);
+-  make_stack_arg_function_symbol_from_c("rpc-call", (void*)RpcCall_wrapper);
++  make_function_symbol_from_c("rpc-busy?", GOAL_C_FN(RpcBusy));
++  make_function_symbol_from_c("test-load-dgo-c", GOAL_C_FN(LoadDGOTest));
++  make_stack_arg_function_symbol_from_c("rpc-call", GOAL_C_STACK_FN(RpcCall_wrapper));
+ 
+   // PC port interns
+-  make_function_symbol_from_c("pc-sound-set-flava-hack", (void*)set_flava_hack);
+-  make_function_symbol_from_c("pc-sound-set-fade-hack", (void*)set_fade_hack);
++  make_function_symbol_from_c("pc-sound-set-flava-hack", GOAL_C_FN(set_flava_hack));
++  make_function_symbol_from_c("pc-sound-set-fade-hack", GOAL_C_FN(set_fade_hack));
+ }
+ }  // namespace jakx
+\ No newline at end of file
+diff --git a/web/CMakeLists.txt b/web/CMakeLists.txt
+index 7461a335..d302c5e0 100644
+--- a/web/CMakeLists.txt
++++ b/web/CMakeLists.txt
+@@ -93,6 +93,8 @@ target_link_options(gk PRIVATE
+   -sINITIAL_MEMORY=512MB
+   -sALLOW_MEMORY_GROWTH
+   -sMAXIMUM_MEMORY=4GB
++  # GOAL code is instantiated at runtime and added to the function table
++  -sALLOW_TABLE_GROWTH
+   -sENVIRONMENT=web,worker
+   -sEXIT_RUNTIME
+   -sFORCE_FILESYSTEM
+diff --git a/web/asm_funcs_web.cpp b/web/asm_funcs_web.cpp
+index 4eb9bfd7..04a60008 100644
+--- a/web/asm_funcs_web.cpp
++++ b/web/asm_funcs_web.cpp
+@@ -1,57 +1,74 @@
+ // Jakompiled web: replacement for game/kernel/asm_funcs_x86_64.asm.
+ //
+-// The native runtime enters GOAL code through small assembly trampolines that
+-// set up GOAL's registers and jump to machine code emitted by goalc. Until goalc
+-// has a wasm backend (phase 3) there is no GOAL code to jump into, so these
+-// trampolines report the attempted call and stop the EE.
++// The native runtime enters GOAL code through assembly trampolines that set up GOAL's registers
++// and jump to machine code. In the web build, GOAL code is wasm (goalc's wasm backend) and every
++// GOAL function has the type (i64 x 8) -> i64. A GOAL function object holds the function's index
++// in the wasm table, which is a C function pointer for Emscripten, so calling GOAL from C is an
++// ordinary indirect call.
+ 
+ #include <cstdint>
+ #include <cstdio>
+ #include <cstdlib>
++#include <cstring>
+ 
+ extern uint8_t* g_ee_main_mem;
+ 
+ namespace {
+-[[noreturn]] void no_goal_code(const char* trampoline, const void* target) {
++using GoalFunction = uint64_t (*)(uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t,
++                                  uint64_t, uint64_t);
++
++[[noreturn]] void bad_call(const char* trampoline, const void* target) {
+   const long goal_addr = target ? (long)((const uint8_t*)target - g_ee_main_mem) : -1;
+   fprintf(stderr,
+-          "[jakompiled] %s: call into GOAL code at GOAL address 0x%lx (wasm %p). GOAL code "
+-          "cannot run yet (goalc has no wasm backend); stopping.\n",
+-          trampoline, goal_addr, target);
++          "[jakompiled] %s: GOAL function object at GOAL address 0x%lx has no wasm code "
++          "(was it compiled for x86?); stopping.\n",
++          trampoline, goal_addr);
+   fflush(stderr);
+   abort();
+ }
++
++GoalFunction goal_function(const char* trampoline, const void* function_object) {
++  uint32_t table_index;
++  memcpy(&table_index, function_object, sizeof(table_index));
++  if (!table_index) {
++    bad_call(trampoline, function_object);
++  }
++  return (GoalFunction)(uintptr_t)table_index;
++}
+ }  // namespace
+ 
+ extern "C" {
+ 
+-// kscheme: C -> GOAL helpers registered as GOAL functions
++// kscheme: call_goal / call_goal_on_stack. The GOAL stack argument is not used yet: GOAL stack
++// frames live in wasm locals and in the C stack of the calling thread.
++uint64_t _call_goal_asm_systemv(uint64_t a0, uint64_t a1, uint64_t a2, void* fptr, void*, void*) {
++  return goal_function("call_goal", fptr)(a0, a1, a2, 0, 0, 0, 0, 0);
++}
++uint64_t _call_goal_on_stack_asm_systemv(uint64_t, uint64_t, uint64_t, void* fptr, void*, void*) {
++  return goal_function("call_goal_on_stack", fptr)(0, 0, 0, 0, 0, 0, 0, 0);
++}
++
++// mips2c: calls from translated C++ back into GOAL
++uint64_t _call_goal8_asm_systemv(void* func, uint64_t* args, uint64_t, uint64_t, uint64_t, void*) {
++  return goal_function("call_goal8", func)(args[0], args[1], args[2], args[3], args[4], args[5],
++                                           args[6], args[7]);
++}
++
++// Native trampolines from GOAL into C. In the web build C functions are wrapped by GOAL_C_FN
++// adapters instead (game/kernel/common/goal_c_fn.h), so these are never reached.
+ void _arg_call_systemv() {
+-  no_goal_code("_arg_call_systemv", nullptr);
++  bad_call("_arg_call_systemv", nullptr);
+ }
+ void _stack_call_systemv() {
+-  no_goal_code("_stack_call_systemv", nullptr);
++  bad_call("_stack_call_systemv", nullptr);
+ }
+ void _stack_call_win32() {
+-  no_goal_code("_stack_call_win32", nullptr);
++  bad_call("_stack_call_win32", nullptr);
+ }
+ void _mips2c_call_systemv() {
+-  no_goal_code("_mips2c_call_systemv", nullptr);
++  bad_call("_mips2c_call_systemv", nullptr);
+ }
+ void _mips2c_call_windows() {
+-  no_goal_code("_mips2c_call_windows", nullptr);
+-}
+-
+-// kscheme: call_goal / call_goal_on_stack
+-uint64_t _call_goal_asm_systemv(uint64_t, uint64_t, uint64_t, void* fptr, void*, void*) {
+-  no_goal_code("call_goal", fptr);
+-}
+-uint64_t _call_goal_on_stack_asm_systemv(uint64_t, uint64_t, uint64_t, void* fptr, void*, void*) {
+-  no_goal_code("call_goal_on_stack", fptr);
+-}
+-
+-// mips2c: calls from translated C++ back into GOAL
+-uint64_t _call_goal8_asm_systemv(void* func, uint64_t*, uint64_t, uint64_t, uint64_t, void*) {
+-  no_goal_code("call_goal8", func);
++  bad_call("_mips2c_call_windows", nullptr);
+ }
+ }
+diff --git a/web/goal_wasm_link.cpp b/web/goal_wasm_link.cpp
+new file mode 100644
+index 00000000..820219d5
+--- /dev/null
++++ b/web/goal_wasm_link.cpp
+@@ -0,0 +1,103 @@
++// Jakompiled web: loading GOAL code compiled to wasm.
++//
++// goalc's wasm backend emits normal GOAL object files: static data, one 8-byte function object
++// per function, and the wasm module embedded at the end of the top-level segment (see
++// goalc/wasm/WasmCodegen.h). klink links the data as usual; then link_wasm_object() instantiates
++// the module against this runtime's memory and table and runs its __link export, which puts
++// every function in the table and writes the index into its function object.
++
++#include <cstdint>
++#include <cstring>
++
++#include <emscripten.h>
++
++#include "common/common_types.h"
++#include "common/link_types.h"
++#include "common/log/log.h"
++#include "common/versions/versions.h"
++
++#include "game/kernel/common/klink.h"
++#include "game/kernel/common/kscheme.h"
++#include "game/kernel/jak2/kscheme.h"
++
++extern u8* g_ee_main_mem;
++extern GameVersion g_game_version;
++
++namespace {
++constexpr u32 kEmbeddedModuleMagic = 0x4b4a5741;  // goalc/wasm/WasmCodegen.h
++}
++
++// called from JS for every sym.<name> import: GOAL address of the symbol
++extern "C" EMSCRIPTEN_KEEPALIVE u32 jakompiled_intern(const char* name) {
++  switch (g_game_version) {
++    case GameVersion::Jak2:
++      return jak2::intern_from_c(name).offset;
++    default:
++      lg::die("jakompiled: wasm GOAL objects are only supported for Jak 2 so far");
++      return 0;
++  }
++}
++
++EM_JS_DEPS(jakompiled_link, "$wasmTable,$stringToUTF8OnStack,$withStackSave,$UTF8ToString");
++
++// clang-format off
++EM_JS(int, jakompiled_instantiate,
++      (const u8* bytes, u32 size, u32 s7, u32 seg_main, u32 seg_debug, u32 seg_top,
++       const char* name), {
++  const objName = UTF8ToString(name);
++  // compile from a private copy: WebAssembly.Module rejects views of shared memory
++  const code = HEAPU8.slice(bytes, bytes + size);
++  let module;
++  try {
++    module = new WebAssembly.Module(code);
++  } catch (e) {
++    err(`[jakompiled] ${objName}: invalid wasm module: ${e}`);
++    return 0;
++  }
++  const imports = {
++    env: { mem: wasmMemory, table: wasmTable, s7: BigInt(s7) },
++    seg: { main: BigInt(seg_main), debug: BigInt(seg_debug), "top-level": BigInt(seg_top) },
++    sym: {},
++  };
++  for (const imp of WebAssembly.Module.imports(module)) {
++    if (imp.module === "sym") {
++      imports.sym[imp.name] =
++          BigInt(withStackSave(() => _jakompiled_intern(stringToUTF8OnStack(imp.name))));
++    }
++  }
++  try {
++    const instance = new WebAssembly.Instance(module, imports);
++    instance.exports.__link();
++    (globalThis.jakompiledInstances ??= []).push(instance);
++  } catch (e) {
++    err(`[jakompiled] ${objName}: ${e}`);
++    return 0;
++  }
++  return 1;
++});
++// clang-format on
++
++namespace jakompiled {
++
++void link_wasm_object(const ObjectFileHeader* ofh, const char* name) {
++  const u32 entry = ofh->code_infos[TOP_LEVEL_SEGMENT].offset + 4;
++  u32 module_offset;
++  memcpy(&module_offset, g_ee_main_mem + entry + 4, 4);
++  if (!module_offset) {
++    lg::die("jakompiled: object {} has no wasm module (was it compiled for x86?)", name);
++  }
++  const u8* header = g_ee_main_mem + entry + module_offset;
++  u32 magic, size;
++  memcpy(&magic, header, 4);
++  memcpy(&size, header + 4, 4);
++  if (magic != kEmbeddedModuleMagic) {
++    lg::die("jakompiled: object {}: bad wasm module header", name);
++  }
++  lg::debug("[jakompiled] {}: instantiating {} byte wasm module", name, size);
++  if (!jakompiled_instantiate(header + 8, size, s7.offset, ofh->code_infos[0].offset,
++                              ofh->code_infos[1].offset, ofh->code_infos[2].offset, name)) {
++    lg::die("jakompiled: could not load the wasm code of {}", name);
++  }
++}
++
++}  // namespace jakompiled
+-- 
+2.43.0
+

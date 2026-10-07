@@ -1,0 +1,466 @@
+From 50d027bc7c23bd84da951f9fac7b2d920db9ffa7 Mon Sep 17 00:00:00 2001
+From: Jakompiled <itsrufer@gmail.com>
+Date: Wed, 7 Oct 2026 16:15:43 +0000
+Subject: [PATCH 5/6] goalc: wasm object files and a uniform GOAL function type
+
+goalc-wasm can now write a GOAL v3 object for the wasm runtime: static
+data, an 8-byte function object per function (table index, and for the
+top-level function the offset of the embedded module) and the wasm
+module at the end of the top-level segment. Static and function
+addresses are segment base imports plus offsets; each module exports
+__link, which adds its functions to the table.
+
+Every GOAL function now has the wasm type (i64 x 8) -> i64 and callers
+pad with zeros, because GOAL code calls functions with more or fewer
+arguments than they take, which x86 tolerates and call_indirect doesn't.
+---
+ goalc/compiler/IR.h             |   1 +
+ goalc/compiler/IR_wasm.cpp      |  23 ++++-
+ goalc/emitter/ObjectGenerator.h |   4 +
+ goalc/wasm/WasmCodegen.cpp      | 162 +++++++++++++++++++++++++++++++-
+ goalc/wasm/WasmCodegen.h        |  45 ++++++++-
+ goalc/wasm/goalc_wasm_main.cpp  |  25 ++++-
+ 6 files changed, 250 insertions(+), 10 deletions(-)
+
+diff --git a/goalc/compiler/IR.h b/goalc/compiler/IR.h
+index 90882af0..27daf978 100644
+--- a/goalc/compiler/IR.h
++++ b/goalc/compiler/IR.h
+@@ -201,6 +201,7 @@ class IR_StaticVarAddr : public IR {
+                         const AllocationResult& allocs,
+                         emitter::IR_Record irec) override;
+ 
++  void do_codegen_wasm(wasm_backend::FunctionGen& gen) override;
+  protected:
+   const RegVal* m_dest = nullptr;
+   const StaticObject* m_src = nullptr;
+diff --git a/goalc/compiler/IR_wasm.cpp b/goalc/compiler/IR_wasm.cpp
+index 3cda804a..cf58239d 100644
+--- a/goalc/compiler/IR_wasm.cpp
++++ b/goalc/compiler/IR_wasm.cpp
+@@ -143,14 +143,20 @@ void IR_RegSet::do_codegen_wasm(FunctionGen& gen) {
+ }
+ 
+ void IR_FunctionCall::do_codegen_wasm(FunctionGen& gen) {
++  // uniform GOAL function type: 8 i64 params, unused ones are zero
+   std::vector<BinaryenExpressionRef> args;
+-  std::vector<BinaryenType> params;
++  std::vector<BinaryenType> params(wasm_backend::kGoalArgCount, BinaryenTypeInt64());
++  if ((int)m_args.size() > wasm_backend::kGoalArgCount) {
++    gen.unsupported("a call with more than 8 arguments");
++  }
+   for (auto* arg : m_args) {
+     if (arg->ireg().reg_class != RegClass::GPR_64) {
+       gen.unsupported("a 128-bit function argument");
+     }
+     args.push_back(gen.get(arg));
+-    params.push_back(BinaryenTypeInt64());
++  }
++  while ((int)args.size() < wasm_backend::kGoalArgCount) {
++    args.push_back(i64_const(gen, 0));
+   }
+   if (m_ret->ireg().reg_class != RegClass::GPR_64) {
+     gen.unsupported("a 128-bit return value");
+@@ -426,5 +432,16 @@ void IR_StaticVarLoad::do_codegen_wasm(FunctionGen& gen) {
+     gen.emit(gen.set(m_dest, f32_const(gen, f->value)));
+     return;
+   }
+-  gen.unsupported("loading static data other than a float constant");
++  // other statics (e.g. vector constants) are read from the object's static data
++  auto ptr = gen.goal_addr(gen.mod()->static_addr(m_src));
++  if (is_simd128(m_dest->ireg().reg_class)) {
++    gen.emit(gen.set(m_dest, BinaryenLoad(gen.module(), 16, false, gen.mem_offset(0), 1,
++                                          BinaryenTypeVec128(), ptr, wasm_backend::kMemoryName)));
++    return;
++  }
++  gen.unsupported("loading this kind of static data");
++}
++
++void IR_StaticVarAddr::do_codegen_wasm(FunctionGen& gen) {
++  gen.emit(gen.set(m_dest, gen.mod()->static_addr(m_src)));
+ }
+diff --git a/goalc/emitter/ObjectGenerator.h b/goalc/emitter/ObjectGenerator.h
+index 1bcbc5e9..2c2f92c5 100644
+--- a/goalc/emitter/ObjectGenerator.h
++++ b/goalc/emitter/ObjectGenerator.h
+@@ -97,6 +97,10 @@ class ObjectGenerator {
+   void link_instruction_to_function(const InstructionRecord& instr,
+                                     const FunctionRecord& target_func);
+   ObjectGeneratorStats get_stats() const;
++  // Jakompiled wasm backend: offset of a static in its segment, valid after generate_data_v3
++  int static_location(const StaticRecord& rec) const {
++    return m_static_data_by_seg.at(rec.seg).at(rec.static_id).location;
++  }
+   void count_eliminated_move();
+ 
+   GameVersion version() const { return m_version; }
+diff --git a/goalc/wasm/WasmCodegen.cpp b/goalc/wasm/WasmCodegen.cpp
+index 2d365ac3..bafd9b80 100644
+--- a/goalc/wasm/WasmCodegen.cpp
++++ b/goalc/wasm/WasmCodegen.cpp
+@@ -15,6 +15,9 @@
+ 
+ #include "goalc/compiler/Env.h"
+ #include "goalc/compiler/IR.h"
++#include "goalc/compiler/StaticObject.h"
++#include "goalc/debugger/DebugInfo.h"
++#include "goalc/emitter/ObjectGenerator.h"
+ 
+ #include "fmt/format.h"
+ 
+@@ -113,13 +116,20 @@ void FunctionGen::set_params(const std::vector<RegVal*>& args) {
+   if (!m_local_types.empty()) {
+     throw std::runtime_error("wasm backend: function arguments set after other locals");
+   }
++  if ((int)args.size() > kGoalArgCount) {
++    unsupported("more than 8 arguments");
++  }
+   for (auto* arg : args) {
+     if (arg->ireg().reg_class != RegClass::GPR_64) {
+       unsupported("a 128-bit function argument");
+     }
+     local_index(arg);
+   }
+-  m_num_params = (int)args.size();
++  // the remaining params exist (uniform GOAL function type) but are never read
++  while ((int)m_local_types.size() < kGoalArgCount) {
++    m_local_types.push_back(BinaryenTypeInt64());
++  }
++  m_num_params = kGoalArgCount;
+ }
+ 
+ void FunctionGen::set_return_reg(const RegVal* rv) {
+@@ -136,12 +146,17 @@ void FunctionGen::run() {
+   const auto& code = m_env->code();
+ 
+   // the arguments have to be known before any other local is created
++  bool has_params = false;
+   for (auto& ir : code) {
+     if (auto* reset = dynamic_cast<IR_ValueReset*>(ir.get())) {
+       set_params(reset->args());
++      has_params = true;
+       break;
+     }
+   }
++  if (!has_params) {
++    set_params({});
++  }
+ 
+   // basic block leaders: function start, branch targets and instructions after a branch
+   std::set<int> leaders = {0};
+@@ -241,6 +256,7 @@ ModuleGen::ModuleGen(FileEnv* env, GameVersion version, const Options& options)
+                                           BinaryenFeatureMutableGlobals() |
+                                           BinaryenFeatureBulkMemory() |
+                                           BinaryenFeatureSignExt() |
++                                          BinaryenFeatureReferenceTypes() |
+                                           (options.shared_memory ? BinaryenFeatureAtomics() : 0));
+   BinaryenSetMemory(m_module, kMinMemoryPages, kMaxMemoryPages, nullptr, nullptr, nullptr, nullptr,
+                     nullptr, nullptr, 0, options.shared_memory, false, kMemoryName);
+@@ -273,11 +289,53 @@ BinaryenExpressionRef ModuleGen::symbol_addr(const std::string& name) {
+   return import_global(kSymbolModule, name, "sym:" + name);
+ }
+ 
++BinaryenExpressionRef ModuleGen::segment_addr(int seg, int offset) {
++  static const char* kSegNames[N_SEG] = {"main", "debug", "top-level"};
++  auto base = import_global(kSegmentModule, kSegNames[seg], fmt::format("seg:{}", kSegNames[seg]));
++  return BinaryenBinary(m_module, BinaryenAddInt64(), base,
++                        BinaryenConst(m_module, BinaryenLiteralInt64(offset)));
++}
++
+ BinaryenExpressionRef ModuleGen::function_addr(const FunctionEnv* f) {
++  if (m_layout) {
++    auto& [seg, offset] = m_layout->functions.at(f);
++    return segment_addr(seg, offset);
++  }
+   auto name = export_name(f);
+   return import_global(kFunctionModule, name, "func:" + name);
+ }
+ 
++BinaryenExpressionRef ModuleGen::static_addr(const StaticObject* s) {
++  if (!m_layout) {
++    throw std::runtime_error("wasm backend: static data needs an object layout (goalc-wasm -o)");
++  }
++  auto& [seg, offset] = m_layout->statics.at(s);
++  return segment_addr(seg, offset + s->get_addr_offset());
++}
++
++/*!
++ * __link(): add every function of the module to the table and store its index in the function
++ * object, so that GOAL code (and the runtime) can call it through call_indirect.
++ */
++void ModuleGen::add_link_function() {
++  std::vector<BinaryenExpressionRef> body;
++  for (auto& f : m_env->functions()) {
++    auto name = export_name(f.get());
++    auto func_ref = BinaryenRefFunc(m_module, name.c_str(),
++                                    BinaryenFunctionGetType(BinaryenGetFunction(m_module, name.c_str())));
++    auto index = BinaryenTableGrow(m_module, kTableName, func_ref,
++                                   BinaryenConst(m_module, BinaryenLiteralInt32(1)));
++    auto addr = BinaryenUnary(m_module, BinaryenWrapInt64(), function_addr(f.get()));
++    body.push_back(BinaryenStore(m_module, 4, WASM_EE_MAIN_MEM_BASE, 4, addr, index,
++                                 BinaryenTypeInt32(), kMemoryName));
++  }
++  auto block = BinaryenBlock(m_module, nullptr, body.data(), (BinaryenIndex)body.size(),
++                             BinaryenTypeNone());
++  BinaryenAddFunction(m_module, kLinkExport, BinaryenTypeNone(), BinaryenTypeNone(), nullptr, 0,
++                      block);
++  BinaryenAddFunctionExport(m_module, kLinkExport, kLinkExport);
++}
++
+ std::string ModuleGen::export_name(const FunctionEnv* f) const {
+   return f->name();
+ }
+@@ -291,6 +349,9 @@ std::vector<u8> ModuleGen::run() {
+     FunctionGen fg(this, f.get());
+     fg.run();
+   }
++  if (m_layout) {
++    add_link_function();
++  }
+ 
+   if (!BinaryenModuleValidate(m_module)) {
+     throw std::runtime_error("wasm backend: generated module failed validation");
+@@ -314,4 +375,103 @@ std::vector<u8> codegen_wasm(FileEnv* env, GameVersion version, const Options& o
+   return gen.run();
+ }
+ 
++namespace {
++// klink starts an object at the first function of the top-level segment
++const FunctionEnv* top_level_function(FileEnv* env) {
++  for (auto& f : env->functions()) {
++    if (f->segment == TOP_LEVEL_SEGMENT) {
++      return f.get();
++    }
++  }
++  throw std::runtime_error("wasm backend: object has no top-level function");
++}
++
++/*!
++ * Lay out a wasm-target object: an 8-byte function object per function (table index, then the
++ * offset to the embedded module for the top-level function), the statics, and the module at the
++ * end of the top-level segment. Functions and statics come before the module, so their offsets
++ * don't depend on its size.
++ */
++std::vector<u8> build_object(FileEnv* env,
++                             GameVersion version,
++                             const TypeSystem* ts,
++                             const std::vector<u8>& module,
++                             u32 top_level_module_offset,
++                             Layout* layout_out,
++                             int* module_location_out) {
++  emitter::ObjectGenerator gen(version, emitter::InstructionSet::X86);
++  DebugInfo debug(env->name());
++  std::vector<emitter::FunctionRecord> recs;
++  for (auto& f : env->functions()) {
++    auto rec = gen.add_function_to_seg(f->segment, &debug.add_function(f->name(), env->name()));
++    const bool top_level = (f.get() == top_level_function(env));
++    const u32 aux = top_level ? top_level_module_offset : 0;
++    gen.add_instr_no_ir(rec,
++                        emitter::InstructionARM64(emitter::InstructionARM64(u32(0)),
++                                                  emitter::InstructionARM64(aux)),
++                        InstructionInfo::Kind::PROLOGUE);
++    recs.push_back(rec);
++  }
++  for (auto& st : env->statics()) {
++    st->generate(&gen);
++  }
++  auto module_rec = gen.add_static_to_seg(TOP_LEVEL_SEGMENT, 16);
++  auto& module_data = gen.get_static_data(module_rec);
++  EmbeddedModuleHeader header{kEmbeddedModuleMagic, (u32)module.size()};
++  module_data.resize(sizeof(header) + module.size());
++  memcpy(module_data.data(), &header, sizeof(header));
++  if (!module.empty()) {
++    memcpy(module_data.data() + sizeof(header), module.data(), module.size());
++  }
++
++  auto data = gen.generate_data_v3(ts);
++
++  if (layout_out) {
++    for (size_t i = 0; i < env->functions().size(); i++) {
++      auto& f = env->functions()[i];
++      auto& dbg = debug.function_by_name(f->name());
++      layout_out->functions[f.get()] = {dbg.seg, (int)dbg.offset_in_seg};
++    }
++    for (auto& st : env->statics()) {
++      layout_out->statics[st.get()] = {st->rec.seg, gen.static_location(st->rec)};
++    }
++  }
++  if (module_location_out) {
++    *module_location_out = gen.static_location(module_rec);
++  }
++  return data.to_vector();
++}
++}  // namespace
++
++WasmObject codegen_wasm_object(FileEnv* env,
++                               GameVersion version,
++                               const TypeSystem* ts,
++                               const Options& options) {
++  // pass 1: layout, with an empty module
++  Layout layout;
++  int module_location = -1;
++  build_object(env, version, ts, {}, 0, &layout, &module_location);
++
++  // the module refers to functions and statics through that layout
++  ModuleGen mod(env, version, options);
++  mod.set_layout(&layout);
++  WasmObject result;
++  result.module = mod.run();
++
++  // pass 2: the final object, with the module embedded
++  auto& [tl_seg, tl_offset] = layout.functions.at(top_level_function(env));
++  if (tl_seg != TOP_LEVEL_SEGMENT || tl_offset != 4) {
++    throw std::runtime_error("wasm backend: top-level function is not the object's entry point");
++  }
++  Layout check;
++  int check_location = -1;
++  result.object = build_object(env, version, ts, result.module,
++                               (u32)(module_location - tl_offset), &check, &check_location);
++  if (check_location != module_location || check.functions != layout.functions ||
++      check.statics != layout.statics) {
++    throw std::runtime_error("wasm backend: object layout changed between passes");
++  }
++  return result;
++}
++
+ }  // namespace wasm_backend
+diff --git a/goalc/wasm/WasmCodegen.h b/goalc/wasm/WasmCodegen.h
+index 289d1d53..f912c050 100644
+--- a/goalc/wasm/WasmCodegen.h
++++ b/goalc/wasm/WasmCodegen.h
+@@ -13,7 +13,10 @@
+  *  - GOAL memory is the imported linear memory, at constant offset WASM_EE_MAIN_MEM_BASE.
+  *    A GOAL pointer p is accessed as load/store (wrap p) with immediate offset BASE + field.
+  *  - GPRs are i64 locals, floats f32, 128-bit registers v128.
+- *  - Every GOAL function has the wasm type (i64 x nargs) -> i64.
++ *  - Every GOAL function has the same wasm type, (i64 x 8) -> i64, and callers pad the arguments
++ *    they don't pass with zeros. x86 GOAL code tolerates calling a function with more or fewer
++ *    arguments than it takes (methods, casts, run-function-in-process); wasm checks the exact type
++ *    of every indirect call, so a single type keeps those calls working.
+  *  - A GOAL function value is the GOAL address of a function object whose first word holds the
+  *    function's index in the imported table. Calls load it and use call_indirect.
+  *  - s7 (symbol table) and every symbol / function object used are imported i64 globals, so the
+@@ -35,6 +38,7 @@ class FileEnv;
+ class FunctionEnv;
+ class RegVal;
+ class StaticObject;
++class TypeSystem;
+ 
+ namespace wasm_backend {
+ 
+@@ -45,6 +49,27 @@ constexpr const char* kTableName = "table";
+ constexpr const char* kS7Global = "s7";
+ constexpr const char* kSymbolModule = "sym";     // sym.<name>: GOAL address of a symbol
+ constexpr const char* kFunctionModule = "func";  // func.<name>: GOAL address of a function
++constexpr const char* kSegmentModule = "seg";    // seg.<n>: GOAL address of segment n
++constexpr const char* kLinkExport = "__link";    // puts every function in the table
++constexpr int kGoalArgCount = 8;                 // wasm params of every GOAL function
++
++// Header of the wasm module embedded in a wasm-target object file (end of the top-level segment).
++// The top-level function's stub stores the offset from the function to this header.
++constexpr u32 kEmbeddedModuleMagic = 0x4b4a5741;  // "AWJK"
++struct EmbeddedModuleHeader {
++  u32 magic;
++  u32 size;  // bytes of wasm module that follow
++};
++
++/*!
++ * Where functions and statics end up in the object's segments (offsets from the segment start).
++ * With a layout, the module refers to them as seg.<n> + offset, and exports __link, which
++ * adds every function to the table and stores the index in its function object.
++ */
++struct Layout {
++  std::unordered_map<const FunctionEnv*, std::pair<int, int>> functions;  // seg, offset
++  std::unordered_map<const StaticObject*, std::pair<int, int>> statics;   // seg, offset
++};
+ 
+ struct Options {
+   bool shared_memory = false;  // the runtime uses a SharedArrayBuffer (pthreads)
+@@ -122,18 +147,23 @@ class ModuleGen {
+   BinaryenExpressionRef s7();
+   BinaryenExpressionRef symbol_addr(const std::string& name);
+   BinaryenExpressionRef function_addr(const FunctionEnv* f);
++  BinaryenExpressionRef static_addr(const StaticObject* s);
+   std::string export_name(const FunctionEnv* f) const;
++  void set_layout(const Layout* layout) { m_layout = layout; }
+ 
+  private:
+   BinaryenExpressionRef import_global(const std::string& module,
+                                       const std::string& field,
+                                       const std::string& internal);
++  BinaryenExpressionRef segment_addr(int seg, int offset);
++  void add_link_function();
+ 
+   FileEnv* m_env;
+   GameVersion m_version;
+   Options m_options;
+   BinaryenModuleRef m_module;
+   std::unordered_map<std::string, std::string> m_imported_globals;  // module.field -> internal
++  const Layout* m_layout = nullptr;
+ };
+ 
+ /*!
+@@ -141,4 +171,17 @@ class ModuleGen {
+  */
+ std::vector<u8> codegen_wasm(FileEnv* env, GameVersion version, const Options& options = {});
+ 
++/*!
++ * Compile a FileEnv to a GOAL object file (v3) for the wasm runtime: the object holds the static
++ * data and an 8-byte function object per function, and embeds the wasm module (see Layout).
++ */
++struct WasmObject {
++  std::vector<u8> object;
++  std::vector<u8> module;
++};
++WasmObject codegen_wasm_object(FileEnv* env,
++                               GameVersion version,
++                               const TypeSystem* ts,
++                               const Options& options = {});
++
+ }  // namespace wasm_backend
+diff --git a/goalc/wasm/goalc_wasm_main.cpp b/goalc/wasm/goalc_wasm_main.cpp
+index cc489fcd..85a6bd9d 100644
+--- a/goalc/wasm/goalc_wasm_main.cpp
++++ b/goalc/wasm/goalc_wasm_main.cpp
+@@ -2,7 +2,10 @@
+  * goalc-wasm: compile a GOAL source file to a WebAssembly module (Jakompiled).
+  *
+  *   goalc-wasm [--game jak2] [--proj-path dir] [--no-opt] [--shared-memory] [--print-ir]
+- *              <in.gc> <out.wasm>
++ *              <in.gc> <out.wasm | out.o>
++ *
++ * With a .o output it writes a GOAL object file for the wasm runtime (static data, function
++ * objects and the embedded module, see codegen_wasm_object) and the module next to it (.wasm).
+  *
+  * The object file is compiled with the normal goalc front end and then emitted by the wasm
+  * backend instead of register allocation + x86 codegen. Every function is exported under its
+@@ -71,10 +74,22 @@ int main(int argc, char** argv) {
+         }
+       }
+     }
+-    auto bytes = wasm_backend::codegen_wasm(file_env, version, options);
+-    file_util::write_binary_file(fs::absolute(positional[1]), bytes.data(), bytes.size());
+-    printf("%s: %zu bytes, %zu functions\n", positional[1].c_str(), bytes.size(),
+-           file_env->functions().size());
++    auto out = fs::absolute(positional[1]);
++    if (out.extension() == ".o") {
++      auto obj = wasm_backend::codegen_wasm_object(file_env, version, &compiler.type_system(),
++                                                   options);
++      file_util::write_binary_file(out, obj.object.data(), obj.object.size());
++      auto wasm_path = fs::path(out).replace_extension(".wasm");
++      file_util::write_binary_file(wasm_path, obj.module.data(), obj.module.size());
++      printf("%s: %zu bytes (module %zu bytes), %zu functions, %zu statics\n",
++             out.string().c_str(), obj.object.size(), obj.module.size(),
++             file_env->functions().size(), file_env->statics().size());
++    } else {
++      auto bytes = wasm_backend::codegen_wasm(file_env, version, options);
++      file_util::write_binary_file(out, bytes.data(), bytes.size());
++      printf("%s: %zu bytes, %zu functions\n", out.string().c_str(), bytes.size(),
++             file_env->functions().size());
++    }
+   } catch (std::exception& e) {
+     fprintf(stderr, "goalc-wasm: %s\n", e.what());
+     return 1;
+-- 
+2.43.0
+
