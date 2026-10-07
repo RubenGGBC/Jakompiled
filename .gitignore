@@ -1,0 +1,5 @@
+*.iso
+*.ISO
+iso_data/
+out/
+build/
