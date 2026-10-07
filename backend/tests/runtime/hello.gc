@@ -21,3 +21,15 @@
 (_format 0 "[GOAL/wasm] (+ 2 3) = ~D, (hello-fact 10) = ~D~%" (+ 2 3) (hello-fact 10))
 (_format 0 "[GOAL/wasm] cadena estática: ~A (suma de bytes ~D)~%" "jakompiled" (hello-sum-string "jakompiled"))
 (_format 0 "[GOAL/wasm] flotante: ~f~%" (* 0.5 7.0))
+
+(defun hello-static-list-ok ()
+  "Una lista estática de símbolos: cada car debe ser la dirección del símbolo (no su
+   desplazamiento desde s7, como cuando klink enlazaba dos veces los registros duplicados de los
+   pares) y el último cdr la lista vacía."
+  (let ((l '(uno dos tres)))
+    (and (= (car l) 'uno)
+         (= (car (cdr l)) 'dos)
+         (= (car (cdr (cdr l))) 'tres)
+         (= (cdr (cdr (cdr l))) '()))))
+
+(_format 0 "[GOAL/wasm] lista estática: ~A~%" (if (hello-static-list-ok) "bien" "MAL"))

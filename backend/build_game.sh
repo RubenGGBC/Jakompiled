@@ -38,7 +38,9 @@ inputs+=("${game[@]}")
   --out-dir "$objs" "${inputs[@]}" | grep -v "debug\]" | grep -v "bytes (module" || true
 
 if [ "${EMPTY_TPAGE_DIR:-0}" = 1 ]; then
-  # goalc escribe out/jak2/obj/dir-tpages.go con su propio generador (asm-data-file dir-tpages)
+  # goalc escribe out/jak2/obj/dir-tpages.go con su propio generador (asm-data-file dir-tpages),
+  # pero no crea el directorio (en un árbol recién clonado no existe)
+  mkdir -p "$JAK_PROJECT/out/jak2/obj"
   : > "$objs/empty-tpage-dir.txt"
   echo "(asm-data-file dir-tpages \"$objs/empty-tpage-dir.txt\")" > "$objs/make-tpage-dir.gc"
   "$goalc_wasm" --proj-path "$JAK_PROJECT" "$objs/make-tpage-dir.gc" "$objs/make-tpage-dir.wasm" \

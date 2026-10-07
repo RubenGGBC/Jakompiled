@@ -23,16 +23,15 @@ Idioma del proyecto: castellano (docs, mensajes, scripts). Código y comentarios
 | Renderer en WebGL 2 | ⚠️ pinta la pantalla de carga del juego (datos de la ISO); el juego se para antes del primer nivel |
 | Input (teclado/mando), sonido | ❌ pendiente |
 
-## Siguiente paso: `lookup-level-info` se sale de la memoria
+## Siguiente paso: el renderer llama a código GOAL desde el hilo de gráficos
 
-Con la ISO real el motor llega a `play-boot!` y se cae el proceso de `play`:
+Arreglado (parche 0021): las listas estáticas de los objetos wasm quedaban mal enlazadas (`lookup-level-info` se salía de la memoria). Ahora el motor carga el nivel `title`.
 
-```
-RuntimeError: memory access out of bounds
-    at lookup-level-info → (method level-get-for-use level-group) → play
-```
+Fallo actual: en el primer fotograma, `OpenGLRenderer::dispatch_buckets_jak2` → `vif_interrupt_callback` (`game/kernel/common/kmachine.cpp`) → `call_goal` del handler VIF1 de GOAL (`vif1-handler`, `goal_src/jak2/engine/gfx/hw/display.gc`, instalado con `install-handler 5`). Ese código corre en el hilo de gráficos, pero los módulos wasm de GOAL, su tabla y `globalThis.jak` (sp/pp) solo existen en el worker del hilo EE → `TypeError ... reading 'sp'` en `js_get_sp` y `std::terminate`. Opciones: no llamar al handler en la web (solo hace profiling de buckets; comprobarlo) o reenviar la llamada al hilo EE.
 
-`lookup-level-info` (`goal_src/jak2/engine/level/level.gc`) recorre `*level-load-list*`, una lista estática de ~160 símbolos (`level-info.gc`). Sospechas: el final de la lista estática (`'()`) o el valor de algún símbolo enlazado mal por el backend wasm (`CODE.PAK`). Para depurarlo hace falta recompilar `CODE.PAK` (backend nativo, `backend/build_code.sh`).
+Para ver excepciones JS dentro de los workers: CDP con pausa en excepciones (Chromium con `--remote-debugging-port=0` y el puerto leído de `DevToolsActivePort` de su propio perfil; nunca un puerto fijo, puede ser el Chrome del usuario).
+
+Recompilar: `gk`/extractor con Docker `emscripten/emsdk:6.0.11`; `goalc-wasm` (y `KERNEL.CGO`, `CODE.PAK`, `GAME.CGO` con `backend/build_*.sh`) en una imagen Ubuntu 24.04 con clang, lld, cmake, ninja, nasm, python3, libssl-dev (en Windows los `.sh` del repo tienen CRLF: convertirlos dentro del contenedor).
 
 Probar (la ISO va en `iso/`, ignorada por git; en Windows no hay WSL, se compila con Docker `emscripten/emsdk:6.0.11`):
 

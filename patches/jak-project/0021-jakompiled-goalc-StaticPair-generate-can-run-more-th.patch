@@ -1,0 +1,36 @@
+From b78cb4c7e36be28635a40be8ab775b0e9f580d13 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Thu, 8 Oct 2026 01:31:58 +0200
+Subject: [PATCH] [jakompiled] goalc: StaticPair::generate can run more than
+ once
+
+The wasm backend builds each object twice (layout, then the final object with the
+module embedded). StaticPair::generate added its link records on every call, so
+the final object linked each symbol of a static list twice: the first time klink
+wrote the symbol's address, the second time (no -1 placeholder left) its offset
+from s7. Static lists then held s7 offsets and ended in -7 instead of '(): with a
+real ISO, lookup-level-info walked *level-load-list* out of memory.
+---
+ goalc/compiler/StaticObject.cpp | 6 ++++++
+ 1 file changed, 6 insertions(+)
+
+diff --git a/goalc/compiler/StaticObject.cpp b/goalc/compiler/StaticObject.cpp
+index 5bdb7e49..058bca6a 100644
+--- a/goalc/compiler/StaticObject.cpp
++++ b/goalc/compiler/StaticObject.cpp
+@@ -180,6 +180,12 @@ int StaticPair::get_addr_offset() const {
+ }
+ 
+ void StaticPair::generate(emitter::ObjectGenerator* gen) {
++  // all of a pair's link records come from generate_item below. Start over, so generate() can run
++  // more than once (the wasm backend builds each object twice): otherwise the records would be
++  // duplicated, and the linker would link the same symbol twice (the 2nd time as an s7 offset).
++  symbols.clear();
++  pointers.clear();
++  functions.clear();
+   data.resize(2 * POINTER_SIZE);  // size of pair
+   generate_item(m_car, 0);
+   generate_item(m_cdr, 4);
+-- 
+2.49.0.windows.1
+

@@ -40,7 +40,7 @@ sleep 1
 "$goalc_wasm" --proj-path "$JAK_PROJECT" --shared-memory "$here/tests/runtime/hello.gc" "$work/hello.o" \
   | grep -v "debug\]" || true
 python3 "$here/make_dgo.py" "$work/hello.CGO" "$work/hello.o" >/dev/null
-run_case hello "$work/hello.CGO" "\[GOAL/wasm\] flotante"
+run_case hello "$work/hello.CGO" "\[GOAL/wasm\] lista estática: bien"
 
 GOALC_WASM="$goalc_wasm" "$here/build_kernel.sh" "$work/procs.CGO" "$here/tests/runtime/procs.gc" >/dev/null
 run_case procs "$work/procs.CGO" "el proceso se desactiva"
