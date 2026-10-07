@@ -7,6 +7,7 @@ OpenGOAL (Jak and Daxter 1–3) en el navegador con WebAssembly.
 - [Fase 1: medición de riesgo de rendimiento](docs/fase1-benchmark.md): peor caso ~2x, se puede seguir
 - [Fase 2: el runtime en el navegador](docs/fase2-runtime.md): `gk` arranca en Chromium y carga `KERNEL.CGO`
 - [Fase 3: backend wasm de goalc](docs/fase3-backend.md) (en curso): el kernel GOAL de Jak 2 compilado a wasm ejecuta procesos en Chromium; el motor (`GAME.CGO`) compila a wasm y se ejecuta en el navegador hasta que necesita datos de la ISO
+- [Extracción de la ISO en el navegador](docs/extraccion-iso.md) (lista para probar con una ISO real): ISO → OPFS y extractor de OpenGOAL en wasm, sin que nada salga del navegador
 
 Basado en [open-goal/jak-project](https://github.com/open-goal/jak-project), commit de referencia `efb21c3`.
 

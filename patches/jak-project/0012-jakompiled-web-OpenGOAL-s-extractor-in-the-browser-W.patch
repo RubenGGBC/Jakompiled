@@ -1,0 +1,263 @@
+From 22ec6071bf2ca03ca25de7c1ecd794450acfba5f Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Wed, 7 Oct 2026 18:35:17 +0000
+Subject: [PATCH 12/12] [jakompiled] web: OpenGOAL's extractor in the browser
+ (WasmFS + OPFS)
+
+- extractor-web: decompiler/extractor/main.cpp without the compile/play steps, with WasmFS and its
+  OPFS backend so the extracted ISO and decompiler output stay on disk, in the browser's private
+  file system; decompiler config and texture assets embedded (no game data)
+- decompiler builds for wasm32: xdelta3 SIZEOF_SIZE_T from the compiler, usize_t for xd3 sizes
+- tiny_gltf keeps the web compile flags (its CMakeLists replaces CMAKE_CXX_FLAGS)
+- extractor_util: the suggested ELF database entry had 4 format fields for 3 arguments
+---
+ decompiler/ObjectFile/ObjectFileDB.cpp  |  4 +--
+ decompiler/extractor/extractor_util.cpp |  2 +-
+ decompiler/extractor/main.cpp           | 22 ++++++++++++
+ third-party/xdelta3/xdelta3.h           |  2 +-
+ web/CMakeLists.txt                      | 35 +++++++++++++++++++
+ web/extract_web.cpp                     | 45 +++++++++++++++++++++++++
+ 6 files changed, 106 insertions(+), 4 deletions(-)
+ create mode 100644 web/extract_web.cpp
+
+diff --git a/decompiler/ObjectFile/ObjectFileDB.cpp b/decompiler/ObjectFile/ObjectFileDB.cpp
+index 288edd4e..3e1b295b 100644
+--- a/decompiler/ObjectFile/ObjectFileDB.cpp
++++ b/decompiler/ObjectFile/ObjectFileDB.cpp
+@@ -167,7 +167,7 @@ ObjectFileDB::ObjectFileDB(const std::vector<fs::path>& _dgos,
+         // ideally the delta patch should never be that big.
+         int buf_sz = data.size() * 2;
+         u8* out_buf = (u8*)malloc(buf_sz);
+-        size_t out_sz = 0;  // this is where the actual used size of the delta patch will be stored
++        usize_t out_sz = 0;  // this is where the actual used size of the delta patch will be stored
+         int xd3_res = xd3_encode_memory(data2.data(), data2.size(), data.data(), data.size(),
+                                         out_buf, &out_sz, buf_sz, 0);
+         if (xd3_res) {
+@@ -194,7 +194,7 @@ ObjectFileDB::ObjectFileDB(const std::vector<fs::path>& _dgos,
+         // delta patch's size
+         int buf_sz = data.size() * 2 + data2.size();
+         u8* out_buf = (u8*)malloc(buf_sz);
+-        size_t out_sz = 0;
++        usize_t out_sz = 0;
+         int xd3_res = xd3_decode_memory(data2.data(), data2.size(), data.data(), data.size(),
+                                         out_buf, &out_sz, buf_sz, 0);
+         if (xd3_res) {
+diff --git a/decompiler/extractor/extractor_util.cpp b/decompiler/extractor/extractor_util.cpp
+index 99739509..ea950bb9 100644
+--- a/decompiler/extractor/extractor_util.cpp
++++ b/decompiler/extractor/extractor_util.cpp
+@@ -270,7 +270,7 @@ void log_potential_new_db_entry(ExtractorErrorCode error_code,
+         serial);
+     lg::info(
+         "\t'{{{}, {{\"GAME_TITLE\", \"NTSC-U/PAL/NTSC-J\", {}, {}U, "
+-        "\"DECOMP_CONFIF_FILENAME_NO_EXTENSION\", \"jak1|jak2|jak3|jakx\", {}}}}}'",
++        "\"DECOMP_CONFIF_FILENAME_NO_EXTENSION\", \"jak1|jak2|jak3|jakx\", {{}}}}}}'",
+         elf_hash, files_extracted, contents_hash);
+   }
+ }
+diff --git a/decompiler/extractor/main.cpp b/decompiler/extractor/main.cpp
+index aa302ecf..061d1228 100644
+--- a/decompiler/extractor/main.cpp
++++ b/decompiler/extractor/main.cpp
+@@ -8,7 +8,15 @@
+ #include "decompiler/config.h"
+ #include "decompiler/decompilation_process.h"
+ #include "decompiler/extractor/extractor_util.h"
++#ifdef __EMSCRIPTEN__
++// Jakompiled web: the in-browser extractor only extracts and decompiles. The game's code is
++// compiled to wasm ahead of time, so there's no compile step (and no goalc in this build).
++namespace jakompiled {
++void extract_setup_fs();  // web/extract_web.cpp
++}
++#else
+ #include "goalc/compiler/Compiler.h"
++#endif
+ 
+ #include "third-party/CLI11.hpp"
+ 
+@@ -134,6 +142,7 @@ ExtractorErrorCode decompile(const fs::path& in_folder,
+ const std::unordered_map<std::string, GameIsoFlags> game_iso_flag_names = {
+     {"jak1-black-label", FLAG_JAK1_BLACK_LABEL}};
+ 
++#ifndef __EMSCRIPTEN__
+ ExtractorErrorCode compile(const fs::path& iso_data_path,
+                            const std::string& data_subfolder,
+                            emitter::InstructionSet instr_str) {
+@@ -176,6 +185,7 @@ void launch_game(const std::string& game_version) {
+                      game_version)
+              .c_str());
+ }
++#endif
+ 
+ int main(int argc, char** argv) {
+   ArgumentGuard u8_guard(argc, argv);
+@@ -199,6 +209,9 @@ int main(int argc, char** argv) {
+ #endif
+ 
+   lg::initialize();
++#ifdef __EMSCRIPTEN__
++  jakompiled::extract_setup_fs();
++#endif
+ 
+   CLI::App app{"OpenGOAL Extractor (ISO Tools + Decompiler + Compiler)"};
+   app.add_option("game-files-path", input_file_path,
+@@ -226,6 +239,12 @@ int main(int argc, char** argv) {
+   app.validate_positionals();
+   CLI11_PARSE(app, argc, argv);
+ 
++#ifdef __EMSCRIPTEN__
++  if (flag_compile || flag_play || flag_runall) {
++    lg::error("the web extractor only extracts and decompiles (-e, -d)");
++    return static_cast<int>(ExtractorErrorCode::INVALID_CLI_INPUT);
++  }
++#else
+   emitter::InstructionSet instr_set;
+   if (instr_set_name == "x86") {
+     instr_set = emitter::InstructionSet::X86;
+@@ -235,6 +254,7 @@ int main(int argc, char** argv) {
+     lg::error("Instruction set '{}' must be 'x86' or 'arm64'", instr_set_name);
+     return 1;
+   }
++#endif
+ 
+   lg::info("Working Directory - {}", fs::current_path().string());
+ 
+@@ -409,6 +429,7 @@ int main(int argc, char** argv) {
+     }
+   }
+ 
++#ifndef __EMSCRIPTEN__
+   if (flag_compile) {
+     const auto status_code = compile(iso_data_path, data_subfolder, instr_set);
+     if (status_code != ExtractorErrorCode::SUCCESS) {
+@@ -419,6 +440,7 @@ int main(int argc, char** argv) {
+   if (flag_play) {
+     launch_game(game_name);
+   }
++#endif
+ 
+   return 0;
+ }
+diff --git a/third-party/xdelta3/xdelta3.h b/third-party/xdelta3/xdelta3.h
+index bec82e61..383e1ebf 100644
+--- a/third-party/xdelta3/xdelta3.h
++++ b/third-party/xdelta3/xdelta3.h
+@@ -1,6 +1,6 @@
+ #pragma once
+ 
+-#define SIZEOF_SIZE_T 8
++#define SIZEOF_SIZE_T __SIZEOF_SIZE_T__  // 4 on wasm32 (Jakompiled web)
+ #define SIZEOF_UNSIGNED_LONG_LONG 8
+ 
+ #ifdef __cplusplus
+diff --git a/web/CMakeLists.txt b/web/CMakeLists.txt
+index fc04a5fb..6b12bb21 100644
+--- a/web/CMakeLists.txt
++++ b/web/CMakeLists.txt
+@@ -65,6 +65,9 @@ build_third_party_lib(stb_image stb_image)
+ add_library(draco_disabled INTERFACE)
+ add_library(draco::draco ALIAS draco_disabled)
+ build_third_party_lib(tiny_gltf tiny_gltf)
++# its CMakeLists replaces CMAKE_CXX_FLAGS with -O3, dropping the web flags (atomics for -pthread)
++separate_arguments(WEB_FLAGS_LIST UNIX_COMMAND "${WEB_FLAGS}")
++target_compile_options(tiny_gltf PRIVATE ${WEB_FLAGS_LIST})
+ 
+ set(STATICALLY_LINK ON)  # Emscripten has no shared libraries
+ include(SDLOptions)
+@@ -83,6 +86,10 @@ add_library(cubeb STATIC ${CMAKE_CURRENT_SOURCE_DIR}/stubs/cubeb_stub.cpp)
+ add_subdirectory(${OG_ROOT}/common common)
+ add_subdirectory(${OG_ROOT}/game game)
+ 
++# ---- decompiler, for the in-browser extractor (web/extract_web.cpp)
++build_third_party_lib(xdelta3 xdelta3)
++add_subdirectory(${OG_ROOT}/decompiler decompiler EXCLUDE_FROM_ALL)
++
+ # ---- gk for the browser
+ set_target_properties(gk PROPERTIES SUFFIX ".js")
+ target_link_options(gk PRIVATE
+@@ -108,3 +115,31 @@ target_link_options(gk PRIVATE
+   -sASSERTIONS=1
+   --profiling-funcs
+ )
++
++# ---- extractor for the browser: extracts and decompiles the user's ISO into OPFS
++add_executable(extractor-web ${OG_ROOT}/decompiler/extractor/main.cpp
++  ${CMAKE_CURRENT_SOURCE_DIR}/extract_web.cpp)
++target_link_libraries(extractor-web decomp common lzokay fmt stb_image tiny_gltf sound)
++set_target_properties(extractor-web PROPERTIES OUTPUT_NAME "extractor" SUFFIX ".js")
++target_link_options(extractor-web PRIVATE
++  # WasmFS: its OPFS backend keeps the GBs of ISO data on disk instead of in memory
++  -sWASMFS
++  # runs inside a Worker created by the page (web/extract.js); main() may block there
++  -sENVIRONMENT=worker
++  -sMODULARIZE -sEXPORT_NAME=createExtractor
++  # loaded with importScripts from web/extract-worker.js: the pthread workers need the real script URL
++  -sINCOMING_MODULE_JS_API=[print,printErr,mainScriptUrlOrBlob,locateFile,onAbort]
++  -sPTHREAD_POOL_SIZE=4
++  -sSTACK_SIZE=8MB
++  -sINITIAL_MEMORY=256MB
++  -sALLOW_MEMORY_GROWTH
++  -sMAXIMUM_MEMORY=4GB
++  -sEXIT_RUNTIME
++  -sEXPORTED_RUNTIME_METHODS=callMain
++  -sINVOKE_RUN=0
++  -sASSERTIONS=1
++  --profiling-funcs
++  "SHELL:--embed-file ${OG_ROOT}/decompiler/config/jak2@/data/decompiler/config/jak2"
++  "SHELL:--embed-file ${OG_ROOT}/game/assets/jak2@/data/game/assets/jak2"
++  "SHELL:--embed-file ${OG_ROOT}/custom_assets/jak2@/data/custom_assets/jak2"
++)
+diff --git a/web/extract_web.cpp b/web/extract_web.cpp
+new file mode 100644
+index 00000000..852099fb
+--- /dev/null
++++ b/web/extract_web.cpp
+@@ -0,0 +1,45 @@
++// Jakompiled web: filesystem of the in-browser extractor (decompiler/extractor/main.cpp built with
++// Emscripten and WasmFS).
++//
++//   /data                    project dir (--proj-path): decompiler config and texture assets,
++//                            embedded in the module (no game data)
++//   /data/iso_data       ->  OPFS /iso_data         files of the user's ISO, written by the page
++//   /data/decompiler_out ->  OPFS /decompiler_out   decompiler output (raw objects, textures...)
++//   /data/out            ->  OPFS /out              fr3 files for the PC renderers
++//   /data/log            ->  OPFS /log              extractor logs
++//
++// Everything derived from the ISO lives in the browser's origin private file system (OPFS) and
++// never leaves the user's machine. The module must run in a Worker: the OPFS backend blocks.
++
++#include <cerrno>
++#include <cstring>
++#include <string>
++
++#include <emscripten/wasmfs.h>
++#include <sys/stat.h>
++#include <unistd.h>
++
++#include "common/log/log.h"
++
++namespace jakompiled {
++
++void extract_setup_fs() {
++  backend_t opfs = wasmfs_create_opfs_backend();
++  if (wasmfs_create_directory("/opfs", 0777, opfs) != 0) {
++    lg::die("jakompiled: can't mount OPFS at /opfs");
++  }
++  mkdir("/data", 0777);
++  chmod("/data", 0777);  // the embedded files' directory is read-only by default
++  for (const char* dir : {"iso_data", "decompiler_out", "out", "log"}) {
++    const std::string target = std::string("/opfs/") + dir;
++    const std::string link = std::string("/data/") + dir;
++    if (mkdir(target.c_str(), 0777) != 0 && errno != EEXIST) {
++      lg::die("jakompiled: can't create {}: {}", target, strerror(errno));
++    }
++    if (symlink(target.c_str(), link.c_str()) != 0 && errno != EEXIST) {
++      lg::die("jakompiled: can't link {} -> {}: {}", link, target, strerror(errno));
++    }
++  }
++}
++
++}  // namespace jakompiled
+-- 
+2.43.0
+

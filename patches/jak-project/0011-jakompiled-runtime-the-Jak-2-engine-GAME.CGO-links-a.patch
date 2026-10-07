@@ -1,7 +1,7 @@
 From 14407e68cc013f719ab16f9ac34af1dee5466277 Mon Sep 17 00:00:00 2001
 From: Claude <noreply@anthropic.com>
 Date: Wed, 7 Oct 2026 17:38:00 +0000
-Subject: [PATCH 11/11] [jakompiled] runtime: the Jak 2 engine (GAME.CGO) links
+Subject: [PATCH 11/12] [jakompiled] runtime: the Jak 2 engine (GAME.CGO) links
  and runs in the browser
 
 - mips2c functions: a pool of adapters with the GOAL function type that build the MIPS

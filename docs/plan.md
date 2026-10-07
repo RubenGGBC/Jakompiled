@@ -110,7 +110,7 @@ ISO del usuario → extractor → decompilador → código .gc (GOAL)
 - [ ] Renderers propios de Jak 2
 - [ ] Audio: SDL → Web Audio
 - [ ] Input: Gamepad API
-- [ ] Extracción de la ISO y persistencia en OPFS
+- [ ] Extracción de la ISO y persistencia en OPFS (adelantada: [extraccion-iso.md](extraccion-iso.md), falta probarla con la ISO real)
 - [ ] Optimización con el profiler del navegador: draw calls, tamaño de módulos, tiempos de carga
 
 **Salida:** Jak 2 completable de principio a fin en Chrome de escritorio a un framerate estable.

@@ -2,7 +2,8 @@
 # Compila el runtime de OpenGOAL (gk) para el navegador y monta web/dist.
 #
 #   1. Clona jak-project en el commit de referencia y aplica patches/jak-project
-#   2. Compila gk.js + gk.wasm con Emscripten (emsdk activo: source emsdk_env.sh)
+#   2. Compila gk.js + gk.wasm y el extractor (extractor.js + extractor.wasm) con Emscripten
+#      (emsdk activo: source emsdk_env.sh)
 #   3. Compila Binaryen y goalc en nativo (incluido goalc-wasm, el backend wasm de la fase 3)
 #   4. Compila el kernel GOAL a wasm y monta KERNEL.CGO (backend/build_kernel.sh, sin ISO)
 #   5. Compila el motor a wasm y monta GAME.CGO solo con código (backend/build_game.sh, sin ISO;
@@ -32,7 +33,7 @@ fi
 
 echo "== gk (wasm)"
 emcmake cmake -S "$src/web" -B "$src/build-web" -G Ninja -DCMAKE_BUILD_TYPE=Release >/dev/null
-ninja -C "$src/build-web" gk
+ninja -C "$src/build-web" gk extractor-web
 
 echo "== Binaryen (lo usa el backend wasm de goalc)"
 binaryen="$work/binaryen"
