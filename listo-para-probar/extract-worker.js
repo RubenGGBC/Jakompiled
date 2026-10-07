@@ -105,7 +105,11 @@ async function extractIso(file) {
   post("log", `[iso] extraída en ${((performance.now() - t0) / 1000).toFixed(1)} s`);
 }
 
-async function runExtractor() {
+// Una sola llamada a main (el módulo termina con EXIT_RUNTIME):
+//   extract: valida la ISO y descompila sus datos (-e -d)
+//   build:   monta los DGO/CGO y los ficheros de datos del juego (--web-build), con el código
+//            compilado a wasm de data/CODE.PAK
+async function runExtractor(steps) {
   importScripts("extractor.js");
   const module = await createExtractor({
     print: (t) => post("log", t),
@@ -113,9 +117,19 @@ async function runExtractor() {
     // las pthreads del módulo cargan este script (no extract-worker.js)
     mainScriptUrlOrBlob: "extractor.js",
   });
-  post("log", "[extractor] validando y descomprimiendo los datos del juego...");
+  const args = ["-g", "jak2", "--proj-path", "/data", "-f"];
+  if (steps.includes("extract")) args.push("-e", "-d");
+  if (steps.includes("build")) {
+    post("log", "[build] descargando el código del juego (CODE.PAK)...");
+    const r = await fetch("data/CODE.PAK");
+    if (!r.ok) throw new Error(`data/CODE.PAK: HTTP ${r.status}`);
+    module.FS.writeFile("/data/CODE.PAK", new Uint8Array(await r.arrayBuffer()));
+    args.push("--web-build");
+  }
+  args.push("/data/iso_data/jak2");
+  post("log", "[extractor] " + args.join(" "));
   try {
-    return module.callMain(["-g", "jak2", "--proj-path", "/data", "-f", "-e", "-d", "/data/iso_data/jak2"]);
+    return module.callMain(args);
   } catch (e) {
     if (e && e.name === "ExitStatus") return e.status; // exit() de main con EXIT_RUNTIME
     throw e;
@@ -123,11 +137,11 @@ async function runExtractor() {
 }
 
 onmessage = async (ev) => {
-  const { iso, steps = ["iso", "extract"] } = ev.data;
+  const { iso, steps = ["iso", "extract", "build"] } = ev.data;
   try {
     if (steps.includes("iso")) await extractIso(iso);
     let code = 0;
-    if (steps.includes("extract")) code = await runExtractor();
+    if (steps.includes("extract") || steps.includes("build")) code = await runExtractor(steps);
     post("done", { ok: code === 0, code });
   } catch (e) {
     post("log", `[error] ${e && e.stack ? e.stack : e}`);

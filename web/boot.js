@@ -30,13 +30,15 @@ const display = params.get("display") === "1";
 const gameArgs = ["-fakeiso", "-nosound", ...(bootGame ? ["-boot"] : [])];
 const cgoFiles = ["KERNEL.CGO", ...(bootGame ? ["GAME.CGO"] : [])];
 
+const downloaded = {};
+
 var Module = {
   arguments: ["-g", "jak2", "-v", ...(display ? [] : ["--no-display"]), "--proj-path", "/data", "--", ...gameArgs],
   canvas: document.getElementById("canvas"),
+  // Con WasmFS no se puede escribir en el sistema de ficheros hasta que el runtime está
+  // inicializado: los CGO se descargan en preRun y se escriben justo antes de main().
   preRun: [
     () => {
-      Module.FS.mkdirTree("/data/out/jak2/iso");
-      Module.FS.mkdirTree("/data/goal_src/user");
       for (const name of cgoFiles) {
         Module.addRunDependency(name);
         fetch(`data/${name}`)
@@ -45,7 +47,7 @@ var Module = {
             return r.arrayBuffer();
           })
           .then((buf) => {
-            Module.FS.writeFile(`/data/out/jak2/iso/${name}`, new Uint8Array(buf));
+            downloaded[name] = new Uint8Array(buf);
             log(`[boot] ${name}: ${buf.byteLength} bytes`);
             Module.removeRunDependency(name);
           })
@@ -53,6 +55,16 @@ var Module = {
       }
     },
   ],
+  onRuntimeInitialized: () => {
+    // los CGO servidos van a /data/served: el runtime los enlaza en out/jak2/iso si todavía no
+    // hay una ISO extraída en OPFS (web/runtime_fs_web.cpp)
+    Module.FS.chmod("/data", 0o777); // lo crean de solo lectura los ficheros incrustados (shaders)
+    Module.FS.mkdirTree("/data/served");
+    Module.FS.mkdirTree("/data/goal_src/user");
+    for (const [name, data] of Object.entries(downloaded)) {
+      Module.FS.writeFile(`/data/served/${name}`, data);
+    }
+  },
   print: (text) => log(text),
   printErr: (text) => {
     log(text);

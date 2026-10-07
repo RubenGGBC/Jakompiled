@@ -1,0 +1,321 @@
+From 7291fa6e91347399e21540c3707a451ea07da9f1 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Wed, 7 Oct 2026 21:02:03 +0000
+Subject: [PATCH 14/15] [jakompiled] web extractor: build the game's DGO/CGO
+ and data files in the browser
+
+--web-build, after decompiling: dir-tpages.go, game text and subtitles with goalc's data
+compiler, and every DGO/CGO of goal_src/jak2/dgos/*.gd from the wasm code objects of CODE.PAK
+and the decompiler's raw objects (the user's ISO), named like goalc's dgo tool
+---
+ decompiler/extractor/main.cpp |  22 +++-
+ web/CMakeLists.txt            |  10 +-
+ web/build_game_web.cpp        | 210 ++++++++++++++++++++++++++++++++++
+ 3 files changed, 237 insertions(+), 5 deletions(-)
+ create mode 100644 web/build_game_web.cpp
+
+diff --git a/decompiler/extractor/main.cpp b/decompiler/extractor/main.cpp
+index 061d1228..f92060f5 100644
+--- a/decompiler/extractor/main.cpp
++++ b/decompiler/extractor/main.cpp
+@@ -12,7 +12,8 @@
+ // Jakompiled web: the in-browser extractor only extracts and decompiles. The game's code is
+ // compiled to wasm ahead of time, so there's no compile step (and no goalc in this build).
+ namespace jakompiled {
+-void extract_setup_fs();  // web/extract_web.cpp
++void extract_setup_fs();   // web/extract_web.cpp
++int build_game_files();    // web/build_game_web.cpp
+ }
+ #else
+ #include "goalc/compiler/Compiler.h"
+@@ -235,6 +236,11 @@ int main(int argc, char** argv) {
+   app.add_flag("-f,--folder", flag_folder, "Take ISO input from a folder");
+   app.add_option("--instruction-set", instr_set_name,
+                  "Select the x86 or ARM64 code generation backend.");
++#ifdef __EMSCRIPTEN__
++  bool flag_web_build = false;
++  app.add_flag("--web-build", flag_web_build,
++               "Build the game's DGO/CGO and data files (code from CODE.PAK)");
++#endif
+   define_common_cli_arguments(app);
+   app.validate_positionals();
+   CLI11_PARSE(app, argc, argv);
+@@ -259,7 +265,11 @@ int main(int argc, char** argv) {
+   lg::info("Working Directory - {}", fs::current_path().string());
+ 
+   // If no flag is set, we default to running everything
+-  if (!flag_extract && !flag_decompile && !flag_compile && !flag_play) {
++  bool any_step = flag_extract || flag_decompile || flag_compile || flag_play;
++#ifdef __EMSCRIPTEN__
++  any_step = any_step || flag_web_build;
++#endif
++  if (!any_step) {
+     lg::info("Running all steps, no flags provided!");
+     flag_runall = true;
+   }
+@@ -429,7 +439,13 @@ int main(int argc, char** argv) {
+     }
+   }
+ 
+-#ifndef __EMSCRIPTEN__
++#ifdef __EMSCRIPTEN__
++  if (flag_web_build) {
++    if (jakompiled::build_game_files() != 0) {
++      return static_cast<int>(ExtractorErrorCode::COMPILATION_BAD_PROJECT_PATH);
++    }
++  }
++#else
+   if (flag_compile) {
+     const auto status_code = compile(iso_data_path, data_subfolder, instr_set);
+     if (status_code != ExtractorErrorCode::SUCCESS) {
+diff --git a/web/CMakeLists.txt b/web/CMakeLists.txt
+index caece5cf..3c7b3bad 100644
+--- a/web/CMakeLists.txt
++++ b/web/CMakeLists.txt
+@@ -127,7 +127,12 @@ target_link_options(gk PRIVATE
+ 
+ # ---- extractor for the browser: extracts and decompiles the user's ISO into OPFS
+ add_executable(extractor-web ${OG_ROOT}/decompiler/extractor/main.cpp
+-  ${CMAKE_CURRENT_SOURCE_DIR}/extract_web.cpp)
++  ${CMAKE_CURRENT_SOURCE_DIR}/extract_web.cpp
++  ${CMAKE_CURRENT_SOURCE_DIR}/build_game_web.cpp
++  # goalc's data compiler (texture directory, text, subtitles), without the rest of goalc
++  ${OG_ROOT}/goalc/data_compiler/DataObjectGenerator.cpp
++  ${OG_ROOT}/goalc/data_compiler/dir_tpages.cpp
++  ${OG_ROOT}/goalc/data_compiler/game_text_common.cpp)
+ target_link_libraries(extractor-web decomp common lzokay fmt stb_image tiny_gltf sound)
+ set_target_properties(extractor-web PROPERTIES OUTPUT_NAME "extractor" SUFFIX ".js")
+ target_link_options(extractor-web PRIVATE
+@@ -144,11 +149,12 @@ target_link_options(extractor-web PRIVATE
+   -sALLOW_MEMORY_GROWTH
+   -sMAXIMUM_MEMORY=4GB
+   -sEXIT_RUNTIME
+-  -sEXPORTED_RUNTIME_METHODS=callMain
++  -sEXPORTED_RUNTIME_METHODS=callMain,FS
+   -sINVOKE_RUN=0
+   -sASSERTIONS=1
+   --profiling-funcs
+   "SHELL:--embed-file ${OG_ROOT}/decompiler/config/jak2@/data/decompiler/config/jak2"
+   "SHELL:--embed-file ${OG_ROOT}/game/assets/jak2@/data/game/assets/jak2"
+   "SHELL:--embed-file ${OG_ROOT}/custom_assets/jak2@/data/custom_assets/jak2"
++  "SHELL:--embed-file ${OG_ROOT}/goal_src/jak2/dgos@/data/goal_src/jak2/dgos"
+ )
+diff --git a/web/build_game_web.cpp b/web/build_game_web.cpp
+new file mode 100644
+index 00000000..a9808ae4
+--- /dev/null
++++ b/web/build_game_web.cpp
+@@ -0,0 +1,210 @@
++// Jakompiled web: builds the game's files in the browser, after the extractor has decompiled the
++// user's ISO. It does what goalc's (mi) does in the native build, minus compiling code:
++//
++//  - dir-tpages.go, the game text (*COMMON.TXT) and subtitles (*SUBTI2.TXT): OpenGOAL's own data
++//    compiler (goalc/data_compiler), from the decompiler's output and the project's assets
++//  - every DGO/CGO of goal_src/jak2/dgos/*.gd, like the "dgo" make tool: code objects come from
++//    /data/CODE.PAK (all the game's code, compiled to wasm ahead of time and served with the page),
++//    data objects from the decompiler's raw_obj (the user's ISO)
++//
++// Everything is written under /data/out (OPFS, see web/extract_web.cpp).
++
++#include <cstring>
++#include <regex>
++#include <string>
++#include <unordered_map>
++#include <vector>
++
++#include "common/log/log.h"
++#include "common/serialization/subtitles/subtitles.h"
++#include "common/serialization/text/text_ser.h"
++#include "common/util/BinaryWriter.h"
++#include "common/util/FileUtil.h"
++
++#include "goalc/data_compiler/dir_tpages.h"
++#include "goalc/data_compiler/game_text_common.h"
++
++namespace {
++
++const std::string kGame = "jak2";
++
++std::string remap(const std::string& path) {
++  // the $DECOMP of the make system
++  const std::string decomp = "$DECOMP/";
++  if (path.rfind(decomp, 0) == 0) {
++    return "decompiler_out/" + kGame + "/" + path.substr(decomp.size());
++  }
++  return path;
++}
++
++// CODE.PAK: same layout as a DGO (backend/make_dgo.py), one entry per code object
++std::unordered_map<std::string, std::vector<u8>> read_code_pack(const fs::path& path) {
++  std::unordered_map<std::string, std::vector<u8>> result;
++  auto data = file_util::read_binary_file(path);
++  size_t pos = 0;
++  auto u32_at = [&](size_t p) {
++    u32 v;
++    memcpy(&v, data.data() + p, 4);
++    return v;
++  };
++  const u32 count = u32_at(0);
++  pos = 64;
++  for (u32 i = 0; i < count; i++) {
++    const u32 size = u32_at(pos);
++    std::string name((const char*)data.data() + pos + 4);
++    pos += 64;
++    result[name] = std::vector<u8>(data.begin() + pos, data.begin() + pos + size);
++    pos += size;
++    pos = (pos + 15) & ~size_t(15);
++  }
++  return result;
++}
++
++// name of an object inside a DGO, as goalc/make/Tools.cpp (DgoTool) deduces it
++std::string name_in_dgo(const std::string& file) {
++  auto ends_with = [&](const std::string& suffix) {
++    return file.size() > suffix.size() &&
++           file.compare(file.size() - suffix.size(), suffix.size(), suffix) == 0;
++  };
++  if (ends_with(".o")) {
++    return file.substr(0, file.size() - 2);
++  }
++  if (ends_with("-ag.go")) {
++    return file.substr(0, file.size() - 6);
++  }
++  if (ends_with(".go")) {
++    return file.substr(0, file.size() - 3);
++  }
++  return file;
++}
++
++int build_dgos(const std::unordered_map<std::string, std::vector<u8>>& code) {
++  const auto proj = file_util::get_jak_project_dir();
++  const auto gd_dir = proj / "goal_src" / kGame / "dgos";
++  const auto raw_obj = proj / "decompiler_out" / kGame / "raw_obj";
++  const auto generated = proj / "out" / kGame / "obj";
++  const auto iso_out = proj / "out" / kGame / "iso";
++  fs::create_directories(iso_out);
++
++  int built = 0;
++  int missing = 0;
++  const std::regex quoted("\"([^\"]+)\"");
++  for (const auto& entry : fs::directory_iterator(gd_dir)) {
++    if (entry.path().extension() != ".gd") {
++      continue;
++    }
++    const auto text = file_util::read_text_file(entry.path());
++    std::vector<std::string> names;
++    for (auto it = std::sregex_iterator(text.begin(), text.end(), quoted);
++         it != std::sregex_iterator(); ++it) {
++      names.push_back((*it)[1].str());
++    }
++    if (names.empty()) {
++      continue;
++    }
++    const std::string dgo_name = names[0];
++
++    BinaryWriter writer;
++    writer.add<uint32_t>(0);  // object count, patched below
++    writer.add_cstr_len(dgo_name.c_str(), 60);
++    u32 count = 0;
++    for (size_t i = 1; i < names.size(); i++) {
++      const auto& file = names[i];
++      std::vector<u8> obj;
++      if (file.size() > 2 && file.compare(file.size() - 2, 2, ".o") == 0) {
++        auto it = code.find(name_in_dgo(file));
++        if (it == code.end()) {
++          // collide-planes.o has no source in Jak 2 (the original was empty): the native build
++          // skips it with the same warning
++          lg::warn("{}: no code object {} (not in CODE.PAK)", dgo_name, file);
++          if (file != "collide-planes.o") {
++            missing++;
++          }
++          continue;
++        }
++        obj = it->second;
++      } else if (fs::exists(generated / file)) {
++        obj = file_util::read_binary_file(generated / file);  // dir-tpages.go
++      } else if (fs::exists(raw_obj / file)) {
++        obj = file_util::read_binary_file(raw_obj / file);
++      } else {
++        lg::warn("{}: data object {} wasn't extracted", dgo_name, file);
++        missing++;
++        continue;
++      }
++      writer.add<uint32_t>(obj.size());
++      writer.add_str_len(name_in_dgo(file), 60);
++      writer.add_data(obj.data(), obj.size());
++      while (writer.get_size() & 0xf) {
++        writer.add<uint8_t>(0);
++      }
++      count++;
++    }
++    memcpy(writer.get_data(), &count, 4);
++    writer.write_to_file(iso_out / dgo_name);
++    built++;
++  }
++  lg::info("[build] {} DGO/CGO files, {} missing objects", built, missing);
++  return missing;
++}
++
++}  // namespace
++
++namespace jakompiled {
++
++// returns the number of steps that failed (0: everything built)
++int build_game_files() {
++  const auto proj = file_util::get_jak_project_dir();
++  int failed = 0;
++  auto step = [&](const char* what, auto&& fn) {
++    lg::info("[build] {}", what);
++    try {
++      fn();
++    } catch (std::exception& e) {
++      lg::error("[build] {} failed: {}", what, e.what());
++      failed++;
++    }
++  };
++
++  step("texture directory",
++       [&] { compile_dir_tpages(remap("$DECOMP/textures/tpage-dir.txt"), kGame); });
++
++  step("game text", [&] {
++    GameTextDB db;
++    std::vector<GameTextDefinitionFile> files;
++    open_text_project("text", "game/assets/jak2/game_text.gp", files);
++    for (auto& file : files) {
++      file.file_path = remap(file.file_path);
++    }
++    compile_game_text(files, db, kGame);
++  });
++
++  step("subtitles", [&] {
++    GameSubtitleDB db;
++    db.m_subtitle_version = GameSubtitleDB::SubtitleFormat::V2;
++    std::vector<GameSubtitleDefinitionFile> files;
++    open_subtitle_project("subtitle-v2", "game/assets/jak2/game_subtitle.gp", files);
++    for (auto& file : files) {
++      file.lines_path = remap(file.lines_path);
++      file.meta_path = remap(file.meta_path);
++      if (file.lines_base_path) {
++        file.lines_base_path = remap(file.lines_base_path.value());
++      }
++      if (file.meta_base_path) {
++        file.meta_base_path = remap(file.meta_base_path.value());
++      }
++    }
++    compile_game_subtitles(files, db, kGame);
++  });
++
++  step("DGO and CGO files", [&] {
++    const auto code = read_code_pack(proj / "CODE.PAK");
++    lg::info("[build] CODE.PAK: {} code objects", code.size());
++    if (build_dgos(code) != 0) {
++      failed++;
++    }
++  });
++  return failed;
++}
++
++}  // namespace jakompiled
+-- 
+2.43.0
+

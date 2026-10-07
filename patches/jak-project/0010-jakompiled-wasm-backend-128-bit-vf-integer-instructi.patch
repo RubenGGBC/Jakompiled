@@ -1,7 +1,7 @@
 From be20433691bcda3262484b174e937f43e0853f01 Mon Sep 17 00:00:00 2001
 From: Claude <noreply@anthropic.com>
 Date: Wed, 7 Oct 2026 17:16:39 +0000
-Subject: [PATCH 10/13] [jakompiled] wasm backend: 128-bit vf/integer
+Subject: [PATCH 10/15] [jakompiled] wasm backend: 128-bit vf/integer
  instructions, &var, 128-bit args and returns
 
 - vf math (add/sub/mul/div/min/max/xor/sqrt), blend, splat, swizzle, itof/ftoi as wasm SIMD,

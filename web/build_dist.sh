@@ -13,4 +13,5 @@ cp "$JAK_WEB/build-web/game/gk.js" "$JAK_WEB/build-web/game/gk.wasm" "$dist/"
 cp "$JAK_WEB/build-web/extractor.js" "$JAK_WEB/build-web/extractor.wasm" "$dist/"
 cp "$JAK_PROJECT/out/jak2/iso/KERNEL.CGO" "$dist/data/"
 if [ -f "$JAK_PROJECT/out/jak2/iso/GAME.CGO" ]; then cp "$JAK_PROJECT/out/jak2/iso/GAME.CGO" "$dist/data/"; fi
+cp "$JAK_PROJECT/out/jak2/iso/CODE.PAK" "$dist/data/"
 ls -la "$dist" "$dist/data"

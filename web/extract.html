@@ -60,7 +60,9 @@
       worker.postMessage({ iso: file, steps });
     }
 
-    $("iso").onchange = () => { if ($("iso").files[0]) start($("iso").files[0], ["iso", "extract"]); };
+    // ?steps=build: solo montar los DGO con lo ya extraído (para pruebas)
+    const steps = (new URLSearchParams(location.search).get("steps") ?? "iso,extract,build").split(",");
+    $("iso").onchange = () => { if ($("iso").files[0]) start($("iso").files[0], steps); };
   </script>
 </body>
 </html>

@@ -1,7 +1,7 @@
 From d8fd3856ee7c110fc501a2946e8ad27cabd53769 Mon Sep 17 00:00:00 2001
 From: Claude <noreply@anthropic.com>
 Date: Wed, 7 Oct 2026 20:22:04 +0000
-Subject: [PATCH 13/13] [jakompiled] web: OpenGOAL's OpenGL renderer on WebGL 2
+Subject: [PATCH 13/15] [jakompiled] web: OpenGOAL's OpenGL renderer on WebGL 2
 
 - WebGL 2 context (GLES 3.0) through SDL3 on an OffscreenCanvas in main()'s pthread
 - glad loads every GL 4.3 entry point the browser has; web/gl_web.cpp fills in the 13 the

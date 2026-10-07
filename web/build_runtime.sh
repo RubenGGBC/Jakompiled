@@ -8,7 +8,9 @@
 #   4. Compila el kernel GOAL a wasm y monta KERNEL.CGO (backend/build_kernel.sh, sin ISO)
 #   5. Compila el motor a wasm y monta GAME.CGO solo con código (backend/build_game.sh, sin ISO;
 #      con un directorio de texturas vacío para poder probar el arranque con ?boot=game)
-#   6. Lo copia todo a web/dist
+#   6. Compila todo el código del juego (kernel, motor y niveles) a CODE.PAK: con él, la página de
+#      extracción monta los DGO/CGO del juego a partir de la ISO del usuario
+#   7. Lo copia todo a web/dist
 #
 # Uso: ./build_runtime.sh [directorio-de-trabajo]   (por defecto: web/work)
 # Requisitos: git, cmake, ninja, clang, nasm, emsdk (emcc en el PATH)
@@ -57,6 +59,9 @@ ninja -C "$src/build/Release/bin" goalc goalc-wasm
 echo "== KERNEL.CGO (kernel GOAL compilado a wasm)"
 mkdir -p "$src/out/jak2/iso"
 JAK_PROJECT="$src" "$repo/backend/build_kernel.sh" "$src/out/jak2/iso/KERNEL.CGO"
+
+echo "== CODE.PAK (todo el código del juego en wasm: kernel, motor y niveles)"
+JAK_PROJECT="$src" "$repo/backend/build_code.sh" "$src/out/jak2/iso/CODE.PAK"
 
 echo "== GAME.CGO (motor compilado a wasm, sin datos de la ISO)"
 EMPTY_TPAGE_DIR=1 JAK_PROJECT="$src" "$repo/backend/build_game.sh" "$src/out/jak2/iso/GAME.CGO"

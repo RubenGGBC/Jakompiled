@@ -1,0 +1,189 @@
+From 8c15ffb2fb68cc50483a6913a7a133c394c591cd Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Wed, 7 Oct 2026 21:08:43 +0000
+Subject: [PATCH 15/15] [jakompiled] web runtime: WasmFS + OPFS, play from the
+ extracted ISO
+
+gk uses WasmFS. Before the runtime starts, out/<game>/iso is filled with links to the files built
+from the user's ISO in OPFS (DGO/CGO, text, and the ISO's STR/SBK/MUS/VAG/SCREEN1 files) and
+out/<game>/fr3 links to the extracted levels; without an extracted ISO, the CGO files served with
+the page are used. The user directory (settings, save games) lives in OPFS.
+---
+ game/main.cpp          |  11 +++++
+ web/CMakeLists.txt     |   7 ++-
+ web/runtime_fs_web.cpp | 109 +++++++++++++++++++++++++++++++++++++++++
+ 3 files changed, 125 insertions(+), 2 deletions(-)
+ create mode 100644 web/runtime_fs_web.cpp
+
+diff --git a/game/main.cpp b/game/main.cpp
+index 1edeea27..0fe95983 100644
+--- a/game/main.cpp
++++ b/game/main.cpp
+@@ -86,6 +86,12 @@ std::string game_arg_documentation() {
+ /*!
+  * Entry point for the game.
+  */
++#ifdef __EMSCRIPTEN__
++namespace jakompiled {
++void runtime_setup_fs(const char* game);  // web/runtime_fs_web.cpp
++}
++#endif
++
+ int main(int argc, char** argv) {
+   ArgumentGuard u8_guard(argc, argv);
+ 
+@@ -207,6 +213,11 @@ int main(int argc, char** argv) {
+   }
+ #endif
+ 
++#ifdef __EMSCRIPTEN__
++  // Jakompiled web: the game's files come from the extracted ISO (OPFS) or from the page
++  jakompiled::runtime_setup_fs(game_name.c_str());
++#endif
++
+   // set up file paths for resources. This is the full repository when developing, and the data
+   // directory (a subset of the full repo) in release versions
+   if (project_path_override.empty()) {
+diff --git a/web/CMakeLists.txt b/web/CMakeLists.txt
+index 3c7b3bad..3828160c 100644
+--- a/web/CMakeLists.txt
++++ b/web/CMakeLists.txt
+@@ -92,7 +92,8 @@ add_subdirectory(${OG_ROOT}/decompiler decompiler EXCLUDE_FROM_ALL)
+ 
+ # ---- gk for the browser
+ set_target_properties(gk PROPERTIES SUFFIX ".js")
+-target_sources(gk PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/gl_web.cpp)
++target_sources(gk PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/gl_web.cpp
++  ${CMAKE_CURRENT_SOURCE_DIR}/runtime_fs_web.cpp)
+ target_link_options(gk PRIVATE
+   # main() runs on a worker so the EE/IOP threads can block; the page thread stays free
+   -sPROXY_TO_PTHREAD
+@@ -119,7 +120,9 @@ target_link_options(gk PRIVATE
+   -sSTACK_OVERFLOW_CHECK=0
+   -sENVIRONMENT=web,worker
+   -sEXIT_RUNTIME
+-  -sFORCE_FILESYSTEM
++  # WasmFS: its OPFS backend gives the runtime the files extracted from the user's ISO
++  # (web/runtime_fs_web.cpp) and keeps settings and save games
++  -sWASMFS
+   -sEXPORTED_RUNTIME_METHODS=FS,addRunDependency,removeRunDependency
+   -sASSERTIONS=1
+   --profiling-funcs
+diff --git a/web/runtime_fs_web.cpp b/web/runtime_fs_web.cpp
+new file mode 100644
+index 00000000..b29e7cb5
+--- /dev/null
++++ b/web/runtime_fs_web.cpp
+@@ -0,0 +1,109 @@
++// Jakompiled web: filesystem of the runtime (gk, built with WasmFS).
++//
++// The game reads its files from <project>/out/jak2/iso (the "fake ISO": every file listed there,
++// symlinks included) and the PC renderer's levels from <project>/out/jak2/fr3. Before main() runs
++// the rest of the runtime, they are filled in from one of two sources:
++//
++//  - the user's extracted ISO, in OPFS (written by extract.html: web/extract-worker.js and the
++//    extractor): DGO/CGO and text files built in the browser, plus the sound, music and movie files
++//    of the ISO, which the native build copies to out/jak2/iso. Linked, not copied.
++//  - otherwise, the CGO files served with the page (code only), which boot.js puts in /data/served
++//
++// The user directory (/home/web_user: settings, save games) lives in OPFS so it persists.
++
++#include <cerrno>
++#include <cstdio>
++#include <cstring>
++#include <string>
++
++#include <dirent.h>
++#include <emscripten/wasmfs.h>
++#include <sys/stat.h>
++#include <unistd.h>
++
++namespace {
++
++bool exists(const std::string& path) {
++  struct stat st;
++  return stat(path.c_str(), &st) == 0;
++}
++
++void mkdir_p(const std::string& path) {
++  for (size_t i = 1; i <= path.size(); i++) {
++    if (i == path.size() || path[i] == '/') {
++      mkdir(path.substr(0, i).c_str(), 0777);
++    }
++  }
++}
++
++void link(const std::string& target, const std::string& link_path) {
++  if (symlink(target.c_str(), link_path.c_str()) != 0 && errno != EEXIST) {
++    printf("[jakompiled] can't link %s -> %s: %s\n", link_path.c_str(), target.c_str(),
++           strerror(errno));
++  }
++}
++
++// link every regular file of dir into dest (filter: optional name prefix)
++int link_files(const std::string& dir, const std::string& dest, const char* prefix = nullptr) {
++  DIR* d = opendir(dir.c_str());
++  if (!d) {
++    return 0;
++  }
++  int count = 0;
++  while (dirent* e = readdir(d)) {
++    const std::string name = e->d_name;
++    if (name == "." || name == ".." || (prefix && name.rfind(prefix, 0) != 0)) {
++      continue;
++    }
++    struct stat st;
++    if (stat((dir + "/" + name).c_str(), &st) != 0 || !S_ISREG(st.st_mode)) {
++      continue;
++    }
++    if (!exists(dest + "/" + name)) {
++      link(dir + "/" + name, dest + "/" + name);
++      count++;
++    }
++  }
++  closedir(d);
++  return count;
++}
++
++}  // namespace
++
++namespace jakompiled {
++
++void runtime_setup_fs(const char* game) {
++  backend_t opfs = wasmfs_create_opfs_backend();
++  if (wasmfs_create_directory("/opfs", 0777, opfs) != 0) {
++    printf("[jakompiled] can't mount OPFS, the game's files and saves won't persist\n");
++  }
++
++  chmod("/data", 0777);  // the embedded files' directory is read-only by default
++
++  // settings and save games
++  mkdir("/opfs/user", 0777);
++  mkdir("/home", 0777);
++  link("/opfs/user", "/home/web_user");
++
++  const std::string g = game;
++  const std::string iso = "/data/out/" + g + "/iso";
++  const std::string extracted = "/opfs/out/" + g + "/iso";
++  mkdir_p(iso);
++
++  if (exists(extracted + "/KERNEL.CGO") && exists(extracted + "/GAME.CGO")) {
++    int n = link_files(extracted, iso);
++    // the files the native build copies from the ISO (copy-iso-file in goal_src/jak2/game.gp)
++    const std::string iso_data = "/opfs/iso_data/" + g;
++    for (const char* sub : {"STR", "SBK", "MUS", "VAG"}) {
++      n += link_files(iso_data + "/" + sub, iso);
++    }
++    n += link_files(iso_data + "/DRIVERS", iso, "SCREEN1.");
++    link("/opfs/out/" + g + "/fr3", "/data/out/" + g + "/fr3");
++    printf("[jakompiled] game files: the extracted ISO in OPFS (%d files)\n", n);
++  } else {
++    const int n = link_files("/data/served", iso);
++    printf("[jakompiled] game files: served with the page (%d files, no extracted ISO yet)\n", n);
++  }
++}
++
++}  // namespace jakompiled
+-- 
+2.43.0
+

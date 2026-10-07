@@ -1,6 +1,8 @@
 # Extracción de la ISO en el navegador
 
-> **Estado: lista para probar con una ISO real.** Con una ISO de prueba (sin datos del juego), la página lee el sistema de ficheros ISO9660, copia los ficheros a OPFS byte a byte y arranca el extractor de OpenGOAL compilado a wasm. El extractor valida la versión y se detiene porque el ejecutable de la ISO de prueba no es el de Jak II. Falta comprobar la descompilación con la ISO real, que solo puede hacerse en la máquina del usuario.
+> **Estado: lista para probar con una ISO real.** Desde la ISO hasta el juego: la página extrae y descompila la ISO, monta los 168 DGO/CGO del juego (código wasm + datos de la ISO) y el runtime los usa desde OPFS.
+>
+> Antes: Con una ISO de prueba (sin datos del juego), la página lee el sistema de ficheros ISO9660, copia los ficheros a OPFS byte a byte y arranca el extractor de OpenGOAL compilado a wasm. El extractor valida la versión y se detiene porque el ejecutable de la ISO de prueba no es el de Jak II. Falta comprobar la descompilación con la ISO real, que solo puede hacerse en la máquina del usuario.
 
 En el plan esta tarea estaba en la fase 5. La adelanto porque es lo que separa el motor, que ya corre en el navegador (fase 3.6), de los datos del juego.
 
@@ -44,6 +46,40 @@ extract.html ── File de la ISO ──▶ extract-worker.js (Worker)
 | Las pthreads del módulo cargaban `extract-worker.js` en vez de `extractor.js` | `mainScriptUrlOrBlob` |
 | Al proponer una entrada nueva para la base de datos de versiones, el formato tenía 4 campos y 3 argumentos (error de OpenGOAL, también en nativo) | Corregido |
 
+## Montaje de los ficheros del juego
+
+Después de descompilar, el extractor (`--web-build`, [`web/build_game_web.cpp`](../patches/jak-project/0014-jakompiled-web-extractor-build-the-game-s-DGO-CGO-an.patch)) hace lo que `goalc` hace con `(mi)` en el build nativo, salvo compilar código:
+
+| Fichero | De dónde sale |
+|---|---|
+| `dir-tpages.go` | Compilador de datos de `goalc`, desde la salida del descompilador |
+| `*COMMON.TXT` (texto del juego) | Ídem, con `game_text.txt` del descompilador y los JSON del proyecto |
+| `*SUBTI2.TXT` (subtítulos) | Ídem, con los JSON del proyecto |
+| Los 168 DGO/CGO de `goal_src/jak2/dgos/*.gd` | Código: `CODE.PAK`, servido con la página. Datos: `raw_obj` del descompilador (tu ISO) |
+
+`CODE.PAK` ([`backend/build_code.sh`](../backend/build_code.sh)) contiene **todo el código del juego compilado a wasm**: kernel, motor y niveles, **839 objetos y 18.475 funciones, sin ninguna trampa**, 21 MB. Se compilan en el orden de `goal_src/jak2/game.gp` ([`backend/code_sources.py`](../backend/code_sources.py)).
+
+Los nombres dentro de cada DGO siguen las reglas de la herramienta `dgo` de `goalc`: sin `.o`, sin `.go` y, en los art groups, sin `-ag.go`.
+
+## El runtime lee de OPFS
+
+`gk` también usa WasmFS ([parche 0015](../patches/jak-project/0015-jakompiled-web-runtime-WasmFS-OPFS-play-from-the-ext.patch)). Al arrancar, si OPFS tiene una ISO extraída, `out/jak2/iso` se llena de enlaces a:
+- los DGO/CGO y textos montados en el navegador;
+- los ficheros de la ISO que el build nativo copia ahí (`STR`, `SBK`, `MUS`, `VAG`, `SCREEN1.*`): se enlazan, no se copian.
+
+Además, `out/jak2/fr3` apunta a los niveles extraídos. Sin ISO extraída, se usan los CGO servidos con la página. El directorio de usuario (ajustes y partidas guardadas) también está en OPFS, así que se conserva entre visitas.
+
+Prueba del flujo completo en una misma sesión del navegador ([`web/tests/test-flow.mjs`](../web/tests/test-flow.mjs)), con la ISO de prueba:
+
+```
+[warn] GAME.CGO: no code object collide-planes.o (not in CODE.PAK)     ← igual que en nativo
+[build] 168 DGO/CGO files, 1828 missing objects                         ← los datos que no tiene la ISO de prueba
+[jakompiled] game files: the extracted ISO in OPFS (191 files)
+[Load and Link DGO From C (fast)] game
+got 436 objects, name GAME.CGO
+link finish: texture-upload
+```
+
 ## Prueba sin ISO
 
 [`web/tests/make_test_iso.py`](../web/tests/make_test_iso.py) crea una ISO con la forma de la de Jak II (`SYSTEM.CNF`, `SCUS_972.65`, `DGO/`, `CGO/`) pero con contenido inventado. [`web/tests/test-extract.mjs`](../web/tests/test-extract.mjs) la elige en la página desde Chromium headless y lista OPFS al terminar:
@@ -69,9 +105,10 @@ Es el mismo resultado que daría el extractor nativo con esa ISO.
 2. Sirve la página: `node web/serve.mjs web/dist 8080` (pone las cabeceras COOP/COEP).
 3. Abre `http://localhost:8080/extract.html` en Chrome de escritorio y elige tu ISO de Jak II (NTSC-U, SCUS-97265).
 4. Al terminar, copia el registro de la página. Si algo falla, el registro completo también está en OPFS (`/log`).
+5. Abre `http://localhost:8080/?boot=game&display=1`: el juego arranca con los datos extraídos.
 
 ## Riesgos pendientes
 
 - **Memoria**: el descompilador carga todos los DGO a la vez. En wasm32 el límite es 4 GB. Si no cabe, se descompilará por grupos de DGO (la configuración permite limitar las entradas).
 - **Tiempo**: el extractor nativo tarda unos minutos. En wasm será algo más lento; la extracción solo se hace una vez.
-- **Siguiente paso**: montar los DGO del juego (código wasm del servidor + datos de OPFS) y que el runtime lea de OPFS.
+- **Ficheros de datos aún sin probar**: el montaje con datos reales, el texto del juego y el directorio de texturas solo se pueden comprobar con la ISO.

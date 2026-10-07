@@ -1,6 +1,6 @@
 # Jakompiled listo para probar
 
-Esta carpeta tiene el motor ya compilado: el runtime de OpenGOAL (`gk.wasm`), el extractor (`extractor.wasm`) y el código del juego compilado a wasm desde el código fuente (`data/*.CGO`). **No contiene nada de la ISO ni datos del juego.** Esos salen de tu propia ISO, en tu navegador.
+Esta carpeta tiene el motor ya compilado: el runtime de OpenGOAL (`gk.wasm`), el extractor (`extractor.wasm`) y todo el código del juego compilado a wasm desde el código fuente (`data/CODE.PAK`, `data/*.CGO`). **No contiene nada de la ISO ni datos del juego.** Esos salen de tu propia ISO, en tu navegador.
 
 ## Qué necesitas
 
@@ -34,6 +34,7 @@ Esta carpeta tiene el motor ya compilado: el runtime de OpenGOAL (`gk.wasm`), el
 2. Espera. Primero copia los ficheros de la ISO (barra de progreso) y luego descomprime los datos del juego. Puede tardar bastantes minutos. No cierres la pestaña.
 3. Al terminar, verás **"Extracción terminada"** o un error.
 4. **Copia todo el texto del registro** de la página (Ctrl+A / Cmd+A sobre él, o selecciónalo) y pégamelo. Si algo falla, con eso puedo arreglarlo.
+5. Si la extracción terminó, abre en Chrome **`http://localhost:8080/?boot=game&display=1`**. El juego arranca con los datos extraídos de tu ISO (solo hace falta extraer una vez). Copia también ese registro y, si se ve algo en el recuadro negro, haz una captura.
 
 Para parar el servidor, cierra la ventana negra (Terminal o símbolo del sistema).
 
