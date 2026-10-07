@@ -2,6 +2,8 @@
 
 OpenGOAL (Jak and Daxter 1–3) en el navegador con WebAssembly.
 
+**Para probar con tu ISO sin compilar nada:** [`listo-para-probar/`](listo-para-probar/LEEME.md) (macOS y Windows).
+
 - [Plan](docs/plan.md)
 - [Fase 0: mapa del pipeline e inventario](docs/fase0-inventario.md)
 - [Fase 1: medición de riesgo de rendimiento](docs/fase1-benchmark.md): peor caso ~2x, se puede seguir
