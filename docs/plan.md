@@ -100,8 +100,8 @@ ISO del usuario → extractor → decompilador → código .gc (GOAL)
 > **Conseguido (con Jak 2 en vez de Jak 1):** el kernel GOAL de Jak 2 ejecuta procesos con suspend/resume (3.4), y el motor completo (`GAME.CGO`) se carga y se ejecuta en el navegador hasta que necesita datos de la ISO (3.6).
 
 ### Fase 4 — Jak 1 arrancando (1–2 meses)
-- [ ] Renderer en WebGL2, o en WebGPU según el inventario de la fase 0
-- [ ] Portar shaders a GLSL ES
+- [ ] Renderer en WebGL2, o en WebGPU según el inventario de la fase 0 (en curso: arranca en el navegador, [fase4-graficos.md](fase4-graficos.md))
+- [x] Portar shaders a GLSL ES (traducción automática, 46/46 programas compilan en WebGL 2)
 - [ ] Empezar por el pipeline más simple que pinte algo e ir añadiendo renderers
 
 **Salida:** un nivel de Jak 1 en pantalla con Jak moviéndose.

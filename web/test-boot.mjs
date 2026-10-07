@@ -3,6 +3,7 @@
 //   Sin regex: comprueba que el runtime llega al primer salto a código GOAL (fase 2).
 //   Con regex: espera a que alguna línea la cumpla (p. ej. la salida de un programa GOAL).
 // PLAYWRIGHT permite usar una instalación global: PLAYWRIGHT=$(npm root -g)/playwright/index.js
+// SCREENSHOT=fichero.png guarda una captura de la página al terminar.
 const pw = await import(process.env.PLAYWRIGHT ?? "playwright");
 const { chromium } = pw.chromium ? pw : pw.default;
 
@@ -10,7 +11,8 @@ const url = process.argv[2] ?? "http://localhost:8080/";
 const timeoutMs = Number(process.argv[3] ?? 120) * 1000;
 const expect = process.argv[4] ? new RegExp(process.argv[4]) : null;
 
-const browser = await chromium.launch();
+// WebGL 2 por software (SwiftShader) en headless
+const browser = await chromium.launch({ args: ["--use-angle=swiftshader", "--enable-unsafe-swiftshader"] });
 const page = await browser.newPage();
 const lines = [];
 let done;
@@ -30,6 +32,7 @@ await page.goto(url);
 const isolated = await page.evaluate(() => crossOriginIsolated);
 console.log(`[test] crossOriginIsolated=${isolated}`);
 const outcome = await Promise.race([finished, new Promise((r) => setTimeout(() => r("timeout"), timeoutMs))]);
+if (process.env.SCREENSHOT) await page.screenshot({ path: process.env.SCREENSHOT, fullPage: true });
 await browser.close();
 
 if (expect) {

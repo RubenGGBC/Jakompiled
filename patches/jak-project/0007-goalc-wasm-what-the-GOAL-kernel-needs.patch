@@ -1,7 +1,7 @@
 From abb61ad3756dcd6a900d08669cc0aaff5edf230a Mon Sep 17 00:00:00 2001
 From: Jakompiled <itsrufer@gmail.com>
 Date: Wed, 7 Oct 2026 16:52:57 +0000
-Subject: [PATCH 07/12] goalc wasm: what the GOAL kernel needs
+Subject: [PATCH 07/13] goalc wasm: what the GOAL kernel needs
 
 - pp and the GOAL stack pointer are mutable i64 globals shared by every
   module (env.pp, env.sp); registers pinned to r13 (pp) use env.pp and

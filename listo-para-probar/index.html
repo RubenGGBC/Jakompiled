@@ -16,12 +16,14 @@
     #status { font-weight: 600; }
     #status.ok { color: var(--ok); }
     #status.err { color: var(--err); }
+    canvas { display: block; max-width: 100%; background: #000; margin: 0 0 12px; }
     pre { font: 12px/1.45 ui-monospace, monospace; white-space: pre-wrap; word-break: break-word; margin: 12px 0 0; }
   </style>
 </head>
 <body>
   <h1>Jakompiled · runtime de OpenGOAL en wasm</h1>
-  <p>Fase 2: el kernel C++ de Jak 2 arranca y carga <code>KERNEL.CGO</code>. Todavía no hay código GOAL en wasm.</p>
+  <p>Runtime de OpenGOAL y código GOAL compilados a WebAssembly. <code>?boot=game</code> carga el motor; <code>?display=1</code> activa WebGL 2.</p>
+  <canvas id="canvas" width="640" height="480" oncontextmenu="event.preventDefault()"></canvas>
   <div id="status">Cargando…</div>
   <pre id="log"></pre>
   <script src="boot.js"></script>

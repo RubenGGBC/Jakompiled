@@ -4,6 +4,7 @@
 //
 // ?boot=game: arranque normal del juego (-boot). El runtime carga además GAME.CGO (el motor,
 // también compilado a wasm desde el código fuente) y llama a play-boot.
+// ?display=1: con gráficos (WebGL 2 en el <canvas>); sin él, el runtime arranca con --no-display.
 
 const logEl = document.getElementById("log");
 const statusEl = document.getElementById("status");
@@ -23,12 +24,15 @@ if (!crossOriginIsolated) {
   setStatus("Falta aislamiento cross-origin (cabeceras COOP/COEP): SharedArrayBuffer no está disponible.", "err");
 }
 
-const bootGame = new URLSearchParams(location.search).get("boot") === "game";
+const params = new URLSearchParams(location.search);
+const bootGame = params.get("boot") === "game";
+const display = params.get("display") === "1";
 const gameArgs = ["-fakeiso", "-nosound", ...(bootGame ? ["-boot"] : [])];
 const cgoFiles = ["KERNEL.CGO", ...(bootGame ? ["GAME.CGO"] : [])];
 
 var Module = {
-  arguments: ["-g", "jak2", "-v", "--no-display", "--proj-path", "/data", "--", ...gameArgs],
+  arguments: ["-g", "jak2", "-v", ...(display ? [] : ["--no-display"]), "--proj-path", "/data", "--", ...gameArgs],
+  canvas: document.getElementById("canvas"),
   preRun: [
     () => {
       Module.FS.mkdirTree("/data/out/jak2/iso");
