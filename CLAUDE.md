@@ -17,29 +17,37 @@ Idioma del proyecto: castellano (docs, mensajes, scripts). Código y comentarios
 | Backend wasm de `goalc` | ✅ todo el código de Jak 2: 839 objetos, 18.475 funciones, 0 trampas; idéntico a x86 en 535 casos |
 | Kernel GOAL, procesos (JSPI) | ✅ |
 | Motor (`GAME.CGO`) en el navegador | ✅ hasta donde necesita datos de la ISO |
-| Extracción de la ISO en el navegador (`extract.html`) | ⚠️ probada solo con una ISO falsa |
-| Montaje de los 168 DGO/CGO desde la ISO (`--web-build`) | ⚠️ probado solo con la ISO falsa |
-| Runtime leyendo de OPFS | ✅ probado con la ISO falsa (`web/tests/test-flow.mjs`) |
-| Renderer en WebGL 2 | ⚠️ arranca y compila los 92 shaders; sin datos no hay nada que pintar |
+| Extracción de la ISO en el navegador (`extract.html`) | ✅ con la ISO real (NTSC v2.01, SCUS-97265): ~2,5 min, pico de 5,3 GB (extractor en wasm64) |
+| Montaje de los DGO/CGO desde la ISO (`--web-build`) | ✅ los 150 que monta el build nativo (`game.gp`), 0 objetos sin encontrar |
+| Runtime leyendo de OPFS | ✅ con la ISO real: carga `GAME.CGO`, los `.fr3` y llega a `play-boot!` |
+| Renderer en WebGL 2 | ⚠️ pinta la pantalla de carga del juego (datos de la ISO); el juego se para antes del primer nivel |
 | Input (teclado/mando), sonido | ❌ pendiente |
 
-## Siguiente paso: probar con la ISO real (NTSC-U, SCUS-97265)
+## Siguiente paso: `lookup-level-info` se sale de la memoria
 
-Lo más rápido, sin compilar nada (`listo-para-probar/` ya está compilado):
+Con la ISO real el motor llega a `play-boot!` y se cae el proceso de `play`:
+
+```
+RuntimeError: memory access out of bounds
+    at lookup-level-info → (method level-get-for-use level-group) → play
+```
+
+`lookup-level-info` (`goal_src/jak2/engine/level/level.gc`) recorre `*level-load-list*`, una lista estática de ~160 símbolos (`level-info.gc`). Sospechas: el final de la lista estática (`'()`) o el valor de algún símbolo enlazado mal por el backend wasm (`CODE.PAK`). Para depurarlo hace falta recompilar `CODE.PAK` (backend nativo, `backend/build_code.sh`).
+
+Probar (la ISO va en `iso/`, ignorada por git; en Windows no hay WSL, se compila con Docker `emscripten/emsdk:6.0.11`):
 
 ```sh
 cd listo-para-probar && node serve.mjs . 8080      # en otra terminal
-# extracción en Chromium headless (Playwright) con la ISO, sin que salga del disco:
-PLAYWRIGHT=$(npm root -g)/playwright/index.js node ../web/tests/test-flow.mjs \
-  http://localhost:8080 /RUTA/A/jak2.iso iso,extract,build "link finish: texture-finish|GFX Loop" 3600
+# PROFILE: perfil persistente (un contexto efímero no tiene cuota de OPFS para 4 GB)
+PROFILE=/tmp/perfil PLAYWRIGHT=$(npm root -g)/playwright/index.js node ../web/tests/test-flow.mjs   http://localhost:8080 ../iso/jak2.iso iso,extract,build "calling play-boot" 1800
 ```
 
-Requiere Node.js y Playwright (`npm i -g playwright && npx playwright install chromium`). O a mano: abrir `http://localhost:8080/extract.html` en Chrome, elegir la ISO y después `http://localhost:8080/?boot=game&display=1`.
+Con `steps=build` (o `extract,build`) se repite solo una parte sobre lo que ya hay en OPFS. Para ver el juego: `http://localhost:8080/?boot=game&display=1`.
 
-Riesgos a vigilar con datos reales:
-- Memoria del descompilador (wasm32: 4 GB). Si no cabe, descompilar por grupos de DGO.
-- `dir-tpages`, texto del juego y montaje de DGO (`web/build_game_web.cpp`) solo se han probado sin datos.
-- Presentación de frames del canvas (OffscreenCanvas + JSPI) y formatos de textura en WebGL 2 (`web/gl_web.cpp`).
+Lo aprendido con la ISO real:
+- El descompilador necesita ~5,3 GB: el extractor se compila en wasm64 (`-DJAKOMPILED_MEMORY64=ON`, `build-web64/`); `gk` sigue en wasm32.
+- Los tamaños de los `.fr3` y de la cabecera zstd van siempre en 8 bytes (antes dependían de `size_t`).
+- Pendiente aparte: input (teclado/mando: falta `sdl_controller_db.txt`) y sonido.
 
 ## Estructura
 

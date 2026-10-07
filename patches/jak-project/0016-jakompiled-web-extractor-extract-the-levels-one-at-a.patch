@@ -1,0 +1,69 @@
+From ce8086695498d2b5d36efa4e2d2c6bc5a06846b1 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Wed, 7 Oct 2026 23:48:57 +0200
+Subject: [PATCH 16/20] [jakompiled] web extractor: extract the levels one at a
+ time
+
+extract_all_levels starts one thread per level (~100 for Jak 2). Natively that
+fits in RAM, but in the browser all threads share one heap that the object file
+and texture databases already mostly fill (~4.7 GB with Jak 2). The level thread
+also gets an 8 MB stack, like the main thread: the decompiler expects native-sized
+stacks, not Emscripten's default 64 KB. Also report the wasm heap size in the
+[Mem] logs (there's no getrusage).
+---
+ common/util/os.cpp                           | 6 ++++++
+ decompiler/level_extractor/extract_level.cpp | 6 ++++++
+ web/CMakeLists.txt                           | 3 +++
+ 3 files changed, 15 insertions(+)
+
+diff --git a/common/util/os.cpp b/common/util/os.cpp
+index bb6621cf..490eef75 100644
+--- a/common/util/os.cpp
++++ b/common/util/os.cpp
+@@ -29,6 +29,12 @@ size_t get_peak_rss() {
+     return 0;
+   }
+ }
++#elif defined(__EMSCRIPTEN__)
++#include <emscripten/heap.h>
++// no getrusage: the wasm heap only grows, so its size is the peak
++size_t get_peak_rss() {
++  return emscripten_get_heap_size();
++}
+ #else
+ #include <sys/resource.h>
+ size_t get_peak_rss() {
+diff --git a/decompiler/level_extractor/extract_level.cpp b/decompiler/level_extractor/extract_level.cpp
+index 8db3a8b8..5af14568 100644
+--- a/decompiler/level_extractor/extract_level.cpp
++++ b/decompiler/level_extractor/extract_level.cpp
+@@ -421,6 +421,12 @@ void extract_all_levels(const ObjectFileDB& db,
+   if (tex_db.replace_texture_dir) {
+     num_workers = 1;
+   }
++#ifdef __EMSCRIPTEN__
++  // all threads share one heap, and the object file and texture databases already take ~4.7 GB of
++  // it with Jak 2 (more than wasm32's 4 GB: the extractor is built for wasm64, and its heap must
++  // still fit in the user's RAM). One thread per level (~100 for Jak 2) would add one level each.
++  num_workers = 1;
++#endif
+ 
+   SimpleThreadGroup threads;
+   threads.run(
+diff --git a/web/CMakeLists.txt b/web/CMakeLists.txt
+index 3828160c..621e4313 100644
+--- a/web/CMakeLists.txt
++++ b/web/CMakeLists.txt
+@@ -148,6 +148,9 @@ target_link_options(extractor-web PRIVATE
+   -sINCOMING_MODULE_JS_API=[print,printErr,mainScriptUrlOrBlob,locateFile,onAbort]
+   -sPTHREAD_POOL_SIZE=4
+   -sSTACK_SIZE=8MB
++  # the levels are extracted on a std::thread, and freeing a long goos list recurses once per
++  # element: the default 64 KB pthread stack overflows (like the main thread, they get 8 MB)
++  -sDEFAULT_PTHREAD_STACK_SIZE=8MB
+   -sINITIAL_MEMORY=256MB
+   -sALLOW_MEMORY_GROWTH
+   -sMAXIMUM_MEMORY=4GB
+-- 
+2.49.0.windows.1
+

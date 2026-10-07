@@ -1,0 +1,110 @@
+From 8cfee044d46f16456ca00265dea0effc7afa6fbc Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Thu, 8 Oct 2026 00:28:16 +0200
+Subject: [PATCH 19/20] [jakompiled] fr3 and zstd files: 64-bit sizes on 32-bit
+ builds too
+
+The Serializer saved sizes as size_t and compress_zstd wrote a size_t header,
+so the files depended on the pointer width: the wasm32 runtime couldn't read
+the fr3 files of the wasm64 extractor (or of a native one). Sizes are now
+always 8 bytes, as on 64-bit hosts, where nothing changes.
+---
+ common/util/Serializer.h | 21 +++++++++++++++++----
+ common/util/compress.cpp | 21 ++++++++++++---------
+ 2 files changed, 29 insertions(+), 13 deletions(-)
+
+diff --git a/common/util/Serializer.h b/common/util/Serializer.h
+index 0452adc0..85e40e75 100644
+--- a/common/util/Serializer.h
++++ b/common/util/Serializer.h
+@@ -2,6 +2,7 @@
+ 
+ #include <cstring>
+ #include <string>
++#include <type_traits>
+ #include <vector>
+ 
+ #include "common/common_types.h"
+@@ -96,9 +97,16 @@ class Serializer {
+   template <typename T>
+   T load() {
+     ASSERT(!m_writing);
+-    T result;
+-    read_or_write(&result, sizeof(T));
+-    return result;
++    if constexpr (std::is_same_v<T, size_t> && sizeof(size_t) != sizeof(u64)) {
++      // sizes are always 8 bytes, so 32-bit builds (wasm32) read the same files as 64-bit ones
++      u64 result;
++      read_or_write(&result, sizeof(u64));
++      return (size_t)result;
++    } else {
++      T result;
++      read_or_write(&result, sizeof(T));
++      return result;
++    }
+   }
+ 
+   /*!
+@@ -107,7 +115,12 @@ class Serializer {
+   template <typename T>
+   void save(const T& thing) {
+     ASSERT(m_writing);
+-    read_or_write(const_cast<T*>(&thing), sizeof(T));
++    if constexpr (std::is_same_v<T, size_t> && sizeof(size_t) != sizeof(u64)) {
++      u64 value = thing;
++      read_or_write(&value, sizeof(u64));
++    } else {
++      read_or_write(const_cast<T*>(&thing), sizeof(T));
++    }
+   }
+ 
+   /*!
+diff --git a/common/util/compress.cpp b/common/util/compress.cpp
+index 59404cce..ae613854 100644
+--- a/common/util/compress.cpp
++++ b/common/util/compress.cpp
+@@ -15,14 +15,16 @@ namespace compression {
+  */
+ std::vector<u8> compress_zstd(const void* data, size_t size) {
+   auto max_compressed = ZSTD_compressBound(size);
+-  std::vector<u8> result(sizeof(size_t) + max_compressed);
+-  memcpy(result.data(), &size, sizeof(size_t));
++  // the header is a u64, not a size_t: 32-bit builds (wasm32) must read the same files
++  std::vector<u8> result(sizeof(u64) + max_compressed);
++  const u64 header = size;
++  memcpy(result.data(), &header, sizeof(u64));
+   auto compressed_size =
+-      ZSTD_compress(result.data() + sizeof(size_t), max_compressed, data, size, 1);
++      ZSTD_compress(result.data() + sizeof(u64), max_compressed, data, size, 1);
+   if (ZSTD_isError(compressed_size)) {
+     ASSERT_MSG(false, fmt::format("ZSTD error: {}", ZSTD_getErrorName(compressed_size)));
+   }
+-  result.resize(sizeof(size_t) + compressed_size);
++  result.resize(sizeof(u64) + compressed_size);
+   return result;
+ }
+ 
+@@ -31,14 +33,15 @@ std::vector<u8> compress_zstd(const void* data, size_t size) {
+  * decompressed data's size.
+  */
+ std::vector<u8> decompress_zstd(const void* data, size_t size) {
+-  ASSERT(size >= sizeof(size_t));
+-  size_t decompressed_size;
+-  memcpy(&decompressed_size, data, sizeof(size_t));
+-  size_t compressed_size = size - sizeof(size_t);
++  ASSERT(size >= sizeof(u64));
++  u64 header;
++  memcpy(&header, data, sizeof(u64));
++  size_t decompressed_size = header;
++  size_t compressed_size = size - sizeof(u64);
+ 
+   std::vector<u8> result(decompressed_size);
+   auto decomp_size = ZSTD_decompress(result.data(), decompressed_size,
+-                                     (const u8*)data + sizeof(size_t), compressed_size);
++                                     (const u8*)data + sizeof(u64), compressed_size);
+   if (ZSTD_isError(decomp_size)) {
+     ASSERT_MSG(false, fmt::format("ZSTD error: {}", ZSTD_getErrorName(decomp_size)));
+   }
+-- 
+2.49.0.windows.1
+

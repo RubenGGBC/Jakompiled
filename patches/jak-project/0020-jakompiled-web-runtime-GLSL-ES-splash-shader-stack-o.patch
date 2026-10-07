@@ -1,0 +1,57 @@
+From b4d7e4d44b646549480fec179680673eaa76fb0c Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Thu, 8 Oct 2026 00:28:16 +0200
+Subject: [PATCH 20/20] [jakompiled] web runtime: GLSL ES splash shader; stack
+ of crashed GOAL processes
+
+init_splash read its shaders from the GLSL 4.10 folder; use the GLSL ES one, like
+the other shaders. When a GOAL process thread crashes, print the wasm stack too:
+it names the GOAL functions.
+---
+ game/graphics/pipelines/opengl.cpp | 7 +++++++
+ web/goal_kernel_web.cpp            | 3 ++-
+ 2 files changed, 9 insertions(+), 1 deletion(-)
+
+diff --git a/game/graphics/pipelines/opengl.cpp b/game/graphics/pipelines/opengl.cpp
+index 2f48e39e..9dec7a20 100644
+--- a/game/graphics/pipelines/opengl.cpp
++++ b/game/graphics/pipelines/opengl.cpp
+@@ -22,6 +22,7 @@
+ #include "game/graphics/display.h"
+ #include "game/graphics/gfx.h"
+ #include "game/graphics/opengl_renderer/OpenGLRenderer.h"
++#include "game/graphics/opengl_renderer/Shader.h"
+ #include "game/graphics/opengl_renderer/debug_gui.h"
+ #include "game/graphics/screenshot.h"
+ #include "game/graphics/texture/TexturePool.h"
+@@ -378,7 +379,13 @@ void GLDisplay::init_splash() {
+   if (!Gfx::g_splash.ready.load())
+     return;
+ 
++#ifdef __EMSCRIPTEN__
++  // Jakompiled web: the GLSL ES 3.00 version, like every other shader (see Shader.cpp)
++  const std::string shader_folder =
++      std::string(Shader::shader_folder_es) + version_to_game_name(g_game_version);
++#else
+   auto shader_folder = "game/graphics/opengl_renderer/shaders";
++#endif
+   auto vert_src =
+       file_util::read_text_file(file_util::get_file_path({shader_folder, "splash.vert"}));
+   auto frag_src =
+diff --git a/web/goal_kernel_web.cpp b/web/goal_kernel_web.cpp
+index 2b390d39..f67ea49f 100644
+--- a/web/goal_kernel_web.cpp
++++ b/web/goal_kernel_web.cpp
+@@ -108,7 +108,8 @@ EM_ASYNC_JS(int, js_resume, (uint32_t thread, uint32_t pc, uint32_t c_stack_top)
+       J.fiberMain ??= WebAssembly.promising(wasmExports['jakompiled_fiber_main']);
+       stackRestore(c_stack_top);
+       J.fiberMain(thread, pc).catch((e) => {
+-        err(`[jakompiled] process thread 0x${thread.toString(16)} crashed: ${e}`);
++        // the stack names the GOAL functions (each GOAL wasm module has a name section)
++        err(`[jakompiled] process thread 0x${thread.toString(16)} crashed: ${e}\n${e?.stack ?? ""}`);
+         J.fibers.delete(thread);
+         J.kernelWake?.(1);
+       });
+-- 
+2.49.0.windows.1
+

@@ -1,0 +1,114 @@
+From ae421f6b3ab814ec507071d1b77cd88e8c25e8ae Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Thu, 8 Oct 2026 00:28:16 +0200
+Subject: [PATCH 18/20] [jakompiled] web extractor: build the game files from a
+ real ISO
+
+Found extracting a real NTSC v2 ISO (until now only tested with a fake one):
+- compile_dir_tpages doesn't create out/jak2/obj (natively goalc already has)
+- the game text compiler needs game/assets/fonts/jak2_jak3_korean_db.json for
+  the Korean text of v2 ISOs: embedded in the module
+- build only the DGOs that the native build makes: the (cgo-file ...) entries
+  of goal_src/jak2/game.gp, without the PS3 test levels of its USE_PS3_LEVELS
+  block (not on the PS2 ISOs). art.gd and andrew01.gd aren't built either.
+---
+ web/CMakeLists.txt     |  4 ++++
+ web/build_game_web.cpp | 43 +++++++++++++++++++++++++++++++++++++++---
+ 2 files changed, 44 insertions(+), 3 deletions(-)
+
+diff --git a/web/CMakeLists.txt b/web/CMakeLists.txt
+index 242d65ce..69f15012 100644
+--- a/web/CMakeLists.txt
++++ b/web/CMakeLists.txt
+@@ -177,4 +177,8 @@ target_link_options(extractor-web PRIVATE
+   "SHELL:--embed-file ${OG_ROOT}/game/assets/jak2@/data/game/assets/jak2"
+   "SHELL:--embed-file ${OG_ROOT}/custom_assets/jak2@/data/custom_assets/jak2"
+   "SHELL:--embed-file ${OG_ROOT}/goal_src/jak2/dgos@/data/goal_src/jak2/dgos"
++  # which DGOs the native build makes (web/build_game_web.cpp)
++  "SHELL:--embed-file ${OG_ROOT}/goal_src/jak2/game.gp@/data/goal_src/jak2/game.gp"
++  # the game text compiler needs it for the Korean text (NTSC v2 ISOs have it)
++  "SHELL:--embed-file ${OG_ROOT}/game/assets/fonts/jak2_jak3_korean_db.json@/data/game/assets/fonts/jak2_jak3_korean_db.json"
+ )
+diff --git a/web/build_game_web.cpp b/web/build_game_web.cpp
+index a9808ae4..5044cde4 100644
+--- a/web/build_game_web.cpp
++++ b/web/build_game_web.cpp
+@@ -13,6 +13,7 @@
+ #include <regex>
+ #include <string>
+ #include <unordered_map>
++#include <unordered_set>
+ #include <vector>
+ 
+ #include "common/log/log.h"
+@@ -78,6 +79,33 @@ std::string name_in_dgo(const std::string& file) {
+   return file;
+ }
+ 
++// the .gd files that goal_src/jak2/game.gp builds with (cgo-file "x.gd" ...), like the native
++// build: without the PS3 test levels of its (when USE_PS3_LEVELS ...) block, which aren't on the
++// PS2 ISOs. Some .gd files (art.gd, andrew01.gd) aren't built at all.
++std::unordered_set<std::string> gd_files_in_game_gp(const fs::path& game_gp) {
++  auto text = file_util::read_text_file(game_gp);
++  const std::string ps3_block = "(when USE_PS3_LEVELS";
++  if (auto start = text.find(ps3_block); start != std::string::npos) {
++    int depth = 0;
++    size_t end = start;
++    for (; end < text.size(); end++) {
++      if (text[end] == '(') {
++        depth++;
++      } else if (text[end] == ')' && --depth == 0) {
++        break;
++      }
++    }
++    text.erase(start, end + 1 - start);
++  }
++  std::unordered_set<std::string> result;
++  const std::regex cgo_file("\\(cgo-file \"([^\"]+)\"");
++  for (auto it = std::sregex_iterator(text.begin(), text.end(), cgo_file);
++       it != std::sregex_iterator(); ++it) {
++    result.insert((*it)[1].str());
++  }
++  return result;
++}
++
+ int build_dgos(const std::unordered_map<std::string, std::vector<u8>>& code) {
+   const auto proj = file_util::get_jak_project_dir();
+   const auto gd_dir = proj / "goal_src" / kGame / "dgos";
+@@ -85,12 +113,17 @@ int build_dgos(const std::unordered_map<std::string, std::vector<u8>>& code) {
+   const auto generated = proj / "out" / kGame / "obj";
+   const auto iso_out = proj / "out" / kGame / "iso";
+   fs::create_directories(iso_out);
++  const auto gd_files = gd_files_in_game_gp(proj / "goal_src" / kGame / "game.gp");
++  if (gd_files.empty()) {
++    throw std::runtime_error("no (cgo-file ...) entries in game.gp");
++  }
+ 
+   int built = 0;
+   int missing = 0;
+   const std::regex quoted("\"([^\"]+)\"");
+   for (const auto& entry : fs::directory_iterator(gd_dir)) {
+-    if (entry.path().extension() != ".gd") {
++    if (entry.path().extension() != ".gd" ||
++        !gd_files.count(entry.path().filename().string())) {
+       continue;
+     }
+     const auto text = file_util::read_text_file(entry.path());
+@@ -166,8 +199,12 @@ int build_game_files() {
+     }
+   };
+ 
+-  step("texture directory",
+-       [&] { compile_dir_tpages(remap("$DECOMP/textures/tpage-dir.txt"), kGame); });
++  step("texture directory", [&] {
++    // compile_dir_tpages writes out/jak2/obj/dir-tpages.go, but doesn't create the directory
++    // (natively, goalc already has)
++    fs::create_directories(proj / "out" / kGame / "obj");
++    compile_dir_tpages(remap("$DECOMP/textures/tpage-dir.txt"), kGame);
++  });
+ 
+   step("game text", [&] {
+     GameTextDB db;
+-- 
+2.49.0.windows.1
+

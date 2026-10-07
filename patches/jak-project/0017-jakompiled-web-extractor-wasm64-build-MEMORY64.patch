@@ -1,0 +1,69 @@
+From a6a160b1ce03605d22c2f875f7c78ecc1c5d3d7a Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Thu, 8 Oct 2026 00:28:16 +0200
+Subject: [PATCH 17/20] [jakompiled] web extractor: wasm64 build (MEMORY64)
+
+With a real Jak 2 ISO the decompiler needs ~5.3 GB: linking the data of all the
+DGOs takes ~3 GB and the textures ~0.6 GB more, before the levels. wasm32 stops
+at 4 GB. -DJAKOMPILED_MEMORY64=ON builds for wasm64 with up to 16 GB; it's for
+the extractor only, in its own build directory (gk stays wasm32). stb_image's
+CMakeLists replaces CMAKE_CXX_FLAGS, so it gets the web flags like tiny_gltf.
+---
+ web/CMakeLists.txt | 22 ++++++++++++++++++----
+ 1 file changed, 18 insertions(+), 4 deletions(-)
+
+diff --git a/web/CMakeLists.txt b/web/CMakeLists.txt
+index 621e4313..242d65ce 100644
+--- a/web/CMakeLists.txt
++++ b/web/CMakeLists.txt
+@@ -26,6 +26,18 @@ set(CMAKE_MODULE_PATH ${OG_ROOT}/third-party/cmake/modules/)
+ #   exceptions that unwind through GOAL code, and JSPI can't suspend through the JS frames that
+ #   Emscripten's JS-based exceptions add.
+ set(WEB_FLAGS "-pthread -msimd128 -msse4.2 -fwasm-exceptions -D__linux__=1 -D__linux=1")
++# -DJAKOMPILED_MEMORY64=ON: wasm64, for the extractor only (in its own build directory). The
++#   decompiler needs more than wasm32's 4 GB with a real ISO: linking the data of all of Jak 2's
++#   DGOs takes ~2.8 GB and the textures ~0.7 GB more, before the levels. gk stays wasm32 (the GOAL
++#   runtime assumes 32-bit host pointers), so don't build it with this option.
++option(JAKOMPILED_MEMORY64 "Build for wasm64 (extractor only)" OFF)
++if(JAKOMPILED_MEMORY64)
++  set(WEB_FLAGS "${WEB_FLAGS} -sMEMORY64")
++  set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -sMEMORY64")
++  set(EXTRACTOR_MAXIMUM_MEMORY 16GB)
++else()
++  set(EXTRACTOR_MAXIMUM_MEMORY 4GB)
++endif()
+ set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} ${WEB_FLAGS}")
+ set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} ${WEB_FLAGS} \
+   -Wno-c++11-narrowing -Wno-deprecated-this-capture -Wno-missing-field-initializers \
+@@ -65,9 +77,11 @@ build_third_party_lib(stb_image stb_image)
+ add_library(draco_disabled INTERFACE)
+ add_library(draco::draco ALIAS draco_disabled)
+ build_third_party_lib(tiny_gltf tiny_gltf)
+-# its CMakeLists replaces CMAKE_CXX_FLAGS with -O3, dropping the web flags (atomics for -pthread)
++# their CMakeLists replace CMAKE_CXX_FLAGS with -O3, dropping the web flags (atomics for -pthread,
++# -sMEMORY64)
+ separate_arguments(WEB_FLAGS_LIST UNIX_COMMAND "${WEB_FLAGS}")
+ target_compile_options(tiny_gltf PRIVATE ${WEB_FLAGS_LIST})
++target_compile_options(stb_image PRIVATE ${WEB_FLAGS_LIST})
+ 
+ set(STATICALLY_LINK ON)  # Emscripten has no shared libraries
+ include(SDLOptions)
+@@ -148,12 +162,12 @@ target_link_options(extractor-web PRIVATE
+   -sINCOMING_MODULE_JS_API=[print,printErr,mainScriptUrlOrBlob,locateFile,onAbort]
+   -sPTHREAD_POOL_SIZE=4
+   -sSTACK_SIZE=8MB
+-  # the levels are extracted on a std::thread, and freeing a long goos list recurses once per
+-  # element: the default 64 KB pthread stack overflows (like the main thread, they get 8 MB)
++  # the levels are extracted on a std::thread; the decompiler expects native-sized stacks
++  # (freeing a goos list recurses once per element), not the default 64 KB pthread stack
+   -sDEFAULT_PTHREAD_STACK_SIZE=8MB
+   -sINITIAL_MEMORY=256MB
+   -sALLOW_MEMORY_GROWTH
+-  -sMAXIMUM_MEMORY=4GB
++  -sMAXIMUM_MEMORY=${EXTRACTOR_MAXIMUM_MEMORY}
+   -sEXIT_RUNTIME
+   -sEXPORTED_RUNTIME_METHODS=callMain,FS
+   -sINVOKE_RUN=0
+-- 
+2.49.0.windows.1
+
