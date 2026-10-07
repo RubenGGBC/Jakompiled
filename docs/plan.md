@@ -82,10 +82,10 @@ ISO del usuario → extractor → decompilador → código .gc (GOAL)
 **Salida:** factor de ralentización medido. **Si sale peor de 3x, replantear antes de seguir.**
 
 ### Fase 2 — Runtime en Emscripten (2–4 semanas)
-- [ ] Compilar `gk` con `-pthread`
-- [ ] Renderer y audio en stub; carga de objetos GOAL desactivada
-- [ ] Sistema de ficheros: preload para pruebas y OPFS más adelante
-- [ ] Servidor local con cabeceras COOP/COEP
+- [x] Compilar `gk` con `-pthread` ([fase2-runtime.md](fase2-runtime.md))
+- [x] Renderer y audio en stub; carga de objetos GOAL desactivada
+- [x] Sistema de ficheros: preload para pruebas y OPFS más adelante (preload hecho; OPFS pendiente)
+- [x] Servidor local con cabeceras COOP/COEP
 
 **Salida:** el kernel C++ arranca en el navegador e intenta cargar el primer DGO.
 

@@ -1,0 +1,270 @@
+From fde327d2adedf000b32068e0e2091b462153bec4 Mon Sep 17 00:00:00 2001
+From: Jakompiled <itsrufer@gmail.com>
+Date: Wed, 7 Oct 2026 15:01:36 +0000
+Subject: [PATCH 2/3] Runtime: platform support for Emscripten (wasm32)
+
+- EE main memory at a fixed address of the wasm linear memory
+- software CRC32C (wasm has no crc32 instruction)
+- no ptrace debugger, no AVX requirement, emscripten thread names
+- print u64 listener results with %lld (long is 32 bits on wasm32)
+---
+ common/cross_os_debug/xdbg.cpp |  6 +++---
+ common/goal_constants.h        |  7 +++++++
+ common/util/crc32.h            | 26 ++++++++++++++++++++++++++
+ game/kernel/jak1/kboot.cpp     |  2 +-
+ game/kernel/jak2/kboot.cpp     |  2 +-
+ game/kernel/jak3/kboot.cpp     |  2 +-
+ game/kernel/jakx/kboot.cpp     |  2 +-
+ game/main.cpp                  |  3 +++
+ game/runtime.cpp               | 20 ++++++++++++++++++++
+ game/system/SystemThread.cpp   |  8 +++++++-
+ 10 files changed, 70 insertions(+), 8 deletions(-)
+
+diff --git a/common/cross_os_debug/xdbg.cpp b/common/cross_os_debug/xdbg.cpp
+index e1f7cf3b..4f0587b7 100644
+--- a/common/cross_os_debug/xdbg.cpp
++++ b/common/cross_os_debug/xdbg.cpp
+@@ -13,7 +13,7 @@
+ 
+ #include "fmt/format.h"
+ 
+-#ifdef __linux
++#if defined(__linux) && !defined(__EMSCRIPTEN__)  // Jakompiled web: no ptrace
+ #include <fcntl.h>
+ #include <unistd.h>
+ 
+@@ -33,7 +33,7 @@
+ #endif
+ 
+ namespace xdbg {
+-#ifdef __linux
++#if defined(__linux) && !defined(__EMSCRIPTEN__)  // Jakompiled web: no ptrace
+ 
+ /*!
+  * In Linux, a ThreadID is just the pid_t of the thread.
+@@ -725,7 +725,7 @@ bool set_regs_now(const ThreadID& tid, const Regs& out) {
+   // todo, set fprs.
+   return true;
+ }
+-#elif __APPLE__
++#elif defined(__APPLE__) || defined(__EMSCRIPTEN__)
+ // macOS debugger backend is not implemented
+ ThreadID::ThreadID(const std::string& str) {}
+ 
+diff --git a/common/goal_constants.h b/common/goal_constants.h
+index 7c025416..d7324726 100644
+--- a/common/goal_constants.h
++++ b/common/goal_constants.h
+@@ -108,6 +108,13 @@ constexpr u32 GOAL_MEMUSAGE_METHOD = 8;  // method ID of GOAL mem-usage
+ constexpr int EE_MAIN_MEM_LOW_PROTECT = 512 * 1024;
+ constexpr int EE_MAIN_MEM_SIZE = 128 * (1 << 20);  // 128 MB, same as PS2 TOOL
+ constexpr u64 EE_MAIN_MEM_MAP = 0x2123000000;      // intentionally > 32-bit to catch pointer bugs
++#ifdef __EMSCRIPTEN__
++// Jakompiled web: EE memory lives at a fixed address of the wasm linear memory, so a
++// GOAL pointer maps to a wasm address by a constant offset that compiled GOAL code can
++// fold into the immediate offset of its loads and stores. The linker must place
++// everything else above it (-sGLOBAL_BASE >= WEB_EE_MAIN_MEM_BASE + EE_MAIN_MEM_SIZE).
++constexpr u32 WEB_EE_MAIN_MEM_BASE = 0x01000000;
++#endif
+ 
+ // when true, attempt to map the EE memory in the low 2 GB of RAM
+ // this allows us to use EE pointers as real pointers.  However, this might not always work,
+diff --git a/common/util/crc32.h b/common/util/crc32.h
+index aae05f51..6938bf71 100644
+--- a/common/util/crc32.h
++++ b/common/util/crc32.h
+@@ -25,6 +25,32 @@ inline u32 crc32(const u8* data, size_t size) {
+   }
+   return ~result;
+ }
++#elif defined __EMSCRIPTEN__
++// wasm has no CRC32 instruction: table-driven CRC32C (Castagnoli), same results as SSE4.2
++namespace crc32_detail {
++constexpr u32 kPoly = 0x82F63B78;
++struct Table {
++  u32 v[256];
++  constexpr Table() : v() {
++    for (u32 i = 0; i < 256; i++) {
++      u32 c = i;
++      for (int k = 0; k < 8; k++) {
++        c = (c & 1) ? (c >> 1) ^ kPoly : (c >> 1);
++      }
++      v[i] = c;
++    }
++  }
++};
++inline constexpr Table kTable;
++}  // namespace crc32_detail
++// Computes CRC32C
++inline u32 crc32(const u8* data, size_t size) {
++  u32 result = 0xffffffff;
++  while (size--) {
++    result = crc32_detail::kTable.v[(result ^ *data++) & 0xff] ^ (result >> 8);
++  }
++  return ~result;
++}
+ #else
+ #include <immintrin.h>
+ // Computes CRC32C
+diff --git a/game/kernel/jak1/kboot.cpp b/game/kernel/jak1/kboot.cpp
+index 5c5d3281..daa59e03 100644
+--- a/game/kernel/jak1/kboot.cpp
++++ b/game/kernel/jak1/kboot.cpp
+@@ -130,7 +130,7 @@ void KernelCheckAndDispatch() {
+       if (ListenerFunction->value != s7.offset) {
+         auto result = call_goal_on_stack(Ptr<Function>(ListenerFunction->value), goal_stack,
+                                          s7.offset, g_ee_main_mem);
+-#ifdef __linux__
++#if defined(__linux__) && !defined(__EMSCRIPTEN__)  // long is 32 bits on wasm32
+         cprintf("%ld\n", result);
+ #else
+         cprintf("%lld\n", result);
+diff --git a/game/kernel/jak2/kboot.cpp b/game/kernel/jak2/kboot.cpp
+index ecab015f..27485296 100644
+--- a/game/kernel/jak2/kboot.cpp
++++ b/game/kernel/jak2/kboot.cpp
+@@ -110,7 +110,7 @@ void KernelDispatch(u32 dispatcher_func) {
+     if (ListenerFunction->value() != s7.offset) {
+       auto result = call_goal_on_stack(Ptr<Function>(ListenerFunction->value()), goal_stack,
+                                        s7.offset, g_ee_main_mem);
+-#ifdef __linux__
++#if defined(__linux__) && !defined(__EMSCRIPTEN__)  // long is 32 bits on wasm32
+       cprintf("%ld\n", result);
+ #else
+       cprintf("%lld\n", result);
+diff --git a/game/kernel/jak3/kboot.cpp b/game/kernel/jak3/kboot.cpp
+index dbc08958..3c4e66c5 100644
+--- a/game/kernel/jak3/kboot.cpp
++++ b/game/kernel/jak3/kboot.cpp
+@@ -114,7 +114,7 @@ void KernelDispatch(u32 dispatcher_func) {
+     if (ListenerFunction->value() != s7.offset) {
+       auto result = call_goal_on_stack(Ptr<Function>(ListenerFunction->value()), goal_stack,
+                                        s7.offset, g_ee_main_mem);
+-#ifdef __linux__
++#if defined(__linux__) && !defined(__EMSCRIPTEN__)  // long is 32 bits on wasm32
+       cprintf("%ld\n", result);
+ #else
+       cprintf("%lld\n", result);
+diff --git a/game/kernel/jakx/kboot.cpp b/game/kernel/jakx/kboot.cpp
+index 3e4c5019..b1e6730c 100644
+--- a/game/kernel/jakx/kboot.cpp
++++ b/game/kernel/jakx/kboot.cpp
+@@ -130,7 +130,7 @@ void KernelDispatch(u32 dispatcher_func) {
+     if (ListenerFunction->value() != s7.offset) {
+       auto result = call_goal_on_stack(Ptr<Function>(ListenerFunction->value()), goal_stack,
+                                        s7.offset, g_ee_main_mem);
+-#ifdef __linux__
++#if defined(__linux__) && !defined(__EMSCRIPTEN__)  // long is 32 bits on wasm32
+       cprintf("%ld\n", result);
+ #else
+       cprintf("%lld\n", result);
+diff --git a/game/main.cpp b/game/main.cpp
+index b3e83c7e..1edeea27 100644
+--- a/game/main.cpp
++++ b/game/main.cpp
+@@ -181,6 +181,8 @@ int main(int argc, char** argv) {
+   // Figure out if the CPU has AVX2 to enable higher performance AVX2 versions of functions.
+   setup_cpu_info();
+   // If the CPU doesn't have AVX, GOAL code won't work and we exit.
++  // Jakompiled web: GOAL's vector registers map to wasm SIMD128, not to AVX.
++#ifndef __EMSCRIPTEN__
+   if (!get_cpu_info().has_avx) {
+ // Check if we are on a modern enough version of macOS so that AVX can be
+ // emulated via rosetta
+@@ -203,6 +205,7 @@ int main(int argc, char** argv) {
+     return -1;
+ #endif
+   }
++#endif
+ 
+   // set up file paths for resources. This is the full repository when developing, and the data
+   // directory (a subset of the full repo) in release versions
+diff --git a/game/runtime.cpp b/game/runtime.cpp
+index 7b274802..7661f137 100644
+--- a/game/runtime.cpp
++++ b/game/runtime.cpp
+@@ -84,6 +84,10 @@
+ #include "game/overlord/jak3/overlord.h"
+ #include "game/system/Deci2Server.h"
+ #include "game/system/iop_thread.h"
++#ifdef __EMSCRIPTEN__
++#include <emscripten/heap.h>
++extern "C" char __global_base;  // start of the data segment, set by -sGLOBAL_BASE
++#endif
+ #include "sce/deci2.h"
+ #include "sce/iop.h"
+ #include "sce/libcdvd_ee.h"
+@@ -153,6 +157,17 @@ void deci2_runner(SystemThreadInterface& iface) {
+  */
+ void ee_runner(SystemThreadInterface& iface) {
+   prof().root_event();
++#ifdef __EMSCRIPTEN__
++  // Jakompiled web: reserved region of the linear memory (see WEB_EE_MAIN_MEM_BASE)
++  {
++    const auto ee_end = (uintptr_t)WEB_EE_MAIN_MEM_BASE + EE_MAIN_MEM_SIZE;
++    if ((uintptr_t)&__global_base < ee_end || emscripten_get_heap_size() < ee_end) {
++      lg::die("EE memory overlaps the wasm data segment (global base 0x{:x}, heap size 0x{:x})",
++              (uintptr_t)&__global_base, emscripten_get_heap_size());
++    }
++    g_ee_main_mem = (u8*)(uintptr_t)WEB_EE_MAIN_MEM_BASE;
++  }
++#else
+   // Allocate Main RAM. Must have execute enabled.
+   // Apple Silicon uses separate writable and executable mappings for EE memory.
+   if (EE_MEM_LOW_MAP) {
+@@ -175,6 +190,7 @@ void ee_runner(SystemThreadInterface& iface) {
+                   MAP_ANONYMOUS | MAP_PRIVATE, 0, 0);
+ #endif
+   }
++#endif
+ 
+   if (g_ee_main_mem == (u8*)(-1)) {
+     lg::debug("Failed to initialize main memory! {}", strerror(errno));
+@@ -224,7 +240,9 @@ void ee_runner(SystemThreadInterface& iface) {
+   // prevent access to the first 512 kB of memory.
+   // On the PS2 this is the kernel and can't be accessed either.
+   // this may not work well on systems with a page size > 1 MB.
++#ifndef __EMSCRIPTEN__  // wasm memory has no page protection
+   mprotect((void*)g_ee_main_mem, EE_MAIN_MEM_LOW_PROTECT, PROT_NONE);
++#endif
+   fileio_init_globals();
+   jak1::kboot_init_globals();
+   jak2::kboot_init_globals();
+@@ -514,7 +532,9 @@ RuntimeExitStatus exec_runtime(GameLaunchOptions game_options, int argc, const c
+     Gfx::Exit();
+   }
+   lg::info("GOAL Runtime Shutdown (code {})", fmt::underlying(MasterExit));
++#ifndef __EMSCRIPTEN__
+   munmap(g_ee_main_mem, EE_MAIN_MEM_SIZE);
++#endif
+   Discord_Shutdown();
+   return MasterExit;
+ }
+diff --git a/game/system/SystemThread.cpp b/game/system/SystemThread.cpp
+index 45aa034a..fb292e98 100644
+--- a/game/system/SystemThread.cpp
++++ b/game/system/SystemThread.cpp
+@@ -1,5 +1,9 @@
+ #include "SystemThread.h"
+ 
++#ifdef __EMSCRIPTEN__
++#include <emscripten/threading.h>
++#endif
++
+ #include "common/common_types.h"
+ #include "common/log/log.h"
+ #include "common/util/unicode_util.h"
+@@ -97,7 +101,9 @@ void* bootstrap_thread_func(void* x) {
+   SystemThread* thd = (SystemThread*)x;
+   SystemThreadInterface iface(thd);
+ 
+-#ifdef __linux
++#ifdef __EMSCRIPTEN__
++  emscripten_set_thread_name(pthread_self(), thd->name.c_str());
++#elif defined __linux
+   pthread_setname_np(pthread_self(), thd->name.c_str());
+ #elif __APPLE__
+   pthread_setname_np(thd->name.c_str());
+-- 
+2.43.0
+

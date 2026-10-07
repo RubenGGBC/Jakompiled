@@ -1,0 +1,497 @@
+From 455f6d93db2a81db0afa3f07c1467087d0dc6a6e Mon Sep 17 00:00:00 2001
+From: Jakompiled <itsrufer@gmail.com>
+Date: Wed, 7 Oct 2026 15:01:36 +0000
+Subject: [PATCH 3/3] web: Emscripten build of gk
+
+web/CMakeLists.txt builds only what gk needs. libco runs cothreads on
+pthreads, curl/discord-rpc/cubeb are stubbed, and the GOAL call
+trampolines stop with a message until goalc can emit wasm.
+---
+ common/CMakeLists.txt                |   2 +-
+ game/CMakeLists.txt                  |   7 +-
+ game/sound/CMakeLists.txt            |   8 +-
+ third-party/fmt/include/fmt/format.h |   1 +
+ web/CMakeLists.txt                   | 102 ++++++++++++++++++++
+ web/asm_funcs_web.cpp                |  57 +++++++++++
+ web/libco_pthread.cpp                | 137 +++++++++++++++++++++++++++
+ web/stubs/cubeb_stub.cpp             |  28 ++++++
+ web/stubs/curl_stub.cpp              |  23 +++++
+ web/stubs/discord_stub.cpp           |  11 +++
+ 10 files changed, 371 insertions(+), 5 deletions(-)
+ create mode 100644 web/CMakeLists.txt
+ create mode 100644 web/asm_funcs_web.cpp
+ create mode 100644 web/libco_pthread.cpp
+ create mode 100644 web/stubs/cubeb_stub.cpp
+ create mode 100644 web/stubs/curl_stub.cpp
+ create mode 100644 web/stubs/discord_stub.cpp
+
+diff --git a/common/CMakeLists.txt b/common/CMakeLists.txt
+index 90203686..678b0142 100644
+--- a/common/CMakeLists.txt
++++ b/common/CMakeLists.txt
+@@ -107,7 +107,7 @@ target_link_libraries(common fmt lzokay replxx libzstd_static tree-sitter sqlite
+ 
+ if(WIN32)
+     target_link_libraries(common wsock32 ws2_32 windowsapp)
+-elseif(APPLE)
++elseif(APPLE OR EMSCRIPTEN)
+     # don't need anything special
+ else()
+     target_link_libraries(common stdc++fs)
+diff --git a/game/CMakeLists.txt b/game/CMakeLists.txt
+index ec771661..c3906e12 100644
+--- a/game/CMakeLists.txt
++++ b/game/CMakeLists.txt
+@@ -9,7 +9,10 @@ else()
+     message(STATUS "Non-ARM64 architecture detected (${CMAKE_SYSTEM_PROCESSOR})")
+ endif()
+ 
+-if(ARM64_ARCH)
++if(EMSCRIPTEN)
++    # Jakompiled web: no native code to jump into, the GOAL call trampolines are stubs
++    set(OG_ASM_FUNCS_FILE ${CMAKE_CURRENT_LIST_DIR}/../web/asm_funcs_web.cpp)
++elseif(ARM64_ARCH)
+     # Add your ARM64-specific configuration or build options here
+     set(OG_ASM_FUNCS_FILE kernel/asm_funcs_arm64.s)
+     enable_language(ASM)
+@@ -392,7 +395,7 @@ add_library(runtime STATIC ${RUNTIME_SOURCE} "../third-party/glad/src/glad.c")
+ target_link_libraries(runtime common fmt SDL3::SDL3 imgui discord-rpc sound stb_image libco libcurl)
+ if(WIN32)
+     target_link_libraries(runtime mman)
+-else()
++elseif(NOT EMSCRIPTEN)
+     target_link_libraries(runtime pthread dl)
+ endif()
+ 
+diff --git a/game/sound/CMakeLists.txt b/game/sound/CMakeLists.txt
+index 8aecd005..293b67b3 100644
+--- a/game/sound/CMakeLists.txt
++++ b/game/sound/CMakeLists.txt
+@@ -23,12 +23,16 @@ add_library(sound STATIC ${SOUND_SOURCES})
+ set_target_properties(sound PROPERTIES POSITION_INDEPENDENT_CODE ON)
+ target_link_libraries(sound PRIVATE fmt cubeb common)
+ 
+-add_executable(sndplay 989snd/sndplay.cpp)
+-if(WIN32)
++if(EMSCRIPTEN)
++    # Jakompiled web: no standalone sound player
++elseif(WIN32)
++    add_executable(sndplay 989snd/sndplay.cpp)
+     target_link_libraries(sndplay PRIVATE sound cubeb)
+ elseif(APPLE)
++    add_executable(sndplay 989snd/sndplay.cpp)
+     target_link_libraries(sndplay PRIVATE sound cubeb)
+ else()
++    add_executable(sndplay 989snd/sndplay.cpp)
+     target_link_libraries(sndplay PRIVATE sound cubeb stdc++fs)
+ endif()
+ 
+diff --git a/third-party/fmt/include/fmt/format.h b/third-party/fmt/include/fmt/format.h
+index 287e7163..0574aa81 100644
+--- a/third-party/fmt/include/fmt/format.h
++++ b/third-party/fmt/include/fmt/format.h
+@@ -44,6 +44,7 @@
+ #  include <cmath>    // std::signbit
+ #  include <cstddef>  // std::byte
+ #  include <cstdint>  // uint32_t
++#  include <cstdlib>  // malloc, free
+ #  include <cstring>  // std::memcpy
+ #  include <limits>   // std::numeric_limits
+ #  include <new>      // std::bad_alloc
+diff --git a/web/CMakeLists.txt b/web/CMakeLists.txt
+new file mode 100644
+index 00000000..7461a335
+--- /dev/null
++++ b/web/CMakeLists.txt
+@@ -0,0 +1,102 @@
++# Jakompiled: build of the OpenGOAL runtime (gk) for the browser with Emscripten.
++#
++#   emcmake cmake -S web -B build-web -G Ninja -DCMAKE_BUILD_TYPE=Release
++#   ninja -C build-web gk
++#
++# Only what gk needs is built. Native-only dependencies (curl, discord-rpc,
++# cubeb, x86 asm, libco) are replaced by the stubs and shims in web/.
++cmake_minimum_required(VERSION 3.20)
++project(jakompiled-web)
++
++if(NOT EMSCRIPTEN)
++  message(FATAL_ERROR "web/CMakeLists.txt is only for Emscripten (use emcmake)")
++endif()
++
++set(CMAKE_CXX_STANDARD 20)
++set(CMAKE_CXX_STANDARD_REQUIRED ON)
++set(OG_ROOT ${CMAKE_CURRENT_SOURCE_DIR}/..)
++set(CMAKE_MODULE_PATH ${OG_ROOT}/third-party/cmake/modules/)
++
++# -pthread everywhere: the runtime runs the EE, IOP and helpers on separate threads.
++# -msimd128 + -msse4.2: the runtime's SSE intrinsics are lowered to wasm SIMD.
++# -D__linux__: OpenGOAL picks its platform code with #ifdef __linux__ / _WIN32 / __APPLE__.
++#   Emscripten's libc is musl, so the Linux paths are the right ones; the few that
++#   really are Linux-only are patched with __EMSCRIPTEN__.
++set(WEB_FLAGS "-pthread -msimd128 -msse4.2 -fexceptions -D__linux__=1 -D__linux=1")
++set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} ${WEB_FLAGS}")
++set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} ${WEB_FLAGS} \
++  -Wno-c++11-narrowing -Wno-deprecated-this-capture -Wno-missing-field-initializers \
++  -Wno-sign-compare -Wno-ignored-qualifiers -Wno-nontrivial-memaccess -D_CRT_SECURE_NO_WARNINGS")
++set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -pthread -fexceptions")
++set(THIRDPARTY_IGNORED_WARNINGS "-Wno-everything")
++
++function(build_third_party_lib dir_name target_name)
++  add_subdirectory(${OG_ROOT}/third-party/${dir_name} third-party/${dir_name} EXCLUDE_FROM_ALL)
++  get_target_property(INCLUDES ${target_name} INTERFACE_INCLUDE_DIRECTORIES)
++  if(INCLUDES)
++    set_target_properties(${target_name} PROPERTIES INTERFACE_SYSTEM_INCLUDE_DIRECTORIES "${INCLUDES}")
++  endif()
++  target_compile_options(${target_name} PRIVATE -w)
++endfunction()
++
++include_directories(${OG_ROOT})
++include_directories(SYSTEM ${OG_ROOT}/third-party/inja)
++include_directories(${OG_ROOT}/third-party/curl/include)
++add_definitions(-DHAVE_USLEEP=1 -DSQLITE_THREADSAFE=1 -DSQLITE_ENABLE_JSON1 -DSQLITE_ENABLE_RTREE)
++include_directories(${OG_ROOT}/third-party/tree-sitter/tree-sitter/lib/include)
++include_directories(${OG_ROOT}/third-party/fmt/include)
++include_directories(${OG_ROOT}/third-party/glad/include)
++include_directories(${OG_ROOT}/third-party/SDL/include)
++include_directories(${OG_ROOT}/third-party/discord-rpc/include)
++include_directories(${OG_ROOT}/third-party/cubeb/include)
++
++build_third_party_lib(replxx replxx)
++build_third_party_lib(sqlite3 sqlite3)
++build_third_party_lib(tree-sitter tree-sitter)
++build_third_party_lib(libtinyfiledialogs libtinyfiledialogs)
++build_third_party_lib(fmt fmt)
++build_third_party_lib(zstd libzstd_static)
++build_third_party_lib(lzokay lzokay)
++build_third_party_lib(stb_image stb_image)
++# tiny_gltf without draco mesh compression (draco's Emscripten mode builds JS decoders instead)
++add_library(draco_disabled INTERFACE)
++add_library(draco::draco ALIAS draco_disabled)
++build_third_party_lib(tiny_gltf tiny_gltf)
++
++set(STATICALLY_LINK ON)  # Emscripten has no shared libraries
++include(SDLOptions)
++build_third_party_lib(SDL SDL3-static)
++build_third_party_lib(imgui imgui)
++
++# libco has no wasm backend: coroutines run on pthreads, one at a time (web/libco_pthread.cpp)
++add_library(libco STATIC ${CMAKE_CURRENT_SOURCE_DIR}/libco_pthread.cpp)
++target_include_directories(libco PUBLIC ${OG_ROOT}/third-party)
++
++# native-only services, stubbed out (web/stubs/)
++add_library(libcurl STATIC ${CMAKE_CURRENT_SOURCE_DIR}/stubs/curl_stub.cpp)
++add_library(discord-rpc STATIC ${CMAKE_CURRENT_SOURCE_DIR}/stubs/discord_stub.cpp)
++add_library(cubeb STATIC ${CMAKE_CURRENT_SOURCE_DIR}/stubs/cubeb_stub.cpp)
++
++add_subdirectory(${OG_ROOT}/common common)
++add_subdirectory(${OG_ROOT}/game game)
++
++# ---- gk for the browser
++set_target_properties(gk PROPERTIES SUFFIX ".js")
++target_link_options(gk PRIVATE
++  # main() runs on a worker so the EE/IOP threads can block; the page thread stays free
++  -sPROXY_TO_PTHREAD
++  -sPTHREAD_POOL_SIZE=32
++  -sSTACK_SIZE=8MB
++  -sDEFAULT_PTHREAD_STACK_SIZE=2MB
++  # [0, 16 MB): unused, [16 MB, 144 MB): EE main memory, then the program's own data
++  -sGLOBAL_BASE=144MB
++  -sINITIAL_MEMORY=512MB
++  -sALLOW_MEMORY_GROWTH
++  -sMAXIMUM_MEMORY=4GB
++  -sENVIRONMENT=web,worker
++  -sEXIT_RUNTIME
++  -sFORCE_FILESYSTEM
++  -sEXPORTED_RUNTIME_METHODS=FS,addRunDependency,removeRunDependency
++  -sASSERTIONS=1
++  --profiling-funcs
++)
+diff --git a/web/asm_funcs_web.cpp b/web/asm_funcs_web.cpp
+new file mode 100644
+index 00000000..4eb9bfd7
+--- /dev/null
++++ b/web/asm_funcs_web.cpp
+@@ -0,0 +1,57 @@
++// Jakompiled web: replacement for game/kernel/asm_funcs_x86_64.asm.
++//
++// The native runtime enters GOAL code through small assembly trampolines that
++// set up GOAL's registers and jump to machine code emitted by goalc. Until goalc
++// has a wasm backend (phase 3) there is no GOAL code to jump into, so these
++// trampolines report the attempted call and stop the EE.
++
++#include <cstdint>
++#include <cstdio>
++#include <cstdlib>
++
++extern uint8_t* g_ee_main_mem;
++
++namespace {
++[[noreturn]] void no_goal_code(const char* trampoline, const void* target) {
++  const long goal_addr = target ? (long)((const uint8_t*)target - g_ee_main_mem) : -1;
++  fprintf(stderr,
++          "[jakompiled] %s: call into GOAL code at GOAL address 0x%lx (wasm %p). GOAL code "
++          "cannot run yet (goalc has no wasm backend); stopping.\n",
++          trampoline, goal_addr, target);
++  fflush(stderr);
++  abort();
++}
++}  // namespace
++
++extern "C" {
++
++// kscheme: C -> GOAL helpers registered as GOAL functions
++void _arg_call_systemv() {
++  no_goal_code("_arg_call_systemv", nullptr);
++}
++void _stack_call_systemv() {
++  no_goal_code("_stack_call_systemv", nullptr);
++}
++void _stack_call_win32() {
++  no_goal_code("_stack_call_win32", nullptr);
++}
++void _mips2c_call_systemv() {
++  no_goal_code("_mips2c_call_systemv", nullptr);
++}
++void _mips2c_call_windows() {
++  no_goal_code("_mips2c_call_windows", nullptr);
++}
++
++// kscheme: call_goal / call_goal_on_stack
++uint64_t _call_goal_asm_systemv(uint64_t, uint64_t, uint64_t, void* fptr, void*, void*) {
++  no_goal_code("call_goal", fptr);
++}
++uint64_t _call_goal_on_stack_asm_systemv(uint64_t, uint64_t, uint64_t, void* fptr, void*, void*) {
++  no_goal_code("call_goal_on_stack", fptr);
++}
++
++// mips2c: calls from translated C++ back into GOAL
++uint64_t _call_goal8_asm_systemv(void* func, uint64_t*, uint64_t, uint64_t, uint64_t, void*) {
++  no_goal_code("call_goal8", func);
++}
++}
+diff --git a/web/libco_pthread.cpp b/web/libco_pthread.cpp
+new file mode 100644
+index 00000000..e7b16481
+--- /dev/null
++++ b/web/libco_pthread.cpp
+@@ -0,0 +1,137 @@
++// Jakompiled web: libco implemented on top of pthreads.
++//
++// WebAssembly cannot switch stacks, so libco's assembly backends do not work.
++// Instead each cothread is a real pthread, and co_switch() hands a baton from
++// the caller to the target: the target is woken up and the caller blocks until
++// someone switches back to it. Exactly one cothread of a group runs at a time,
++// which keeps libco's cooperative semantics (the IOP kernel relies on them).
++
++#include <atomic>
++#include <condition_variable>
++#include <cstdio>
++#include <cstdlib>
++#include <mutex>
++
++#include <pthread.h>
++
++#include "libco/libco.h"
++
++namespace {
++
++struct Cothread {
++  void (*entry)(void) = nullptr;
++  unsigned int stack_size = 0;
++  pthread_t thread{};
++  bool started = false;   // pthread created (lazily, on the first switch to it)
++  std::atomic<bool> runnable = false;  // holds the baton
++  std::atomic<bool> deleted = false;   // co_delete() was called: exit instead of resuming
++  std::mutex mutex;
++  std::condition_variable cv;
++};
++
++thread_local Cothread* t_active = nullptr;
++
++// Spin briefly before sleeping: a switch is usually answered within microseconds,
++// and a futex sleep/wake round trip costs tens of microseconds.
++constexpr int kSpinIterations = 20000;
++
++void wait_for_baton(Cothread* self) {
++  bool got = false;
++  for (int i = 0; i < kSpinIterations && !got; i++) {
++    got = self->runnable.load(std::memory_order_acquire) || self->deleted.load();
++  }
++  if (!got) {
++    std::unique_lock<std::mutex> lock(self->mutex);
++    self->cv.wait(lock, [self] { return self->runnable.load() || self->deleted.load(); });
++  }
++  self->runnable.store(false, std::memory_order_relaxed);
++  if (self->deleted.load()) {
++    pthread_exit(nullptr);
++  }
++}
++
++void give_baton(Cothread* target) {
++  target->runnable.store(true, std::memory_order_release);
++  // taking the lock orders this wake-up after a sleeper's predicate check
++  std::lock_guard<std::mutex> lock(target->mutex);
++  target->cv.notify_one();
++}
++
++void* thread_main(void* arg) {
++  auto* self = static_cast<Cothread*>(arg);
++  t_active = self;
++  wait_for_baton(self);
++  self->entry();
++  // libco entry points must never return
++  fprintf(stderr, "[libco_pthread] cothread entry returned\n");
++  abort();
++}
++
++}  // namespace
++
++extern "C" {
++
++cothread_t co_active(void) {
++  if (!t_active) {
++    // the first call on a plain thread adopts it as a cothread
++    t_active = new Cothread();
++    t_active->started = true;
++  }
++  return t_active;
++}
++
++cothread_t co_derive(void*, unsigned int, void (*)(void)) {
++  // needs caller-provided stack memory, which has no pthread equivalent
++  return nullptr;
++}
++
++cothread_t co_create(unsigned int size, void (*entry)(void)) {
++  co_active();
++  auto* co = new Cothread();
++  co->entry = entry;
++  co->stack_size = size;
++  return co;
++}
++
++void co_delete(cothread_t handle) {
++  auto* co = static_cast<Cothread*>(handle);
++  if (!co) {
++    return;
++  }
++  if (co->started) {
++    co->deleted.store(true);
++    {
++      std::lock_guard<std::mutex> lock(co->mutex);
++      co->cv.notify_one();
++    }
++    pthread_join(co->thread, nullptr);
++  }
++  delete co;
++}
++
++void co_switch(cothread_t handle) {
++  auto* target = static_cast<Cothread*>(handle);
++  auto* self = static_cast<Cothread*>(co_active());
++  if (target == self) {
++    return;
++  }
++  if (!target->started) {
++    pthread_attr_t attr;
++    pthread_attr_init(&attr);
++    pthread_attr_setstacksize(&attr, target->stack_size);
++    if (pthread_create(&target->thread, &attr, thread_main, target) != 0) {
++      fprintf(stderr, "[libco_pthread] pthread_create failed\n");
++      abort();
++    }
++    pthread_attr_destroy(&attr);
++    target->started = true;
++  }
++  give_baton(target);
++  wait_for_baton(self);
++  t_active = self;
++}
++
++int co_serializable(void) {
++  return 0;
++}
++}
+diff --git a/web/stubs/cubeb_stub.cpp b/web/stubs/cubeb_stub.cpp
+new file mode 100644
+index 00000000..3160f53b
+--- /dev/null
++++ b/web/stubs/cubeb_stub.cpp
+@@ -0,0 +1,28 @@
++// Jakompiled web: cubeb has no Emscripten backend. Audio goes to Web Audio in
++// phase 5; until then cubeb_init fails and the sound player runs silent, the
++// same path the native runtime takes when no audio device is available.
++#include "third-party/cubeb/cubeb/include/cubeb/cubeb.h"
++
++extern "C" {
++int cubeb_init(cubeb** context, char const*, char const*) {
++  *context = nullptr;
++  return CUBEB_ERROR;
++}
++void cubeb_destroy(cubeb*) {}
++int cubeb_get_min_latency(cubeb*, cubeb_stream_params*, uint32_t*) {
++  return CUBEB_ERROR;
++}
++int cubeb_stream_init(cubeb*, cubeb_stream** stream, char const*, cubeb_devid,
++                      cubeb_stream_params*, cubeb_devid, cubeb_stream_params*, uint32_t,
++                      cubeb_data_callback, cubeb_state_callback, void*) {
++  *stream = nullptr;
++  return CUBEB_ERROR;
++}
++void cubeb_stream_destroy(cubeb_stream*) {}
++int cubeb_stream_start(cubeb_stream*) {
++  return CUBEB_ERROR;
++}
++int cubeb_stream_stop(cubeb_stream*) {
++  return CUBEB_ERROR;
++}
++}
+diff --git a/web/stubs/curl_stub.cpp b/web/stubs/curl_stub.cpp
+new file mode 100644
+index 00000000..98d3ba42
+--- /dev/null
++++ b/web/stubs/curl_stub.cpp
+@@ -0,0 +1,23 @@
++// Jakompiled web: libcurl is only used to fetch external speedrun times.
++// A browser build would use fetch(); for now every request fails cleanly.
++#include "third-party/curl/include/curl/curl.h"
++
++extern "C" {
++CURLcode curl_global_init(long) {
++  return CURLE_OK;
++}
++void curl_global_cleanup(void) {}
++CURL* curl_easy_init(void) {
++  return nullptr;
++}
++CURLcode curl_easy_setopt(CURL*, CURLoption, ...) {
++  return CURLE_FAILED_INIT;
++}
++CURLcode curl_easy_perform(CURL*) {
++  return CURLE_FAILED_INIT;
++}
++void curl_easy_cleanup(CURL*) {}
++const char* curl_easy_strerror(CURLcode) {
++  return "curl is not available in the web build";
++}
++}
+diff --git a/web/stubs/discord_stub.cpp b/web/stubs/discord_stub.cpp
+new file mode 100644
+index 00000000..b8ee76c5
+--- /dev/null
++++ b/web/stubs/discord_stub.cpp
+@@ -0,0 +1,11 @@
++// Jakompiled web: no Discord rich presence in the browser.
++#include "third-party/discord-rpc/include/discord_rpc.h"
++
++extern "C" {
++void Discord_Initialize(const char*, DiscordEventHandlers*, int, const char*) {}
++void Discord_Shutdown(void) {}
++void Discord_RunCallbacks(void) {}
++void Discord_UpdateConnection(void) {}
++void Discord_UpdatePresence(const DiscordRichPresence*) {}
++void Discord_ClearPresence(void) {}
++}
+-- 
+2.43.0
+
