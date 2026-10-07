@@ -10,6 +10,7 @@ const TRUE_OFF = 4; // jak2_symbols::FIX_SYM_TRUE
 const SYM_AREA = S7 + 0x1000;
 const FUNC_AREA = 0x200000;
 const HEAP = 0x300000;
+const STACK_TOP = 0x400000; // pila GOAL (crece hacia abajo)
 
 // todas las funciones GOAL tienen el tipo (i64 x 8) -> i64: se rellenan los argumentos con 0
 const pad8 = (args) => [...args, ...Array(8 - args.length).fill(0n)];
@@ -31,7 +32,11 @@ const symbol = (name) => {
 const exportNames = WebAssembly.Module.exports(module).map((e) => e.name);
 exportNames.forEach((name, i) => funcAddr.set(name, FUNC_AREA + i * 16));
 
-const imports = { env: { mem: memory, table, s7: BigInt(S7) }, sym: {}, func: {} };
+const i64Global = (v) => new WebAssembly.Global({ value: "i64", mutable: true }, v);
+const imports = {
+  env: { mem: memory, table, s7: BigInt(S7), sp: i64Global(BigInt(STACK_TOP)), pp: i64Global(0n) },
+  sym: {}, func: {},
+};
 for (const imp of WebAssembly.Module.imports(module)) {
   if (imp.module === "sym") imports.sym[imp.name] = BigInt(symbol(imp.name));
   if (imp.module === "func") imports.func[imp.name] = BigInt(funcAddr.get(imp.name));
@@ -63,53 +68,56 @@ function check(label, got, want) {
   console.log(`${ok ? "ok  " : "FAIL"} ${label} = ${got}${ok ? "" : `  (esperado ${want})`}`);
 }
 
-// ---- tests
-check("t-add 40 2", call("t-add", 40, 2), 42n);
-check("t-add -5 3", call("t-add", -5, 3), -2n);
-check("t-arith 7 2", call("t-arith", 7, 2), 7n * 2n - 3n);
-check("t-arith -9 2", call("t-arith", -9, 2), -18n - -4n);
-check("t-mod 17 5", call("t-mod", 17, 5), 2n);
-check("t-mod -17 5", call("t-mod", -17, 5), -2n);
-check("t-shift 100 3", call("t-shift", 100, 3), 800n + 25n + 50n);
-check("t-shift -100 3", call("t-shift", -100, 3), -800n + -25n + BigInt.asIntN(64, BigInt.asUintN(64, -100n) >> 1n));
-check("t-logic 12 10", call("t-logic", 12, 10), (12n & 10n) ^ (12n | 7n) ^ ~10n);
-for (const [x, want] of [[-3, -1n], [0, 0n], [5, 1n], [50, 2n]]) check(`t-cond ${x}`, call("t-cond", x), want);
-check("t-loop 10", call("t-loop", 10), 285n);
-check("t-loop 0", call("t-loop", 0), 0n);
-check("t-early 3", call("t-early", 3), 3n);
-check("t-early 9", call("t-early", 9), 100n);
-for (const [x, want] of [[0, 0n], [5, 1n], [10, 0n]]) check(`t-bool ${x}`, call("t-bool", x), want);
-check("t-sym-bool 5 == #t", call("t-sym-bool", 5), BigInt(S7 + TRUE_OFF));
-check("t-sym-bool 1 == #f", call("t-sym-bool", 1), BigInt(S7));
-check("t-fact 10 (recursiva, vía símbolo)", call("t-fact", 10), 3628800n);
-check("t-fact 20 (multiplicación de 32 bits, como en PS2)", call("t-fact", 20), -2102132736n);
-check("t-call3 1 2 3", call("t-call3", 1, 2, 3), 6n);
-check("t-global-set 7", call("t-global-set", 7), 21n);
-check("*t-global* en memoria", symValue("*t-global*"), 21);
+// ---- tests propios de basic.gc (los demás ficheros solo se comparan con el oráculo x86)
+const isBasic = exportNames.includes("t-add");
+if (isBasic) {
+  check("t-add 40 2", call("t-add", 40, 2), 42n);
+  check("t-add -5 3", call("t-add", -5, 3), -2n);
+  check("t-arith 7 2", call("t-arith", 7, 2), 7n * 2n - 3n);
+  check("t-arith -9 2", call("t-arith", -9, 2), -18n - -4n);
+  check("t-mod 17 5", call("t-mod", 17, 5), 2n);
+  check("t-mod -17 5", call("t-mod", -17, 5), -2n);
+  check("t-shift 100 3", call("t-shift", 100, 3), 800n + 25n + 50n);
+  check("t-shift -100 3", call("t-shift", -100, 3), -800n + -25n + BigInt.asIntN(64, BigInt.asUintN(64, -100n) >> 1n));
+  check("t-logic 12 10", call("t-logic", 12, 10), (12n & 10n) ^ (12n | 7n) ^ ~10n);
+  for (const [x, want] of [[-3, -1n], [0, 0n], [5, 1n], [50, 2n]]) check(`t-cond ${x}`, call("t-cond", x), want);
+  check("t-loop 10", call("t-loop", 10), 285n);
+  check("t-loop 0", call("t-loop", 0), 0n);
+  check("t-early 3", call("t-early", 3), 3n);
+  check("t-early 9", call("t-early", 9), 100n);
+  for (const [x, want] of [[0, 0n], [5, 1n], [10, 0n]]) check(`t-bool ${x}`, call("t-bool", x), want);
+  check("t-sym-bool 5 == #t", call("t-sym-bool", 5), BigInt(S7 + TRUE_OFF));
+  check("t-sym-bool 1 == #f", call("t-sym-bool", 1), BigInt(S7));
+  check("t-fact 10 (recursiva, vía símbolo)", call("t-fact", 10), 3628800n);
+  check("t-fact 20 (multiplicación de 32 bits, como en PS2)", call("t-fact", 20), -2102132736n);
+  check("t-call3 1 2 3", call("t-call3", 1, 2, 3), 6n);
+  check("t-global-set 7", call("t-global-set", 7), 21n);
+  check("*t-global* en memoria", symValue("*t-global*"), 21);
 
-// memoria: un array de int32 en el heap GOAL
-for (let i = 0; i < 5; i++) dv.setInt32(g(HEAP + 4 * i), (i + 1) * 10, true);
-check("t-mem suma", call("t-mem", HEAP, 5), 150n);
-check("t-mem escribe", [0, 1, 2, 3, 4].map((i) => dv.getInt32(g(HEAP + 4 * i), true)).join(","), "20,40,60,80,100");
-dv.setInt8(g(HEAP + 64), -7);
-dv.setUint8(g(HEAP + 65), 250);
-check("t-sext int8/uint8", call("t-sext", HEAP + 64, HEAP + 65), -7000n + 250n);
+  // memoria: un array de int32 en el heap GOAL
+  for (let i = 0; i < 5; i++) dv.setInt32(g(HEAP + 4 * i), (i + 1) * 10, true);
+  check("t-mem suma", call("t-mem", HEAP, 5), 150n);
+  check("t-mem escribe", [0, 1, 2, 3, 4].map((i) => dv.getInt32(g(HEAP + 4 * i), true)).join(","), "20,40,60,80,100");
+  dv.setInt8(g(HEAP + 64), -7);
+  dv.setUint8(g(HEAP + 65), 250);
+  check("t-sext int8/uint8", call("t-sext", HEAP + 64, HEAP + 65), -7000n + 250n);
 
-// flotantes
-{
-  const a = 3.5, b = 1.25;
-  const want = BigInt(Math.trunc(f32(1000 * f32(f32(f32(f32(f32(a * b) + f32(a / b)) + Math.min(a, b)) + Math.max(a, b)) + f32(a - b)))));
-  check("t-float 3.5 1.25", call("t-float", f32bits(a), f32bits(b)), want);
+  // flotantes
+  {
+    const a = 3.5, b = 1.25;
+    const want = BigInt(Math.trunc(f32(1000 * f32(f32(f32(f32(f32(a * b) + f32(a / b)) + Math.min(a, b)) + Math.max(a, b)) + f32(a - b)))));
+    check("t-float 3.5 1.25", call("t-float", f32bits(a), f32bits(b)), want);
+  }
+  check("t-f2i 7.9", call("t-f2i", f32bits(7.9)), 7n);
+  check("t-f2i -7.9", call("t-f2i", f32bits(-7.9)), -7n);
+  check("t-f2i NaN (x86: INT_MIN)", call("t-f2i", f32bits(NaN)), -2147483648n);
+  check("t-f2i 3e9 (x86: INT_MIN)", call("t-f2i", f32bits(3e9)), -2147483648n);
+  check("t-i2f 7", bitsf32(call("t-i2f", 7)), 3.5);
+  check("t-fcmp 1 2", call("t-fcmp", f32bits(1), f32bits(2)), 1n);
+  check("t-fcmp 2 2", call("t-fcmp", f32bits(2), f32bits(2)), 10n);
+  check("t-fcmp 3 2", call("t-fcmp", f32bits(3), f32bits(2)), 100n);
+  check("t-fcmp NaN 2 (comiss: < y = ciertos)", call("t-fcmp", f32bits(NaN), f32bits(2)), 11n);
 }
-check("t-f2i 7.9", call("t-f2i", f32bits(7.9)), 7n);
-check("t-f2i -7.9", call("t-f2i", f32bits(-7.9)), -7n);
-check("t-f2i NaN (x86: INT_MIN)", call("t-f2i", f32bits(NaN)), -2147483648n);
-check("t-f2i 3e9 (x86: INT_MIN)", call("t-f2i", f32bits(3e9)), -2147483648n);
-check("t-i2f 7", bitsf32(call("t-i2f", 7)), 3.5);
-check("t-fcmp 1 2", call("t-fcmp", f32bits(1), f32bits(2)), 1n);
-check("t-fcmp 2 2", call("t-fcmp", f32bits(2), f32bits(2)), 10n);
-check("t-fcmp 3 2", call("t-fcmp", f32bits(3), f32bits(2)), 100n);
-check("t-fcmp NaN 2 (comiss: < y = ciertos)", call("t-fcmp", f32bits(NaN), f32bits(2)), 11n);
 
 // ---- comparación con el x86 nativo de goalc
 if (process.argv[3]) {

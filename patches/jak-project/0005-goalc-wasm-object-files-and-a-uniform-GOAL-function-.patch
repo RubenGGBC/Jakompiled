@@ -1,7 +1,8 @@
 From 50d027bc7c23bd84da951f9fac7b2d920db9ffa7 Mon Sep 17 00:00:00 2001
 From: Jakompiled <itsrufer@gmail.com>
 Date: Wed, 7 Oct 2026 16:15:43 +0000
-Subject: [PATCH 5/9] goalc: wasm object files and a uniform GOAL function type
+Subject: [PATCH 05/10] goalc: wasm object files and a uniform GOAL function
+ type
 
 goalc-wasm can now write a GOAL v3 object for the wasm runtime: static
 data, an 8-byte function object per function (table index, and for the

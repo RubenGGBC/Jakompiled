@@ -1,0 +1,803 @@
+From be20433691bcda3262484b174e937f43e0853f01 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Wed, 7 Oct 2026 17:16:39 +0000
+Subject: [PATCH 10/10] [jakompiled] wasm backend: 128-bit vf/integer
+ instructions, &var, 128-bit args and returns
+
+- vf math (add/sub/mul/div/min/max/xor/sqrt), blend, splat, swizzle, itof/ftoi as wasm SIMD,
+  with the exact AVX results (vminps/vmaxps operand order, vcvttps2dq out of range)
+- 128-bit integer ops (pext*, pcpy*, pceq*, pcgt*, logic, psubw, packuswb, paddb, shifts,
+  byte shifts, pshuflw/hw)
+- variables whose address is taken live in the function's frame on the GOAL stack
+- 128-bit arguments / return values through a fixed SIMD argument area
+- vnop / vwaitq are no-ops; behavior self doesn't count toward the 8 argument limit
+---
+ common/goal_constants.h    |   5 +
+ goalc/compiler/IR.h        |  12 ++
+ goalc/compiler/IR_wasm.cpp | 366 ++++++++++++++++++++++++++++++++++++-
+ goalc/wasm/WasmCodegen.cpp | 132 ++++++++++---
+ goalc/wasm/WasmCodegen.h   |  13 +-
+ 5 files changed, 489 insertions(+), 39 deletions(-)
+
+diff --git a/common/goal_constants.h b/common/goal_constants.h
+index ceeda326..b4a0124d 100644
+--- a/common/goal_constants.h
++++ b/common/goal_constants.h
+@@ -114,6 +114,11 @@ constexpr u64 EE_MAIN_MEM_MAP = 0x2123000000;      // intentionally > 32-bit to
+ // everything else above it (-sGLOBAL_BASE >= WASM_EE_MAIN_MEM_BASE + EE_MAIN_MEM_SIZE).
+ // Shared by the runtime (Emscripten build) and goalc's wasm backend.
+ constexpr u32 WASM_EE_MAIN_MEM_BASE = 0x01000000;
++// 128-bit arguments and return values of GOAL functions in wasm. The uniform GOAL function type
++// only has i64 params, so a 128-bit argument i is passed in slot i of this area (wasm address,
++// below the EE memory) and a 128-bit return value in slot 8. Only the EE thread runs GOAL code.
++constexpr u32 WASM_SIMD_ARG_AREA = 0x00F00000;
++constexpr u32 WASM_SIMD_RET_SLOT = 8;
+ #ifdef __EMSCRIPTEN__
+ constexpr u32 WEB_EE_MAIN_MEM_BASE = WASM_EE_MAIN_MEM_BASE;
+ #endif
+diff --git a/goalc/compiler/IR.h b/goalc/compiler/IR.h
+index c7aef5e1..c0b1bb6d 100644
+--- a/goalc/compiler/IR.h
++++ b/goalc/compiler/IR.h
+@@ -174,6 +174,7 @@ class IR_FunctionCall : public IR {
+ 
+ class IR_RegValAddr : public IR {
+  public:
++  void do_codegen_wasm(wasm_backend::FunctionGen& gen) override;
+   IR_RegValAddr(const RegVal* dest, const RegVal* src);
+   std::string print() override;
+   RegAllocInstr to_rai() override;
+@@ -622,6 +623,7 @@ class IR_AsmBreak : public IR_Asm {
+ 
+ class IR_AsmFNop : public IR_Asm {
+  public:
++  void do_codegen_wasm(wasm_backend::FunctionGen& gen) override;
+   IR_AsmFNop();
+   std::string print() override;
+   RegAllocInstr to_rai() override;
+@@ -635,6 +637,7 @@ class IR_AsmFNop : public IR_Asm {
+ 
+ class IR_AsmFWait : public IR_Asm {
+  public:
++  void do_codegen_wasm(wasm_backend::FunctionGen& gen) override;
+   IR_AsmFWait();
+   std::string print() override;
+   RegAllocInstr to_rai() override;
+@@ -682,6 +685,7 @@ class IR_JumpReg : public IR_Asm {
+ 
+ class IR_RegSetAsm : public IR_Asm {
+  public:
++  void do_codegen_wasm(wasm_backend::FunctionGen& gen) override;
+   IR_RegSetAsm(bool use_color, const RegVal* dst, const RegVal* src);
+   std::string print() override;
+   RegAllocInstr to_rai() override;
+@@ -699,6 +703,7 @@ class IR_RegSetAsm : public IR_Asm {
+ 
+ class IR_VFMath3Asm : public IR_Asm {
+  public:
++  void do_codegen_wasm(wasm_backend::FunctionGen& gen) override;
+   enum class Kind { XOR, SUB, ADD, MUL, MAX, MIN, DIV };
+   IR_VFMath3Asm(bool use_color,
+                 const RegVal* dst,
+@@ -723,6 +728,7 @@ class IR_VFMath3Asm : public IR_Asm {
+ 
+ class IR_Int128Math3Asm : public IR_Asm {
+  public:
++  void do_codegen_wasm(wasm_backend::FunctionGen& gen) override;
+   // these are MIPS names, not x86 names.
+   enum class Kind {
+     PEXTUB,
+@@ -769,6 +775,7 @@ class IR_Int128Math3Asm : public IR_Asm {
+ 
+ class IR_Int128Math2Asm : public IR_Asm {
+  public:
++  void do_codegen_wasm(wasm_backend::FunctionGen& gen) override;
+   enum class Kind { PW_SLL, PW_SRL, PH_SLL, PH_SRL, PW_SRA, VPSRLDQ, VPSLLDQ, VPSHUFLW, VPSHUFHW };
+   IR_Int128Math2Asm(bool use_color,
+                     const RegVal* dst,
+@@ -793,6 +800,7 @@ class IR_Int128Math2Asm : public IR_Asm {
+ 
+ class IR_VFMath2Asm : public IR_Asm {
+  public:
++  void do_codegen_wasm(wasm_backend::FunctionGen& gen) override;
+   enum class Kind { ITOF, FTOI };
+   IR_VFMath2Asm(bool use_color, const RegVal* dst, const RegVal* src, Kind kind);
+   std::string print() override;
+@@ -812,6 +820,7 @@ class IR_VFMath2Asm : public IR_Asm {
+ 
+ class IR_BlendVF : public IR_Asm {
+  public:
++  void do_codegen_wasm(wasm_backend::FunctionGen& gen) override;
+   IR_BlendVF(bool use_color, const RegVal* dst, const RegVal* src1, const RegVal* src2, u8 mask);
+   std::string print() override;
+   RegAllocInstr to_rai() override;
+@@ -831,6 +840,7 @@ class IR_BlendVF : public IR_Asm {
+ 
+ class IR_SplatVF : public IR_Asm {
+  public:
++  void do_codegen_wasm(wasm_backend::FunctionGen& gen) override;
+   IR_SplatVF(bool use_color,
+              const RegVal* dst,
+              const RegVal* src,
+@@ -852,6 +862,7 @@ class IR_SplatVF : public IR_Asm {
+ 
+ class IR_SwizzleVF : public IR_Asm {
+  public:
++  void do_codegen_wasm(wasm_backend::FunctionGen& gen) override;
+   IR_SwizzleVF(bool use_color, const RegVal* dst, const RegVal* src, const u8 m_controlBytes);
+   std::string print() override;
+   RegAllocInstr to_rai() override;
+@@ -870,6 +881,7 @@ class IR_SwizzleVF : public IR_Asm {
+ 
+ class IR_SqrtVF : public IR_Asm {
+  public:
++  void do_codegen_wasm(wasm_backend::FunctionGen& gen) override;
+   IR_SqrtVF(bool use_color, const RegVal* dst, const RegVal* src);
+   std::string print() override;
+   RegAllocInstr to_rai() override;
+diff --git a/goalc/compiler/IR_wasm.cpp b/goalc/compiler/IR_wasm.cpp
+index f6ac5f71..f7534bda 100644
+--- a/goalc/compiler/IR_wasm.cpp
++++ b/goalc/compiler/IR_wasm.cpp
+@@ -9,6 +9,7 @@
+ 
+ #include "IR.h"
+ 
++#include "common/goal_constants.h"
+ #include "common/symbols.h"
+ 
+ #include "goalc/compiler/Env.h"
+@@ -118,8 +119,14 @@ void IR_LoadSymbolPointer::do_codegen_wasm(FunctionGen& gen) {
+   } else {
+     value = gen.mod()->symbol_addr(m_name);
+   }
+-  if (m_dest->ireg().reg_class != RegClass::GPR_64) {
+-    gen.unsupported("symbol pointer into a non-GPR");
++  const auto rc = m_dest->ireg().reg_class;
++  if (is_simd128(rc)) {
++    // movq xmm, r64
++    uint8_t zero[16] = {};
++    value = BinaryenSIMDReplace(gen.module(), BinaryenReplaceLaneVecI64x2(),
++                                BinaryenConst(gen.module(), BinaryenLiteralVec128(zero)), 0, value);
++  } else if (rc == RegClass::FLOAT) {
++    value = unary(gen, BinaryenReinterpretInt32(), unary(gen, BinaryenWrapInt64(), value));
+   }
+   gen.emit(gen.set(m_dest, value));
+ }
+@@ -149,17 +156,26 @@ void IR_FunctionCall::do_codegen_wasm(FunctionGen& gen) {
+   if ((int)m_args.size() > wasm_backend::kGoalArgCount) {
+     gen.unsupported("a call with more than 8 arguments");
+   }
+-  for (auto* arg : m_args) {
+-    if (arg->ireg().reg_class != RegClass::GPR_64) {
+-      gen.unsupported("a 128-bit function argument");
++  for (int i = 0; i < (int)m_args.size(); i++) {
++    auto* arg = m_args[i];
++    const auto rc = arg->ireg().reg_class;
++    if (rc == RegClass::GPR_64) {
++      args.push_back(gen.get(arg));
++    } else if (is_simd128(rc)) {
++      // 128-bit argument i: slot i of the SIMD argument area, 0 in the i64 param
++      gen.emit(BinaryenStore(gen.module(), 16, WASM_SIMD_ARG_AREA + 16 * i, 1, i32_const(gen, 0),
++                             gen.get(arg), BinaryenTypeVec128(), wasm_backend::kMemoryName));
++      args.push_back(i64_const(gen, 0));
++    } else {
++      gen.unsupported("a float function argument");
+     }
+-    args.push_back(gen.get(arg));
+   }
+   while ((int)args.size() < wasm_backend::kGoalArgCount) {
+     args.push_back(i64_const(gen, 0));
+   }
+-  if (m_ret->ireg().reg_class != RegClass::GPR_64) {
+-    gen.unsupported("a 128-bit return value");
++  const auto ret_class = m_ret->ireg().reg_class;
++  if (ret_class != RegClass::GPR_64 && !is_simd128(ret_class)) {
++    gen.unsupported("a float return value");
+   }
+   // the function object holds the table index of the code
+   auto table_index = BinaryenLoad(gen.module(), 4, false, gen.mem_offset(0), 4, BinaryenTypeInt32(),
+@@ -168,7 +184,15 @@ void IR_FunctionCall::do_codegen_wasm(FunctionGen& gen) {
+                                    (BinaryenIndex)args.size(),
+                                    BinaryenTypeCreate(params.data(), (BinaryenIndex)params.size()),
+                                    BinaryenTypeInt64());
+-  gen.emit(gen.set(m_ret, call));
++  if (is_simd128(ret_class)) {
++    gen.emit(BinaryenDrop(gen.module(), call));
++    gen.emit(gen.set(m_ret, BinaryenLoad(gen.module(), 16, false,
++                                         WASM_SIMD_ARG_AREA + 16 * WASM_SIMD_RET_SLOT, 1,
++                                         BinaryenTypeVec128(), i32_const(gen, 0),
++                                         wasm_backend::kMemoryName)));
++  } else {
++    gen.emit(gen.set(m_ret, call));
++  }
+ }
+ 
+ void IR_FunctionAddr::do_codegen_wasm(FunctionGen& gen) {
+@@ -454,3 +478,327 @@ void IR_AsmBreak::do_codegen_wasm(FunctionGen& gen) {
+   // (break): an exception on x86 (int3), a trap in wasm
+   gen.emit(BinaryenUnreachable(gen.module()));
+ }
++
++void IR_RegValAddr::do_codegen_wasm(FunctionGen& gen) {
++  // the variable lives in the function's frame on the GOAL stack
++  gen.emit(gen.set(m_dest, gen.reg_val_addr(m_src)));
++}
++
++// VU pipeline nops and waits (vnop, vwaitq): nothing to wait for in wasm
++void IR_AsmFNop::do_codegen_wasm(FunctionGen& gen) {
++  (void)gen;
++}
++
++void IR_AsmFWait::do_codegen_wasm(FunctionGen& gen) {
++  (void)gen;
++}
++
++void IR_RegSetAsm::do_codegen_wasm(FunctionGen& gen) {
++  gen.emit(gen.set(m_dst, convert_for_regset(gen, m_dst, m_src)));
++}
++
++// ---- 128-bit vector float (vf) and integer instructions, matching the AVX instructions of IGen
++
++namespace {
++
++BinaryenExpressionRef shuffle(FunctionGen& g,
++                              BinaryenExpressionRef a,
++                              BinaryenExpressionRef b,
++                              const uint8_t (&mask)[16]) {
++  return BinaryenSIMDShuffle(g.module(), a, b, mask);
++}
++
++// byte shuffle mask from 32-bit lane indices (0-3: a, 4-7: b)
++void lanes32(uint8_t (&mask)[16], const int (&lanes)[4]) {
++  for (int i = 0; i < 4; i++) {
++    for (int j = 0; j < 4; j++) {
++      mask[i * 4 + j] = (uint8_t)(lanes[i] * 4 + j);
++    }
++  }
++}
++
++// x86 punpck{l,h}{bw,wd,dq,qdq} a, b: interleave the low/high halves, a first
++BinaryenExpressionRef unpack(FunctionGen& g,
++                             BinaryenExpressionRef a,
++                             BinaryenExpressionRef b,
++                             int elt_bytes,
++                             bool high) {
++  uint8_t mask[16];
++  const int n = 16 / elt_bytes / 2;  // elements taken from each source
++  for (int i = 0; i < n; i++) {
++    const int src_elt = (high ? n : 0) + i;
++    for (int j = 0; j < elt_bytes; j++) {
++      mask[(2 * i) * elt_bytes + j] = (uint8_t)(src_elt * elt_bytes + j);
++      mask[(2 * i + 1) * elt_bytes + j] = (uint8_t)(16 + src_elt * elt_bytes + j);
++    }
++  }
++  return shuffle(g, a, b, mask);
++}
++
++BinaryenExpressionRef v128_const(FunctionGen& g, const uint8_t (&bytes)[16]) {
++  return BinaryenConst(g.module(), BinaryenLiteralVec128(bytes));
++}
++
++BinaryenExpressionRef splat_i32(FunctionGen& g, s32 v) {
++  return unary(g, BinaryenSplatVecI32x4(), i32_const(g, v));
++}
++
++BinaryenExpressionRef splat_f32(FunctionGen& g, float v) {
++  return unary(g, BinaryenSplatVecF32x4(), f32_const(g, v));
++}
++
++BinaryenExpressionRef zero_v128(FunctionGen& g) {
++  uint8_t zero[16] = {};
++  return v128_const(g, zero);
++}
++
++}  // namespace
++
++void IR_VFMath3Asm::do_codegen_wasm(FunctionGen& gen) {
++  auto a = [&]() { return gen.get(m_src1); };
++  auto b = [&]() { return gen.get(m_src2); };
++  BinaryenExpressionRef r = nullptr;
++  switch (m_kind) {
++    case Kind::XOR:
++      r = binary(gen, BinaryenXorVec128(), a(), b());
++      break;
++    case Kind::SUB:
++      r = binary(gen, BinaryenSubVecF32x4(), a(), b());
++      break;
++    case Kind::ADD:
++      r = binary(gen, BinaryenAddVecF32x4(), a(), b());
++      break;
++    case Kind::MUL:
++      r = binary(gen, BinaryenMulVecF32x4(), a(), b());
++      break;
++    case Kind::DIV:
++      r = binary(gen, BinaryenDivVecF32x4(), a(), b());
++      break;
++    // vmaxps a, b = a > b ? a : b (b if either is NaN); f32x4.pmax(x, y) = x < y ? y : x
++    case Kind::MAX:
++      r = binary(gen, BinaryenPMaxVecF32x4(), b(), a());
++      break;
++    // vminps a, b = a < b ? a : b; f32x4.pmin(x, y) = y < x ? y : x
++    case Kind::MIN:
++      r = binary(gen, BinaryenPMinVecF32x4(), b(), a());
++      break;
++    default:
++      gen.unsupported("this vf math operation");
++  }
++  gen.emit(gen.set(m_dst, r));
++}
++
++void IR_VFMath2Asm::do_codegen_wasm(FunctionGen& gen) {
++  auto x = [&]() { return gen.get(m_src); };
++  BinaryenExpressionRef r = nullptr;
++  switch (m_kind) {
++    case Kind::ITOF:
++      // vcvtdq2ps
++      r = unary(gen, BinaryenConvertSVecI32x4ToVecF32x4(), x());
++      break;
++    case Kind::FTOI: {
++      // vcvttps2dq: NaN and out of range lanes give 0x80000000
++      auto in_range =
++          binary(gen, BinaryenAndVec128(),
++                 binary(gen, BinaryenLtVecF32x4(), x(), splat_f32(gen, 2147483648.0f)),
++                 binary(gen, BinaryenGeVecF32x4(), x(), splat_f32(gen, -2147483648.0f)));
++      r = BinaryenSIMDTernary(gen.module(), BinaryenBitselectVec128(),
++                              unary(gen, BinaryenTruncSatSVecF32x4ToVecI32x4(), x()),
++                              splat_i32(gen, INT32_MIN), in_range);
++    } break;
++    default:
++      gen.unsupported("this vf conversion");
++  }
++  gen.emit(gen.set(m_dst, r));
++}
++
++void IR_BlendVF::do_codegen_wasm(FunctionGen& gen) {
++  // vblendps: lane i from src2 if bit i of the mask is set, else from src1
++  int lanes[4];
++  for (int i = 0; i < 4; i++) {
++    lanes[i] = (m_mask & (1 << i)) ? 4 + i : i;
++  }
++  uint8_t mask[16];
++  lanes32(mask, lanes);
++  gen.emit(gen.set(m_dst, shuffle(gen, gen.get(m_src1), gen.get(m_src2), mask)));
++}
++
++void IR_SplatVF::do_codegen_wasm(FunctionGen& gen) {
++  int lane = 0;
++  switch (m_element) {
++    case emitter::Register::VF_ELEMENT::X:
++      lane = 0;
++      break;
++    case emitter::Register::VF_ELEMENT::Y:
++      lane = 1;
++      break;
++    case emitter::Register::VF_ELEMENT::Z:
++      lane = 2;
++      break;
++    case emitter::Register::VF_ELEMENT::W:
++      lane = 3;
++      break;
++    default:
++      gen.unsupported("splat of this element");
++  }
++  int lanes[4] = {lane, lane, lane, lane};
++  uint8_t mask[16];
++  lanes32(mask, lanes);
++  gen.emit(gen.set(m_dst, shuffle(gen, gen.get(m_src), gen.get(m_src), mask)));
++}
++
++void IR_SwizzleVF::do_codegen_wasm(FunctionGen& gen) {
++  // vshufps src, src, imm: lane i = src[(imm >> 2i) & 3]
++  int lanes[4];
++  for (int i = 0; i < 4; i++) {
++    lanes[i] = (m_controlBytes >> (2 * i)) & 3;
++  }
++  uint8_t mask[16];
++  lanes32(mask, lanes);
++  gen.emit(gen.set(m_dst, shuffle(gen, gen.get(m_src), gen.get(m_src), mask)));
++}
++
++void IR_SqrtVF::do_codegen_wasm(FunctionGen& gen) {
++  gen.emit(gen.set(m_dst, unary(gen, BinaryenSqrtVecF32x4(), gen.get(m_src))));
++}
++
++void IR_Int128Math3Asm::do_codegen_wasm(FunctionGen& gen) {
++  // operands as IR_Int128Math3Asm::do_codegen_x86 passes them to the AVX instruction
++  auto s1 = [&]() { return gen.get(m_src1); };
++  auto s2 = [&]() { return gen.get(m_src2); };
++  BinaryenExpressionRef r = nullptr;
++  switch (m_kind) {
++    case Kind::PEXTUB:
++      r = unpack(gen, s2(), s1(), 1, true);
++      break;
++    case Kind::PEXTUH:
++      r = unpack(gen, s2(), s1(), 2, true);
++      break;
++    case Kind::PEXTUW:
++      r = unpack(gen, s2(), s1(), 4, true);
++      break;
++    case Kind::PEXTLB:
++      r = unpack(gen, s2(), s1(), 1, false);
++      break;
++    case Kind::PEXTLH:
++      r = unpack(gen, s2(), s1(), 2, false);
++      break;
++    case Kind::PEXTLW:
++      r = unpack(gen, s2(), s1(), 4, false);
++      break;
++    case Kind::PCPYLD:
++      r = unpack(gen, s2(), s1(), 8, false);  // vpunpcklqdq src2, src1
++      break;
++    case Kind::PCPYUD:
++      r = unpack(gen, s1(), s2(), 8, true);  // vpunpckhqdq src1, src2
++      break;
++    case Kind::PSUBW:
++      r = binary(gen, BinaryenSubVecI32x4(), s1(), s2());
++      break;
++    case Kind::PCEQB:
++      r = binary(gen, BinaryenEqVecI8x16(), s2(), s1());
++      break;
++    case Kind::PCEQH:
++      r = binary(gen, BinaryenEqVecI16x8(), s2(), s1());
++      break;
++    case Kind::PCEQW:
++      r = binary(gen, BinaryenEqVecI32x4(), s2(), s1());
++      break;
++    case Kind::PCGTB:
++      r = binary(gen, BinaryenGtSVecI8x16(), s1(), s2());
++      break;
++    case Kind::PCGTH:
++      r = binary(gen, BinaryenGtSVecI16x8(), s1(), s2());
++      break;
++    case Kind::PCGTW:
++      r = binary(gen, BinaryenGtSVecI32x4(), s1(), s2());
++      break;
++    case Kind::POR:
++      r = binary(gen, BinaryenOrVec128(), s2(), s1());
++      break;
++    case Kind::PXOR:
++      r = binary(gen, BinaryenXorVec128(), s2(), s1());
++      break;
++    case Kind::PAND:
++      r = binary(gen, BinaryenAndVec128(), s2(), s1());
++      break;
++    case Kind::PACKUSWB:
++      // signed words -> unsigned saturated bytes, src1 in the low half
++      r = binary(gen, BinaryenNarrowUVecI16x8ToVecI8x16(), s1(), s2());
++      break;
++    case Kind::PADDB:
++      r = binary(gen, BinaryenAddVecI8x16(), s1(), s2());
++      break;
++    default:
++      gen.unsupported("this 128-bit integer operation");
++  }
++  gen.emit(gen.set(m_dst, r));
++}
++
++void IR_Int128Math2Asm::do_codegen_wasm(FunctionGen& gen) {
++  if (!m_imm.has_value() || *m_imm < 0 || *m_imm > 255) {
++    gen.unsupported("a 128-bit integer operation without a valid immediate");
++  }
++  const int imm = (int)*m_imm;
++  auto x = [&]() { return gen.get(m_src); };
++  // AVX shifts by an immediate >= the lane width give 0 (sra: the sign); wasm takes it modulo
++  auto shift = [&](BinaryenOp op, int lane_bits, bool arith) -> BinaryenExpressionRef {
++    if (imm >= lane_bits) {
++      if (!arith) {
++        return zero_v128(gen);
++      }
++      return BinaryenSIMDShift(gen.module(), op, x(), i32_const(gen, lane_bits - 1));
++    }
++    return BinaryenSIMDShift(gen.module(), op, x(), i32_const(gen, imm));
++  };
++  BinaryenExpressionRef r = nullptr;
++  switch (m_kind) {
++    case Kind::PW_SLL:
++      r = shift(BinaryenShlVecI32x4(), 32, false);
++      break;
++    case Kind::PW_SRL:
++      r = shift(BinaryenShrUVecI32x4(), 32, false);
++      break;
++    case Kind::PW_SRA:
++      r = shift(BinaryenShrSVecI32x4(), 32, true);
++      break;
++    case Kind::PH_SLL:
++      r = shift(BinaryenShlVecI16x8(), 16, false);
++      break;
++    case Kind::PH_SRL:
++      r = shift(BinaryenShrUVecI16x8(), 16, false);
++      break;
++    case Kind::VPSRLDQ:
++    case Kind::VPSLLDQ: {
++      // byte shift of the whole register, zeros shifted in (bytes 16-31 of the shuffle)
++      const int n = imm > 16 ? 16 : imm;
++      uint8_t mask[16];
++      for (int i = 0; i < 16; i++) {
++        int src = (m_kind == Kind::VPSRLDQ) ? i + n : i - n;
++        mask[i] = (src >= 0 && src < 16) ? (uint8_t)src : (uint8_t)16;
++      }
++      r = shuffle(gen, x(), zero_v128(gen), mask);
++    } break;
++    case Kind::VPSHUFLW:
++    case Kind::VPSHUFHW: {
++      // shuffle the 4 words of one half by imm, keep the other half
++      const int base = (m_kind == Kind::VPSHUFLW) ? 0 : 4;
++      int words[8];
++      for (int i = 0; i < 8; i++) {
++        words[i] = i;
++      }
++      for (int i = 0; i < 4; i++) {
++        words[base + i] = base + ((imm >> (2 * i)) & 3);
++      }
++      uint8_t mask[16];
++      for (int i = 0; i < 8; i++) {
++        mask[2 * i] = (uint8_t)(words[i] * 2);
++        mask[2 * i + 1] = (uint8_t)(words[i] * 2 + 1);
++      }
++      r = shuffle(gen, x(), x(), mask);
++    } break;
++    default:
++      gen.unsupported("this 128-bit integer operation");
++  }
++  gen.emit(gen.set(m_dst, r));
++}
+diff --git a/goalc/wasm/WasmCodegen.cpp b/goalc/wasm/WasmCodegen.cpp
+index e6901c1b..fa67036a 100644
+--- a/goalc/wasm/WasmCodegen.cpp
++++ b/goalc/wasm/WasmCodegen.cpp
+@@ -30,6 +30,14 @@ constexpr u32 kPageSize = 64 * 1024;
+ constexpr u32 kMinMemoryPages = (WASM_EE_MAIN_MEM_BASE + EE_MAIN_MEM_SIZE) / kPageSize;
+ constexpr u32 kMaxMemoryPages = 65536;  // 4 GB
+ 
++bool is_simd128_class(RegClass rc) {
++  return rc == RegClass::INT_128 || rc == RegClass::VECTOR_FLOAT;
++}
++
++u32 mem_size_for_class(RegClass rc) {
++  return rc == RegClass::FLOAT ? 4 : is_simd128_class(rc) ? 16 : 8;
++}
++
+ BinaryenType wasm_type_for_class(RegClass rc) {
+   switch (rc) {
+     case RegClass::GPR_64:
+@@ -91,6 +99,12 @@ BinaryenExpressionRef FunctionGen::get(const RegVal* rv) {
+   if (m_st_iregs.count(rv->ireg().id)) {
+     return m_mod->s7();
+   }
++  auto mem = m_mem_iregs.find(rv->ireg().id);
++  if (mem != m_mem_iregs.end()) {
++    const auto rc = rv->ireg().reg_class;
++    return BinaryenLoad(module(), mem_size_for_class(rc), false, mem_offset(mem->second), 1,
++                        type_of(rv), goal_addr(frame_base()), kMemoryName);
++  }
+   return BinaryenLocalGet(module(), local_index(rv), type_of(rv));
+ }
+ 
+@@ -101,11 +115,55 @@ BinaryenExpressionRef FunctionGen::set(const RegVal* rv, BinaryenExpressionRef v
+   if (m_st_iregs.count(rv->ireg().id)) {
+     unsupported("writing the symbol table register");
+   }
++  auto mem = m_mem_iregs.find(rv->ireg().id);
++  if (mem != m_mem_iregs.end()) {
++    const auto rc = rv->ireg().reg_class;
++    return BinaryenStore(module(), mem_size_for_class(rc), mem_offset(mem->second), 1,
++                         goal_addr(frame_base()), value, type_of(rv), kMemoryName);
++  }
+   return BinaryenLocalSet(module(), local_index(rv), value);
+ }
+ 
++BinaryenExpressionRef FunctionGen::frame_base() {
++  if (m_frame_base_local < 0) {
++    throw std::runtime_error("wasm backend: stack frame used by a function without one");
++  }
++  return BinaryenLocalGet(module(), m_frame_base_local, BinaryenTypeInt64());
++}
++
++BinaryenExpressionRef FunctionGen::reg_val_addr(const RegVal* rv) {
++  auto mem = m_mem_iregs.find(rv->ireg().id);
++  if (mem == m_mem_iregs.end()) {
++    throw std::runtime_error("wasm backend: address of a variable that isn't on the stack");
++  }
++  return BinaryenBinary(module(), BinaryenAddInt64(), frame_base(),
++                        BinaryenConst(module(), BinaryenLiteralInt64(mem->second)));
++}
++
++// frame: [stack variables][variables forced on the stack], 16-byte aligned
++void FunctionGen::layout_frame() {
++  m_stack_vars_size = m_env->stack_slots_used_for_stack_vars() * 8;
++  int offset = m_stack_vars_size;
++  for (auto& rv : m_env->reg_vals()) {
++    if (!rv->forced_on_stack() || is_pp(rv.get()) || m_st_iregs.count(rv->ireg().id)) {
++      continue;
++    }
++    const int size = (int)mem_size_for_class(rv->ireg().reg_class);
++    offset = (offset + size - 1) & ~(size - 1);
++    m_mem_iregs[rv->ireg().id] = offset;
++    offset += size;
++  }
++  m_stack_frame_size = (offset + 15) & ~15;
++  if (m_stack_frame_size > 0) {
++    m_saved_sp_local = (int)m_local_types.size();
++    m_local_types.push_back(BinaryenTypeInt64());
++    m_frame_base_local = (int)m_local_types.size();
++    m_local_types.push_back(BinaryenTypeInt64());
++  }
++}
++
+ BinaryenExpressionRef FunctionGen::stack_slot_addr(int slot) {
+-  if (m_frame_base_local < 0 || slot * 8 >= m_stack_frame_size) {
++  if (m_frame_base_local < 0 || slot * 8 >= m_stack_vars_size) {
+     throw std::runtime_error("wasm backend: stack slot outside of the function's frame");
+   }
+   return BinaryenBinary(module(), BinaryenAddInt64(),
+@@ -138,35 +196,46 @@ void FunctionGen::set_goto(int target_ir) {
+ }
+ 
+ void FunctionGen::set_params(const std::vector<RegVal*>& args) {
+-  // the arguments are the first locals, in order, so they line up with the wasm params
+-  if (!m_local_types.empty()) {
+-    throw std::runtime_error("wasm backend: function arguments set after other locals");
++  // the 8 i64 params are the first locals. A GPR argument in a local is its param directly;
++  // 128-bit arguments and arguments forced on the stack are moved in the prologue.
++  // behavior self (pp) comes last and isn't a real argument
++  int real_args = 0;
++  for (auto* arg : args) {
++    real_args += is_pp(arg) ? 0 : 1;
+   }
+-  if ((int)args.size() > kGoalArgCount) {
++  if (real_args > kGoalArgCount) {
+     unsupported("more than 8 arguments");
+   }
+-  for (auto* arg : args) {
++  for (int i = 0; i < (int)args.size(); i++) {
++    auto* arg = args[i];
+     if (is_pp(arg)) {
+       continue;  // behavior self: comes from pp, not from an argument
+     }
+-    if (arg->ireg().reg_class != RegClass::GPR_64) {
+-      unsupported("a 128-bit function argument");
++    const auto rc = arg->ireg().reg_class;
++    const bool in_memory = arg->forced_on_stack();
++    if (rc == RegClass::GPR_64 && !in_memory) {
++      m_ireg_to_local[arg->ireg().id] = i;
++    } else if (rc == RegClass::GPR_64) {
++      m_param_prologue.push_back(
++          set(arg, BinaryenLocalGet(module(), i, BinaryenTypeInt64())));
++    } else if (is_simd128_class(rc)) {
++      m_param_prologue.push_back(
++          set(arg, BinaryenLoad(module(), 16, false, WASM_SIMD_ARG_AREA + 16 * i, 1,
++                                BinaryenTypeVec128(), BinaryenConst(module(), BinaryenLiteralInt32(0)),
++                                kMemoryName)));
++    } else {
++      unsupported("a float function argument");
+     }
+-    local_index(arg);
+   }
+-  // the remaining params exist (uniform GOAL function type) but are never read
+-  while ((int)m_local_types.size() < kGoalArgCount) {
+-    m_local_types.push_back(BinaryenTypeInt64());
+-  }
+-  m_num_params = kGoalArgCount;
+ }
+ 
+ void FunctionGen::set_return_reg(const RegVal* rv) {
+   if (m_return_reg && m_return_reg->ireg().id != rv->ireg().id) {
+     throw std::runtime_error("wasm backend: function with two return registers");
+   }
+-  if (rv->ireg().reg_class != RegClass::GPR_64) {
+-    unsupported("a 128-bit return value");
++  const auto rc = rv->ireg().reg_class;
++  if (rc != RegClass::GPR_64 && !is_simd128_class(rc)) {
++    unsupported("a float return value");
+   }
+   m_return_reg = rv;
+ }
+@@ -199,26 +268,22 @@ void FunctionGen::run() {
+   }
+ 
+   // the arguments have to be known before any other local is created
+-  bool has_params = false;
++  const std::vector<RegVal*>* ir_args = nullptr;
+   for (auto& ir : code) {
+     if (auto* reset = dynamic_cast<IR_ValueReset*>(ir.get())) {
+-      set_params(reset->args());
+-      has_params = true;
++      ir_args = &reset->args();
+       break;
+     }
+   }
+-  if (!has_params) {
+-    set_params({});
+-  }
++  // the 8 i64 params are always the first locals (uniform GOAL function type)
++  m_local_types.assign(kGoalArgCount, BinaryenTypeInt64());
++  m_num_params = kGoalArgCount;
+ 
+-  // stack variables: reserve a 16-byte aligned frame on the GOAL stack
+-  m_stack_frame_size = m_env->stack_slots_used_for_stack_vars() * 8;
++  // stack variables and variables forced on the stack: a 16-byte aligned frame on the GOAL stack
++  layout_frame();
++  set_params(ir_args ? *ir_args : std::vector<RegVal*>{});
+   std::vector<BinaryenExpressionRef> prologue;
+   if (m_stack_frame_size > 0) {
+-    m_saved_sp_local = (int)m_local_types.size();
+-    m_local_types.push_back(BinaryenTypeInt64());
+-    m_frame_base_local = (int)m_local_types.size();
+-    m_local_types.push_back(BinaryenTypeInt64());
+     prologue.push_back(BinaryenLocalSet(module(), m_saved_sp_local, m_mod->get_sp()));
+     auto new_sp = BinaryenBinary(
+         module(), BinaryenAndInt64(),
+@@ -271,6 +336,7 @@ void FunctionGen::run() {
+   }
+ 
+   // prologue at the start of the entry block
++  prologue.insert(prologue.end(), m_param_prologue.begin(), m_param_prologue.end());
+   blocks.front().exprs.insert(blocks.front().exprs.begin(), prologue.begin(), prologue.end());
+ 
+   // the exit block returns the return register (functions returning none return 0)
+@@ -279,7 +345,15 @@ void FunctionGen::run() {
+     exit_block.exprs.push_back(
+         m_mod->set_sp(BinaryenLocalGet(module(), m_saved_sp_local, BinaryenTypeInt64())));
+   }
+-  if (m_return_reg) {
++  if (m_return_reg && is_simd128_class(m_return_reg->ireg().reg_class)) {
++    // 128-bit value: in the return slot, the low 64 bits as the wasm result
++    exit_block.exprs.push_back(BinaryenStore(
++        module(), 16, WASM_SIMD_ARG_AREA + 16 * WASM_SIMD_RET_SLOT, 1,
++        BinaryenConst(module(), BinaryenLiteralInt32(0)), get(m_return_reg), BinaryenTypeVec128(),
++        kMemoryName));
++    exit_block.exprs.push_back(BinaryenReturn(
++        module(), BinaryenSIMDExtract(module(), BinaryenExtractLaneVecI64x2(), get(m_return_reg), 0)));
++  } else if (m_return_reg) {
+     exit_block.exprs.push_back(BinaryenReturn(module(), get(m_return_reg)));
+   } else {
+     exit_block.exprs.push_back(BinaryenReturn(module(), BinaryenConst(module(), BinaryenLiteralInt64(0))));
+diff --git a/goalc/wasm/WasmCodegen.h b/goalc/wasm/WasmCodegen.h
+index 06a3b8cd..f1384d30 100644
+--- a/goalc/wasm/WasmCodegen.h
++++ b/goalc/wasm/WasmCodegen.h
+@@ -25,6 +25,10 @@
+  *    shared by every module (env.pp, env.sp). Registers the compiler pins to pp (behavior self,
+  *    rlet on r13) read and write env.pp. Functions with stack variables reserve a 16-byte aligned
+  *    frame on the GOAL stack, which lives in GOAL memory like on the PS2.
++ *  - Variables whose address is taken (&var, forced on the stack) live in that frame too.
++ *  - 128-bit arguments and return values go through a fixed area of wasm memory
++ *    (WASM_SIMD_ARG_AREA): argument i in slot i, the return value in slot WASM_SIMD_RET_SLOT. The
++ *    matching i64 param / result is 0 / the low 64 bits.
+  */
+ 
+ #include <cstdint>
+@@ -119,6 +123,8 @@ class FunctionGen {
+ 
+   // address of a stack variable slot (IR_GetStackAddr)
+   BinaryenExpressionRef stack_slot_addr(int slot);
++  // address of a variable forced on the stack (IR_RegValAddr)
++  BinaryenExpressionRef reg_val_addr(const RegVal* rv);
+ 
+   // GOAL memory helpers: address operand and immediate offset for a GOAL pointer + offset
+   BinaryenExpressionRef goal_addr(BinaryenExpressionRef goal_ptr_i64);
+@@ -137,6 +143,8 @@ class FunctionGen {
+ 
+   int local_index(const RegVal* rv);
+   bool is_pp(const RegVal* rv) const;
++  void layout_frame();
++  BinaryenExpressionRef frame_base();
+ 
+   ModuleGen* m_mod;
+   FunctionEnv* m_env;
+@@ -150,7 +158,10 @@ class FunctionGen {
+   bool m_cur_falls_through = true;
+   std::unordered_map<int, bool> m_pp_iregs;  // iregs pinned to pp everywhere
+   std::unordered_map<int, bool> m_st_iregs;  // iregs pinned to the symbol table register
+-  int m_stack_frame_size = 0;                // bytes of stack variables
++  std::vector<BinaryenExpressionRef> m_param_prologue;  // moves params to where they live
++  std::unordered_map<int, int> m_mem_iregs;  // iregs forced on the stack -> offset in the frame
++  int m_stack_vars_size = 0;                 // bytes of stack variables (start of the frame)
++  int m_stack_frame_size = 0;                // bytes of the whole frame
+   int m_saved_sp_local = -1;                 // sp at entry, restored at exit
+   int m_frame_base_local = -1;               // start of this function's stack frame
+ };
+-- 
+2.43.0
+

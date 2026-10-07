@@ -1,7 +1,7 @@
 From 6c8a9743bd289de4d6932a25dc0869806f0a4ba6 Mon Sep 17 00:00:00 2001
 From: Jakompiled <itsrufer@gmail.com>
 Date: Wed, 7 Oct 2026 16:52:58 +0000
-Subject: [PATCH 9/9] runtime: GOAL processes on JSPI stacks
+Subject: [PATCH 09/10] runtime: GOAL processes on JSPI stacks
 
 web/goal_kernel_web.cpp implements the jakompiled-* kernel primitives:
 each process main thread runs on its own JSPI stack (and its own C

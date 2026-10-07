@@ -1,7 +1,7 @@
 From c0c89705f976053cc9880cbea8ef4f4248cfb95f Mon Sep 17 00:00:00 2001
 From: Jakompiled <itsrufer@gmail.com>
 Date: Wed, 7 Oct 2026 15:01:36 +0000
-Subject: [PATCH 1/9] IOP kernel: keep the real signature of thread entry
+Subject: [PATCH 01/10] IOP kernel: keep the real signature of thread entry
  points
 
 IOP thread entries are u32 (*)() but were stored as void (*)() and called

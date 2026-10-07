@@ -1,0 +1,107 @@
+;;-*-Lisp-*-
+;; Fase 3: instrucciones de 128 bits (vf y enteros) del backend wasm.
+;; Cada test recibe dos registros de 128 bits como 4 enteros de 64 bits (a = a0:a1, b = b0:b1),
+;; ejecuta una instrucción y devuelve la mitad sel (0: bits 0-63, 1: bits 64-127) del resultado.
+;; Los resultados se comparan con el x86 real de goalc (simd.oracle-x86.txt).
+
+(defmacro def-q-test (name &rest body)
+  "Test de enteros de 128 bits: el cuerpo lee qa y qb y escribe qr (uint128)."
+  `(defun ,name ((a0 int) (a1 int) (b0 int) (b1 int) (sel int))
+     (let ((va (new 'stack-no-clear 'array 'uint64 2))
+           (vb (new 'stack-no-clear 'array 'uint64 2))
+           (vr (new 'stack-no-clear 'array 'uint64 2)))
+       (set! (-> va 0) (the-as uint a0))
+       (set! (-> va 1) (the-as uint a1))
+       (set! (-> vb 0) (the-as uint b0))
+       (set! (-> vb 1) (the-as uint b1))
+       (let ((qa (-> (the-as (pointer uint128) va)))
+             (qb (-> (the-as (pointer uint128) vb)))
+             (qr (the-as uint128 0)))
+         ,@body
+         (set! (-> (the-as (pointer uint128) vr)) qr))
+       (the-as int (-> vr sel)))))
+
+(defmacro def-vf-test (name &rest body)
+  "Test de vf: el cuerpo lee los registros vf a y b y escribe r."
+  `(def-q-test ,name
+     (rlet ((a :class vf) (b :class vf) (r :class vf))
+       (.mov a qa)
+       (.mov b qb)
+       (.xor.vf r r r)
+       ,@body
+       (.mov qr r))))
+
+;; ---- vf: aritmética
+(def-vf-test t-vf-add (.add.vf r a b))
+(def-vf-test t-vf-sub (.sub.vf r a b))
+(def-vf-test t-vf-mul (.mul.vf r a b))
+(def-vf-test t-vf-div (.div.vf r a b :fsf #b10 :ftf #b01))
+(def-vf-test t-vf-max (.max.vf r a b))
+(def-vf-test t-vf-min (.min.vf r a b))
+(def-vf-test t-vf-xor (.xor.vf r a b))
+(def-vf-test t-vf-sqrt (.sqrt.vf r a :ftf #b11))
+
+;; ---- vf: máscaras (blend), broadcast (splat) y swizzle (outer product)
+(def-vf-test t-vf-add-mask (.add.vf r a b :mask #b0101))
+(def-vf-test t-vf-sub-mask (.mov.vf r b) (.sub.vf r a b :mask #b1010))
+(def-vf-test t-vf-mov-mask (.mov.vf r b) (.mov.vf r a :mask #b0110))
+(def-vf-test t-vf-add-x (.add.x.vf r a b))
+(def-vf-test t-vf-mul-y (.mul.y.vf r a b))
+(def-vf-test t-vf-sub-z (.sub.z.vf r a b))
+(def-vf-test t-vf-max-w (.max.w.vf r a b))
+(def-vf-test t-vf-min-x (.min.x.vf r a b :mask #b0011))
+(def-vf-test t-vf-outer (.outer.product.vf r a b))
+
+;; ---- vf: conversiones
+(def-vf-test t-vf-itof (.itof.vf r a))
+(def-vf-test t-vf-ftoi (.ftoi.vf r a))
+
+;; ---- enteros de 128 bits
+(def-q-test t-pextlb (.pextlb qr qa qb))
+(def-q-test t-pextlh (.pextlh qr qa qb))
+(def-q-test t-pextlw (.pextlw qr qa qb))
+(def-q-test t-pextub (.pextub qr qa qb))
+(def-q-test t-pextuh (.pextuh qr qa qb))
+(def-q-test t-pextuw (.pextuw qr qa qb))
+(def-q-test t-pcpyld (.pcpyld qr qa qb))
+(def-q-test t-pcpyud (.pcpyud qr qa qb))
+(def-q-test t-psubw (.psubw qr qa qb))
+(def-q-test t-pceqb (.pceqb qr qa qb))
+(def-q-test t-pceqh (.pceqh qr qa qb))
+(def-q-test t-pceqw (.pceqw qr qa qb))
+(def-q-test t-pcgtb (.pcgtb qr qa qb))
+(def-q-test t-pcgth (.pcgth qr qa qb))
+(def-q-test t-pcgtw (.pcgtw qr qa qb))
+(def-q-test t-por (.por qr qa qb))
+(def-q-test t-pxor (.pxor qr qa qb))
+(def-q-test t-pand (.pand qr qa qb))
+(def-q-test t-pnor (.pnor qr qa qb))
+(def-q-test t-ppach (.ppach qr qa qb))
+(def-q-test t-ppacb (.ppacb qr qa qb))
+(def-q-test t-paddb (.paddb qr qa qb))
+(def-q-test t-pw-sll (.pw.sll qr qa 5))
+(def-q-test t-pw-srl (.pw.srl qr qa 7))
+(def-q-test t-pw-sra (.pw.sra qr qa 9))
+(def-q-test t-pw-sra-31 (.pw.sra qr qa 31))
+
+;; ---- argumentos y valor de retorno de 128 bits (zona SIMD del ABI wasm)
+(define-extern t-q-callee (function uint128 int uint128 uint128))
+
+(defun t-q-callee ((x uint128) (n int) (y uint128))
+  (let ((r (the-as uint128 0)))
+    (.paddb r x y)
+    (if (> n 0)
+        (t-q-callee r (+ n -1) y)
+        r)))
+
+(def-q-test t-q-call (set! qr (t-q-callee qa 3 qb)))
+
+;; ---- dirección de una variable (&var: la variable vive en la pila GOAL)
+(defun t-addr ((a int) (b int))
+  (let ((x a)
+        (y b))
+    (let ((px (& x))
+          (py (& y)))
+      (set! (-> px) (+ (-> px) (-> py)))
+      (set! (-> py) (* (-> py) 3)))
+    (+ (* x 1000) y)))

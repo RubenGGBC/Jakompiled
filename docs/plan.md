@@ -93,7 +93,7 @@ ISO del usuario → extractor → decompilador → código .gc (GOAL)
 - [x] Subconjunto mínimo: aritmética entera, llamadas, load/store ([fase3-backend.md](fase3-backend.md): idéntico a x86 en 71/71 casos)
 - [x] Tests con programas GOAL fuera del juego, p. ej. `(format #t "hola")` (corre dentro del runtime en Chromium, 3.3)
 - [x] Modelo de enlace: módulo por objeto, `Memory` y `Table` compartidas (módulo incrustado en el objeto GOAL, 3.3)
-- [ ] Registros `vf` → SIMD128
+- [x] Registros `vf` → SIMD128 (3.5: idéntico a x86 en 464/464 casos; todo `GAME.CGO` compila a wasm)
 - [x] Suspend/resume: JSPI, con Asyncify como plan B (JSPI, 3.4: el kernel GOAL real ejecuta procesos en Chromium)
 
 **Salida:** el kernel GOAL de Jak 1 compilado a wasm arranca y ejecuta procesos que se suspenden y reanudan.

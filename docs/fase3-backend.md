@@ -226,6 +226,72 @@ En x86, el kernel cambia de proceso con ensamblador escrito en GOAL: guarda regi
 | `0008` | `goal_src/jak2/kernel`: versiones wasm de las `asm-func` del kernel (+172 líneas) |
 | `0009` | Runtime: procesos sobre pilas JSPI, excepciones, primitivas `jakompiled-*`; 80 registros más a `GOAL_C_FN` |
 
+## 3.5 Instrucciones de 128 bits: todo el motor compila a wasm
+
+> **Resultado: las 9.063 funciones de `GAME.CGO` (kernel + 436 ficheros del motor) compilan a wasm sin ninguna trampa.** Antes de esta sección, 1.096 funciones no compilaban. Las instrucciones nuevas dan el mismo resultado que el x86 de `goalc` en **464 de 464 casos**, incluidos NaN, ±inf, ±0 y valores fuera de rango.
+
+### Medida de partida
+
+Para saber qué faltaba, compilé con `goalc-wasm --trap-unsupported` los 444 objetos de `GAME.CGO`, en el orden del DGO. Una función que usa algo no soportado se compila como una trampa (`unreachable`) y se anota la primera instrucción que falló. Compilar todo el motor tarda ~15 s.
+
+| Primera instrucción no soportada | Funciones |
+|---|---:|
+| `.sub.vf` | 283 |
+| `.pcpyld` | 182 |
+| `.mov` entre clases de registro (`IR_RegSetAsm`) | 171 |
+| `.add.vf` | 96 |
+| `.xor.vf` | 78 |
+| `.splat.vf` | 59 |
+| Argumentos de 128 bits | 54 |
+| Puntero a símbolo en un registro no entero | 53 |
+| `.wait.vf` (aparecía al resolver las anteriores) | 57 |
+| `.mul.vf`, `.blend.vf`, `&var`, `.pxor`, `.pcpyud`, retornos de 128 bits... | resto |
+
+Tras esta sección: **0**.
+
+### Cómo se traduce
+
+Cada instrucción reproduce la instrucción AVX que emite el x86, con el mismo orden de operandos que usa `IR.cpp`:
+
+| GOAL | x86 | wasm |
+|---|---|---|
+| `.add/.sub/.mul/.div.vf` | `vaddps`... | `f32x4.add`... |
+| `.max.vf a b` | `vmaxps`: `a > b ? a : b` (b si hay NaN) | `f32x4.pmax(b, a)`, que es exactamente eso |
+| `.min.vf a b` | `vminps` | `f32x4.pmin(b, a)` |
+| `.ftoi.vf` | `vcvttps2dq`: NaN y fuera de rango → `0x80000000` | `i32x4.trunc_sat_f32x4_s` + `v128.bitselect` con la máscara de rango |
+| `.itof.vf`, `.sqrt.vf`, `.xor.vf` | `vcvtdq2ps`, `vsqrtps`, `vxorps` | `f32x4.convert_i32x4_s`, `f32x4.sqrt`, `v128.xor` |
+| Máscaras (`:mask`), `.blend.vf` | `vblendps` | `i8x16.shuffle` |
+| `.add.x.vf`..., `.splat.vf`, `.swizzle.vf` | `vshufps` | `i8x16.shuffle` |
+| `.pext{l,u}{b,h,w}`, `.pcpyld`, `.pcpyud` | `vpunpck{l,h}{bw,wd,dq,qdq}` | `i8x16.shuffle` |
+| `.pceq*`, `.pcgt*`, `.psubw`, `.paddb`, `.por`... | `vpcmpeq*`, `vpcmpgt*`... | `i*x*.eq`, `i*x*.gt_s`... |
+| `.ppacb` (`vpackuswb`) | Bytes con saturación sin signo | `i8x16.narrow_i16x8_u` |
+| `.pw.sll/srl/sra`, `.ph.sll/srl` | `vpslld`...: desplazar ≥ ancho da 0 (o el signo) | `i32x4.shl`..., con el caso ≥ ancho aparte (wasm usa el módulo) |
+| `vpsrldq`, `vpslldq`, `vpshuflw`, `vpshufhw` | — | `i8x16.shuffle` con ceros |
+| `.nop.vf`, `.wait.vf` | `nop`, `fwait` | Nada |
+
+Otros tres cambios del ABI:
+
+- **`&var`**: una variable cuya dirección se toma ya no es un local wasm. Vive en el marco de la función en la pila GOAL, detrás de las variables de pila, como en x86.
+- **Argumentos y retornos de 128 bits**: la firma única `(i64 × 8) → i64` no los admite. El argumento i va en la ranura i de una zona fija de la memoria wasm (`WASM_SIMD_ARG_AREA`, debajo de la memoria EE) y el retorno en la ranura 8. Solo el hilo EE ejecuta GOAL, y la función los lee en el prólogo, antes de cualquier llamada o `suspend`.
+- **`self` de un `defbehavior`** no cuenta para el límite de 8 argumentos (va en `pp`).
+
+### Validación
+
+[`tests/unit/simd.gc`](../backend/tests/unit/simd.gc) tiene 46 tests: todas las operaciones vf (con máscaras, broadcast y `outer.product`, que usa swizzle), todas las de enteros de 128 bits, una función recursiva que recibe y devuelve `uint128`, y `&var`. Se ejecuta con 5 pares de vectores que incluyen NaN, ±inf, −0, `3e9`, `INT_MIN` y bytes con el bit alto. Cada caso devuelve una mitad del resultado:
+
+```
+== comparación con x86 (goalc nativo)
+464 iguales a x86, 0 distintos
+```
+
+Los 71 casos de `basic.gc` siguen idénticos, y las pruebas `hello` y `procs` en Chromium siguen pasando.
+
+### Parche
+
+| Parche | Contenido |
+|---|---|
+| `0010` | `goalc`: instrucciones vf y de enteros de 128 bits, `&var`, argumentos/retornos de 128 bits |
+
 ### Pendiente en la fase 3
 
 | Tarea | Estado |
@@ -233,10 +299,11 @@ En x86, el kernel cambia de proceso con ensamblador escrito en GOAL: guarda regi
 | Aritmética, floats, control de flujo, llamadas, memoria | ✅ (3.2) |
 | Datos estáticos, enlace en `klink`, llamadas C ↔ GOAL | ✅ (3.3) |
 | Kernel GOAL completo, procesos, suspend/resume, `go`, `catch`/`throw` | ✅ (3.4) |
-| Registros `vf` → SIMD128 | Pendiente: lo necesita el motor (`engine/math`...), no el kernel |
-| Argumentos y retornos de 128 bits en llamadas | Pendiente (1 función del kernel) |
+| Registros `vf` → SIMD128, enteros de 128 bits | ✅ (3.5) |
+| Argumentos y retornos de 128 bits, `&var` | ✅ (3.5) |
+| Compilar `GAME.CGO` (motor del juego) con el backend | ✅ (3.5): 9.063 funciones, 0 trampas |
 | Funciones mips2c (C++ llamado desde GOAL con el ABI de la PS2) | Pendiente: las usa el motor |
-| Compilar `GAME.CGO` (motor del juego) con el backend | Siguiente objetivo |
+| Cargar y ejecutar `GAME.CGO` en el runtime web | Siguiente objetivo |
 
 ### Reproducir
 
