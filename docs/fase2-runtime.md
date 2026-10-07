@@ -6,6 +6,8 @@ No hace falta la ISO: `KERNEL.CGO` lo genera `goalc` a partir de `goal_src/` y n
 
 ## Lo que se ve en el navegador
 
+![Página de arranque en Chromium](img-fase2-navegador.png)
+
 Salida de [`web/test-boot.mjs`](../web/test-boot.mjs) en Chromium headless, recortada:
 
 ```

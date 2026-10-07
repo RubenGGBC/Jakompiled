@@ -6,6 +6,7 @@ const logEl = document.getElementById("log");
 const statusEl = document.getElementById("status");
 
 function log(line) {
+  line = line.replace(/\x1b\[[0-9;]*m/g, ""); // colores ANSI del logger de OpenGOAL
   logEl.textContent += line + "\n";
   console.log(line);
 }
