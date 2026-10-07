@@ -1,0 +1,439 @@
+[top-level]
+- [0x10000] push rbx
+  [0x10001] mov r9d, [r15+r14*1+0xBADBEEF]
+  [0x10009] mov r9d, [r15+r9*1+0x10]
+  [0x1000E] lea rdi, [r14+0xAFECAFE]
+  [0x10016] mov esi, [r15+r14*1+0xBADBEEF]
+  [0x1001E] mov rdx, 0x900000040
+  [0x10028] add r9, r15
+  [0x1002B] call r9
+  [0x1002E] mov edi, [r15+r14*1+0xBADBEEF]
+  [0x10036] mov esi, 0x03
+  [0x1003B] mov r9d, [r15+r14*1+0xBADBEEF]
+  [0x10043] lea rdx, [0x000000000001004A]
+  [0x1004A] sub rdx, r15
+  [0x1004D] add r9, r15
+  [0x10050] call r9
+  [0x10053] lea r9, [0x000000000001005A]
+  [0x1005A] sub r9, r15
+  [0x1005D] mov [r15+r14*1+0xBADBEEF], r9d
+  [0x10065] lea r9, [0x000000000001006C]
+  [0x1006C] sub r9, r15
+  [0x1006F] mov [r15+r14*1+0xBADBEEF], r9d
+  [0x10077] lea r9, [0x000000000001007E]
+  [0x1007E] sub r9, r15
+  [0x10081] mov [r15+r14*1+0xBADBEEF], r9d
+  [0x10089] lea r9, [0x0000000000010090]
+  [0x10090] sub r9, r15
+  [0x10093] mov [r15+r14*1+0xBADBEEF], r9d
+  [0x1009B] lea r9, [0x00000000000100A2]
+  [0x100A2] sub r9, r15
+  [0x100A5] mov [r15+r14*1+0xBADBEEF], r9d
+  [0x100AD] lea r9, [0x00000000000100B4]
+  [0x100B4] sub r9, r15
+  [0x100B7] mov [r15+r14*1+0xBADBEEF], r9d
+  [0x100BF] lea r9, [0x00000000000100C6]
+  [0x100C6] sub r9, r15
+  [0x100C9] mov [r15+r14*1+0xBADBEEF], r9d
+  [0x100D1] lea rax, [0x00000000000100D8]
+  [0x100D8] sub rax, r15
+  [0x100DB] mov [r15+r14*1+0xBADBEEF], eax
+  [0x100E3] pop rbx
+  [0x100E4] ret
+
+
+[bench-matrix-loop]
+- [0x10000] push rbx
+  [0x10001] push rbp
+  [0x10002] push r10
+  [0x10004] push r11
+  [0x10006] push r12
+  [0x10008] sub rsp, 0xC0
+  [0x1000F] mov rbp, rdi
+  [0x10012] mov r12, rsp
+  [0x10015] sub r12, r15
+  [0x10018] lea r11, [rsp+0x40]
+  [0x1001D] sub r11, r15
+  [0x10020] lea rbx, [rsp+0x80]
+  [0x10028] sub rbx, r15
+  [0x1002B] xor r9, r9
+  [0x1002E] jmp 0x00000000000100BD
+  [0x10033] mov r8d, 0x05
+  [0x10039] mov rax, r9
+  [0x1003C] cdq
+  [0x1003D] idiv r8d
+  [0x10040] movsxd rax, edx
+  [0x10043] xor r8, r8
+  [0x10046] cmp rax, r8
+  [0x10049] jnz 0x0000000000010064
+  [0x1004F] movss xmm7, dword ptr [0x0000000000010057]
+  [0x10057] movd r8d, xmm7
+  [0x1005C] movsxd r8, r8d
+  [0x1005F] jmp 0x0000000000010074
+  [0x10064] movss xmm7, dword ptr [0x000000000001006C]
+  [0x1006C] movd r8d, xmm7
+  [0x10071] movsxd r8, r8d
+  [0x10074] mov rcx, r9
+  [0x10077] shl rcx, 0x02
+  [0x1007B] mov rdx, r12
+  [0x1007E] add rcx, rdx
+  [0x10081] mov [r15+rcx*1], r8d
+  [0x10085] movss xmm7, dword ptr [0x000000000001008D]
+  [0x1008D] mov r8, r9
+  [0x10090] mov ecx, 0x01
+  [0x10095] add r8, rcx
+  [0x10098] cvtsi2ss xmm6, r8d
+  [0x1009D] mulss xmm7, xmm6
+  [0x100A1] mov r8, r9
+  [0x100A4] shl r8, 0x02
+  [0x100A8] mov rcx, r11
+  [0x100AB] add r8, rcx
+  [0x100AE] movss [r15+r8*1], xmm7
+  [0x100B4] mov r8d, 0x01
+  [0x100BA] add r9, r8
+  [0x100BD] mov r8d, 0x10
+  [0x100C3] cmp r9, r8
+  [0x100C6] jl 0x0000000000010033
+  [0x100CC] mov r9, r14
+  [0x100CF] xor r10, r10
+  [0x100D2] jmp 0x00000000000100F7
+  [0x100D7] mov r9d, [r15+r14*1+0xBADBEEF]
+  [0x100DF] mov rdi, rbx
+  [0x100E2] mov rsi, r12
+  [0x100E5] mov rdx, r11
+  [0x100E8] add r9, r15
+  [0x100EB] call r9
+  [0x100EE] mov r9d, 0x01
+  [0x100F4] add r10, r9
+  [0x100F7] cmp r10, rbp
+  [0x100FA] jl 0x00000000000100D7
+  [0x10100] mov r9, r14
+  [0x10103] movss xmm7, dword ptr [0x000000000001010B]
+  [0x1010B] movss xmm6, dword ptr [r15+rbx*1]
+  [0x10111] movss xmm5, dword ptr [r15+rbx*1+0x3C]
+  [0x10118] addss xmm6, xmm5
+  [0x1011C] mulss xmm7, xmm6
+  [0x10120] cvttss2si eax, xmm7
+  [0x10124] movsxd rax, eax
+  [0x10127] add rsp, 0xC0
+  [0x1012E] pop r12
+  [0x10130] pop r11
+  [0x10132] pop r10
+  [0x10134] pop rbp
+  [0x10135] pop rbx
+  [0x10136] ret
+
+
+[bench-nop-loop]
+- [0x10000] push rbx
+  [0x10001] push rbp
+  [0x10002] push r12
+  [0x10004] mov rbx, rdi
+  [0x10007] xor rax, rax
+  [0x1000A] xor rbp, rbp
+  [0x1000D] jmp 0x0000000000010035
+  [0x10012] mov r12, rax
+  [0x10015] mov r9d, [r15+r14*1+0xBADBEEF]
+  [0x1001D] mov rdi, rbp
+  [0x10020] add r9, r15
+  [0x10023] call r9
+  [0x10026] add r12, rax
+  [0x10029] mov rax, r12
+  [0x1002C] mov r9d, 0x01
+  [0x10032] add rbp, r9
+  [0x10035] cmp rbp, rbx
+  [0x10038] jl 0x0000000000010012
+  [0x1003E] mov r9, r14
+  [0x10041] pop r12
+  [0x10043] pop rbp
+  [0x10044] pop rbx
+  [0x10045] ret
+
+
+[bench-nop]
+- [0x10000] mov rax, rdi
+  [0x10003] ret
+
+
+[bench-string-loop]
+- [0x10000] push rbx
+  [0x10001] push rbp
+  [0x10002] push r12
+  [0x10004] mov rbp, rdi
+  [0x10007] xor rbx, rbx
+  [0x1000A] xor r12, r12
+  [0x1000D] jmp 0x0000000000010060
+  [0x10012] mov r9d, [r15+r14*1+0xBADBEEF]
+  [0x1001A] lea rdi, [0x0000000000010021]
+  [0x10021] sub rdi, r15
+  [0x10024] lea rsi, [0x000000000001002B]
+  [0x1002B] sub rsi, r15
+  [0x1002E] add r9, r15
+  [0x10031] call r9
+  [0x10034] mov r9, r14
+  [0x10037] cmp rax, r9
+  [0x1003A] jz 0x0000000000010054
+  [0x10040] mov r9, rbx
+  [0x10043] mov r8d, 0x01
+  [0x10049] add r9, r8
+  [0x1004C] mov rbx, r9
+  [0x1004F] jmp 0x0000000000010057
+  [0x10054] mov r9, r14
+  [0x10057] mov r9d, 0x01
+  [0x1005D] add r12, r9
+  [0x10060] cmp r12, rbp
+  [0x10063] jl 0x0000000000010012
+  [0x10069] mov r9, r14
+  [0x1006C] mov rax, rbx
+  [0x1006F] pop r12
+  [0x10071] pop rbp
+  [0x10072] pop rbx
+  [0x10073] ret
+
+
+[bench-sin]
+- [0x10000] movss xmm7, dword ptr [0x0000000000010008]
+  [0x10008] movd xmm6, edi
+  [0x1000C] cvttss2si r9d, xmm6
+  [0x10011] movsxd r9, r9d
+  [0x10014] shl r9, 0x30
+  [0x10018] sar r9, 0x30
+  [0x1001C] cvtsi2ss xmm6, r9d
+  [0x10021] mulss xmm7, xmm6
+  [0x10025] movss xmm6, dword ptr [0x000000000001002D]
+  [0x1002D] mulss xmm6, xmm7
+  [0x10031] movss xmm5, xmm7
+  [0x10035] mulss xmm5, xmm7
+  [0x10039] mulss xmm7, xmm5
+  [0x1003D] movss xmm4, dword ptr [0x0000000000010045]
+  [0x10045] mulss xmm4, xmm7
+  [0x10049] addss xmm6, xmm4
+  [0x1004D] mulss xmm7, xmm5
+  [0x10051] movss xmm4, dword ptr [0x0000000000010059]
+  [0x10059] mulss xmm4, xmm7
+  [0x1005D] addss xmm6, xmm4
+  [0x10061] mulss xmm7, xmm5
+  [0x10065] movss xmm4, dword ptr [0x000000000001006D]
+  [0x1006D] mulss xmm4, xmm7
+  [0x10071] addss xmm6, xmm4
+  [0x10075] mulss xmm7, xmm5
+  [0x10079] movss xmm5, dword ptr [0x0000000000010081]
+  [0x10081] mulss xmm5, xmm7
+  [0x10085] addss xmm6, xmm5
+  [0x10089] movd eax, xmm6
+  [0x1008D] movsxd rax, eax
+  [0x10090] ret
+
+
+[bench-string=]
+- [0x10000] mov r9d, 0x04
+  [0x10006] add r9, rdi
+  [0x10009] mov r8d, 0x04
+  [0x1000F] add r8, rsi
+  [0x10012] xor rcx, rcx
+  [0x10015] mov rdx, r14
+  [0x10018] cmp rdi, rcx
+  [0x1001B] jnz 0x0000000000010026
+  [0x10021] lea rdx, [r14+0x04]
+  [0x10026] mov rcx, rdx
+  [0x10029] mov rdx, r14
+  [0x1002C] cmp rcx, rdx
+  [0x1002F] jnz 0x000000000001004C
+  [0x10035] xor rcx, rcx
+  [0x10038] mov rdx, r14
+  [0x1003B] cmp rsi, rcx
+  [0x1003E] jnz 0x0000000000010049
+  [0x10044] lea rdx, [r14+0x04]
+  [0x10049] mov rcx, rdx
+  [0x1004C] mov rdx, r14
+  [0x1004F] cmp rcx, rdx
+  [0x10052] jz 0x0000000000010065
+  [0x10058] mov rax, r14
+  [0x1005B] jmp 0x0000000000010137
+  [0x10060] jmp 0x0000000000010068
+  [0x10065] mov rcx, r14
+  [0x10068] jmp 0x00000000000100A6
+  [0x1006D] movzx rcx, byte ptr [r15+r9*1]
+  [0x10072] movzx rdx, byte ptr [r15+r8*1]
+  [0x10077] cmp rcx, rdx
+  [0x1007A] jz 0x000000000001008D
+  [0x10080] mov rax, r14
+  [0x10083] jmp 0x0000000000010137
+  [0x10088] jmp 0x0000000000010090
+  [0x1008D] mov rcx, r14
+  [0x10090] mov ecx, 0x01
+  [0x10095] add rcx, r9
+  [0x10098] mov r9, rcx
+  [0x1009B] mov ecx, 0x01
+  [0x100A0] add rcx, r8
+  [0x100A3] mov r8, rcx
+  [0x100A6] movzx rcx, byte ptr [r15+r9*1]
+  [0x100AB] xor rdx, rdx
+  [0x100AE] mov rsi, r14
+  [0x100B1] cmp rcx, rdx
+  [0x100B4] jz 0x00000000000100BF
+  [0x100BA] lea rsi, [r14+0x04]
+  [0x100BF] mov rcx, rsi
+  [0x100C2] mov rdx, r14
+  [0x100C5] cmp rcx, rdx
+  [0x100C8] jz 0x00000000000100EA
+  [0x100CE] movzx rcx, byte ptr [r15+r8*1]
+  [0x100D3] xor rdx, rdx
+  [0x100D6] mov rsi, r14
+  [0x100D9] cmp rcx, rdx
+  [0x100DC] jz 0x00000000000100E7
+  [0x100E2] lea rsi, [r14+0x04]
+  [0x100E7] mov rcx, rsi
+  [0x100EA] mov rdx, r14
+  [0x100ED] cmp rcx, rdx
+  [0x100F0] jnz 0x000000000001006D
+  [0x100F6] mov rcx, r14
+  [0x100F9] movzx r9, byte ptr [r15+r9*1]
+  [0x100FE] xor rcx, rcx
+  [0x10101] mov rax, r14
+  [0x10104] cmp r9, rcx
+  [0x10107] jnz 0x0000000000010112
+  [0x1010D] lea rax, [r14+0x04]
+  [0x10112] mov r9, r14
+  [0x10115] cmp rax, r9
+  [0x10118] jz 0x0000000000010137
+  [0x1011E] movzx r9, byte ptr [r15+r8*1]
+  [0x10123] xor r8, r8
+  [0x10126] mov rax, r14
+  [0x10129] cmp r9, r8
+  [0x1012C] jnz 0x0000000000010137
+  [0x10132] lea rax, [r14+0x04]
+  [0x10137] ret
+
+
+[bench-matrix*!]
+- [0x10000] sub rsp, 0x28
+  [0x10004] movdqa [rsp], xmm8
+  [0x1000A] movdqa [rsp+0x10], xmm9
+  [0x10011] vmovaps xmm6, [r15+rsi*1]
+  [0x10017] vmovaps xmm2, [r15+rdx*1]
+  [0x1001D] vmovaps xmm1, [r15+rdx*1+0x10]
+  [0x10024] vmovaps xmm0, [r15+rdx*1+0x20]
+  [0x1002B] vmovaps xmm8, [r15+rdx*1+0x30]
+  [0x10032] vmovaps xmm5, [r15+rsi*1+0x10]
+  [0x10039] vmovaps xmm4, [r15+rsi*1+0x20]
+  [0x10040] vmovaps xmm3, [r15+rsi*1+0x30]
+  [0x10047] vshufps xmm7, xmm6, xmm6, 0x00
+  [0x1004C] vmulps xmm7, xmm2, xmm7
+  [0x10050] vshufps xmm9, xmm6, xmm6, 0x55
+  [0x10055] vmulps xmm9, xmm1, xmm9
+  [0x1005A] vaddps xmm7, xmm7, xmm9
+  [0x1005F] vshufps xmm9, xmm6, xmm6, 0xAA
+  [0x10064] vmulps xmm9, xmm0, xmm9
+  [0x10069] vaddps xmm7, xmm7, xmm9
+  [0x1006E] vshufps xmm6, xmm6, xmm6, 0xFF
+  [0x10073] vmulps xmm6, xmm8, xmm6
+  [0x10077] vaddps xmm6, xmm7, xmm6
+  [0x1007B] vshufps xmm7, xmm5, xmm5, 0x00
+  [0x10080] vmulps xmm7, xmm2, xmm7
+  [0x10084] vshufps xmm9, xmm5, xmm5, 0x55
+  [0x10089] vmulps xmm9, xmm1, xmm9
+  [0x1008E] vaddps xmm7, xmm7, xmm9
+  [0x10093] vshufps xmm9, xmm5, xmm5, 0xAA
+  [0x10098] vmulps xmm9, xmm0, xmm9
+  [0x1009D] vaddps xmm7, xmm7, xmm9
+  [0x100A2] vshufps xmm5, xmm5, xmm5, 0xFF
+  [0x100A7] vmulps xmm5, xmm8, xmm5
+  [0x100AB] vaddps xmm5, xmm7, xmm5
+  [0x100AF] vshufps xmm7, xmm4, xmm4, 0x00
+  [0x100B4] vmulps xmm7, xmm2, xmm7
+  [0x100B8] vshufps xmm9, xmm4, xmm4, 0x55
+  [0x100BD] vmulps xmm9, xmm1, xmm9
+  [0x100C2] vaddps xmm7, xmm7, xmm9
+  [0x100C7] vshufps xmm9, xmm4, xmm4, 0xAA
+  [0x100CC] vmulps xmm9, xmm0, xmm9
+  [0x100D1] vaddps xmm7, xmm7, xmm9
+  [0x100D6] vshufps xmm4, xmm4, xmm4, 0xFF
+  [0x100DB] vmulps xmm4, xmm8, xmm4
+  [0x100DF] vaddps xmm4, xmm7, xmm4
+  [0x100E3] vshufps xmm7, xmm3, xmm3, 0x00
+  [0x100E8] vmulps xmm7, xmm2, xmm7
+  [0x100EC] vshufps xmm2, xmm3, xmm3, 0x55
+  [0x100F1] vmulps xmm2, xmm1, xmm2
+  [0x100F5] vaddps xmm7, xmm7, xmm2
+  [0x100F9] vshufps xmm2, xmm3, xmm3, 0xAA
+  [0x100FE] vmulps xmm2, xmm0, xmm2
+  [0x10102] vaddps xmm7, xmm7, xmm2
+  [0x10106] vshufps xmm3, xmm3, xmm3, 0xFF
+  [0x1010B] vmulps xmm3, xmm8, xmm3
+  [0x1010F] vaddps xmm7, xmm7, xmm3
+  [0x10113] vmovaps [r15+rdi*1], xmm6
+  [0x10119] vmovaps [r15+rdi*1+0x10], xmm5
+  [0x10120] vmovaps [r15+rdi*1+0x20], xmm4
+  [0x10127] vmovaps [r15+rdi*1+0x30], xmm7
+  [0x1012E] mov rax, rdi
+  [0x10131] movdqa xmm9, [rsp+0x10]
+  [0x10138] movdqa xmm8, [rsp]
+  [0x1013E] add rsp, 0x28
+  [0x10142] ret
+
+
+[bench-sin-loop]
+- [0x10000] sub rsp, 0x18
+  [0x10004] movdqa [rsp], xmm8
+  [0x1000A] push rbx
+  [0x1000B] push rbp
+  [0x1000C] mov rbx, rdi
+  [0x1000F] movss xmm7, dword ptr [0x0000000000010017]
+  [0x10017] xor rbp, rbp
+  [0x1001A] jmp 0x0000000000010054
+  [0x1001F] movss xmm8, xmm7
+  [0x10024] mov r9d, [r15+r14*1+0xBADBEEF]
+  [0x1002C] cvtsi2ss xmm7, ebp
+  [0x10030] movd edi, xmm7
+  [0x10034] movsxd rdi, edi
+  [0x10037] add r9, r15
+  [0x1003A] call r9
+  [0x1003D] movd xmm7, eax
+  [0x10041] addss xmm8, xmm7
+  [0x10046] movss xmm7, xmm8
+  [0x1004B] mov r9d, 0x01
+  [0x10051] add rbp, r9
+  [0x10054] cmp rbp, rbx
+  [0x10057] jl 0x000000000001001F
+  [0x1005D] mov r9, r14
+  [0x10060] cvttss2si eax, xmm7
+  [0x10064] movsxd rax, eax
+  [0x10067] pop rbp
+  [0x10068] pop rbx
+  [0x10069] movdqa xmm8, [rsp]
+  [0x1006F] add rsp, 0x18
+  [0x10073] ret
+
+
+[autogenerated-inspect-method-of-bmatrix]
+- [0x10000] push rbx
+  [0x10001] mov rbx, rdi
+  [0x10004] lea rcx, [r14+0xAFECAFE]
+  [0x1000C] lea rsi, [0x0000000000010013]
+  [0x10013] sub rsi, r15
+  [0x10016] lea rdi, [r14+0x04]
+  [0x1001B] mov r9d, [r15+r14*1+0xBADBEEF]
+  [0x10023] mov rdx, rbx
+  [0x10026] add r9, r15
+  [0x10029] call r9
+  [0x1002C] mov rdx, rbx
+  [0x1002F] lea rsi, [0x0000000000010036]
+  [0x10036] sub rsi, r15
+  [0x10039] lea rdi, [r14+0x04]
+  [0x1003E] mov r9d, [r15+r14*1+0xBADBEEF]
+  [0x10046] add r9, r15
+  [0x10049] call r9
+  [0x1004C] mov rdx, rbx
+  [0x1004F] lea rsi, [0x0000000000010056]
+  [0x10056] sub rsi, r15
+  [0x10059] lea rdi, [r14+0x04]
+  [0x1005E] mov r9d, [r15+r14*1+0xBADBEEF]
+  [0x10066] add r9, r15
+  [0x10069] call r9
+  [0x1006C] mov rax, rbx
+  [0x1006F] pop rbx
+  [0x10070] ret
+
+
+

@@ -1,0 +1,5 @@
+benchmark,iteraciones,segundos,ns_por_iter,resultado
+bench-nop-loop,200000000,0.2663,1.331,19999999900000000
+bench-matrix-loop,100000000,0.4154,4.154,4250
+bench-sin-loop,200000000,3.6808,18.404,9919
+bench-string-loop,10000000,0.6434,64.343,10000000

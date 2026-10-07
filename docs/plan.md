@@ -68,16 +68,16 @@ ISO del usuario → extractor → decompilador → código .gc (GOAL)
 
 ### Fase 0 — Preparación (1–2 semanas)
 - [ ] Compilar OpenGOAL nativo y jugar Jak 1 y Jak 2 con ISOs propias
-- [ ] Mapear el pipeline de `goalc`: IR → register allocator → emitter x86
-- [ ] Inventario del renderer: `grep` de llamadas `gl*`, versión de GL, compute shaders, SSBOs, extensiones
+- [x] Mapear el pipeline de `goalc`: IR → register allocator → emitter x86 ([fase0-inventario.md](fase0-inventario.md))
+- [x] Inventario del renderer: `grep` de llamadas `gl*`, versión de GL, compute shaders, SSBOs, extensiones
 - [ ] Preguntar en el Discord y los issues de OpenGOAL por intentos previos de wasm o ARM
 
 **Salida:** documento con el mapa del pipeline y la lista de features de GL a sustituir.
 
 ### Fase 1 — Medición de riesgo (1–2 semanas)
-- [ ] Elegir 2–3 funciones GOAL calientes (colisión, matemáticas vectoriales)
-- [ ] Traducirlas a mano a wasm (WAT o C compilado con Emscripten)
-- [ ] Hacer benchmark frente a la versión x86 nativa
+- [x] Elegir 2–3 funciones GOAL calientes (colisión, matemáticas vectoriales)
+- [x] Traducirlas a mano a wasm (WAT o C compilado con Emscripten)
+- [x] Hacer benchmark frente a la versión x86 nativa ([fase1-benchmark.md](fase1-benchmark.md): peor caso ~2x)
 
 **Salida:** factor de ralentización medido. **Si sale peor de 3x, replantear antes de seguir.**
 

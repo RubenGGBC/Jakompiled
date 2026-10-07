@@ -120,29 +120,46 @@
       (f32.add (local.get $f1-7) (f32.mul (f32.const 0.0000023042373) (local.get $f0-4))))))
 
   ;; ------------------------------------------------------------------ string=
+  ;; Fiel al IR de goalc: cada (zero? x) / (nonzero? x) materializa un símbolo
+  ;; #t/#f, y los if/while/and/or comparan ese símbolo con #f (s7).
   (func $bench-string= (type $f2) (param $a0 i64) (param $a1 i64) (result i64)
-    (local $a2-0 i64) (local $v1-0 i64)
-    (local.set $a2-0 (i64.add (local.get $a0) (i64.const 4)))
-    (local.set $v1-0 (i64.add (local.get $a1) (i64.const 4)))
-    (if (i64.eqz (local.get $a0)) (then (return (global.get $s7))))
-    (if (i64.eqz (local.get $a1)) (then (return (global.get $s7))))
+    (local $a2-0 i64) (local $v1-0 i64) (local $t i64) (local $u i64)
+    (local.set $a2-0 (i64.add (i64.const 4) (local.get $a0)))
+    (local.set $v1-0 (i64.add (i64.const 4) (local.get $a1)))
+    ;; (or (zero? arg0) (zero? arg1))
+    (local.set $t (select (i64.add (global.get $s7) (i64.const 4)) (global.get $s7)
+                          (i64.eqz (local.get $a0))))
+    (if (i64.eq (local.get $t) (global.get $s7))
+      (then
+        (local.set $t (select (i64.add (global.get $s7) (i64.const 4)) (global.get $s7)
+                              (i64.eqz (local.get $a1))))))
+    (if (i64.ne (local.get $t) (global.get $s7))
+      (then (return (global.get $s7))))
     (block $done
       (loop $top
         ;; (and (nonzero? (-> a2-0 0)) (nonzero? (-> v1-0 0)))
-        (br_if $done (i32.eqz (i32.load8_u (i32.wrap_i64 (local.get $a2-0)))))
-        (br_if $done (i32.eqz (i32.load8_u (i32.wrap_i64 (local.get $v1-0)))))
-        ;; goalc no hace CSE: vuelve a cargar los bytes para el !=
-        (if (i32.ne (i32.load8_u (i32.wrap_i64 (local.get $a2-0)))
-                    (i32.load8_u (i32.wrap_i64 (local.get $v1-0))))
+        (local.set $u (i64.load8_u (i32.wrap_i64 (local.get $a2-0))))
+        (local.set $t (select (global.get $s7) (i64.add (global.get $s7) (i64.const 4))
+                              (i64.eqz (local.get $u))))
+        (br_if $done (i64.eq (local.get $t) (global.get $s7)))
+        (local.set $u (i64.load8_u (i32.wrap_i64 (local.get $v1-0))))
+        (local.set $t (select (global.get $s7) (i64.add (global.get $s7) (i64.const 4))
+                              (i64.eqz (local.get $u))))
+        (br_if $done (i64.eq (local.get $t) (global.get $s7)))
+        ;; (if (!= (-> a2-0 0) (-> v1-0 0)) (return #f)): sin CSE, vuelve a cargar
+        (if (i64.ne (i64.load8_u (i32.wrap_i64 (local.get $a2-0)))
+                    (i64.load8_u (i32.wrap_i64 (local.get $v1-0))))
           (then (return (global.get $s7))))
-        (local.set $a2-0 (i64.add (local.get $a2-0) (i64.const 1)))
-        (local.set $v1-0 (i64.add (local.get $v1-0) (i64.const 1)))
+        (local.set $a2-0 (i64.add (i64.const 1) (local.get $a2-0)))
+        (local.set $v1-0 (i64.add (i64.const 1) (local.get $v1-0)))
         (br $top)))
-    (if (i32.eqz (i32.load8_u (i32.wrap_i64 (local.get $a2-0))))
-      (then
-        (if (i32.eqz (i32.load8_u (i32.wrap_i64 (local.get $v1-0))))
-          (then (return (i64.add (global.get $s7) (i64.const 4)))))))
-    global.get $s7)
+    ;; (and (zero? (-> a2-0 0)) (zero? (-> v1-0 0)))
+    (local.set $t (select (i64.add (global.get $s7) (i64.const 4)) (global.get $s7)
+                          (i64.eqz (i64.load8_u (i32.wrap_i64 (local.get $a2-0))))))
+    (if (i64.eq (local.get $t) (global.get $s7))
+      (then (return (local.get $t))))
+    (select (i64.add (global.get $s7) (i64.const 4)) (global.get $s7)
+            (i64.eqz (i64.load8_u (i32.wrap_i64 (local.get $v1-0))))))
 
   ;; ------------------------------------------------------------------ bucles
   ;; (dotimes (i n) ...) de goalc: comprobación al final del bucle.
