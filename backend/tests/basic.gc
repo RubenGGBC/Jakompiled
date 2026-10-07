@@ -1,0 +1,84 @@
+;;-*-Lisp-*-
+;; Fase 3: primer subconjunto del backend wasm de goalc.
+;; Cada función t-* se comprueba desde run_tests.mjs contra el resultado esperado.
+
+;; ---- enteros
+(defun t-add ((a int) (b int))
+  (+ a b))
+
+(defun t-arith ((a int) (b int))
+  (- (* a b) (/ a b)))
+
+(defun t-mod ((a int) (b int))
+  (mod a b))
+
+(defun t-shift ((a int) (n int))
+  (+ (shl a n) (sar a 2) (shr a 1)))
+
+(defun t-logic ((a int) (b int))
+  (logxor (logand a b) (logior a 7) (lognot b)))
+
+;; ---- control de flujo
+(defun t-cond ((x int))
+  (cond
+    ((< x 0) -1)
+    ((zero? x) 0)
+    ((< x 10) 1)
+    (else 2)))
+
+(defun t-loop ((n int))
+  (let ((acc 0))
+    (dotimes (i n)
+      (+! acc (* i i)))
+    acc))
+
+(defun t-early ((x int))
+  (when (> x 5)
+    (return 100))
+  x)
+
+(defun t-bool ((x int))
+  (if (and (> x 0) (< x 10)) 1 0))
+
+(defun t-sym-bool ((x int))
+  (> x 3))
+
+;; ---- llamadas (a través del símbolo, como en el juego)
+(defun t-fact ((n int))
+  (if (<= n 1)
+      1
+      (* n (t-fact (+ n -1)))))
+
+(defun t-call3 ((a int) (b int) (c int))
+  (t-add (t-add a b) c))
+
+;; ---- símbolos globales
+(define *t-global* 0)
+
+(defun t-global-set ((x int))
+  (set! *t-global* (* x 3))
+  *t-global*)
+
+;; ---- memoria
+(defun t-mem ((p (pointer int32)) (n int))
+  (let ((sum 0))
+    (dotimes (i n)
+      (+! sum (-> p i))
+      (set! (-> p i) (* 2 (-> p i))))
+    sum))
+
+(defun t-sext ((p (pointer int8)) (q (pointer uint8)))
+  (+ (* 1000 (-> p 0)) (-> q 0)))
+
+;; ---- flotantes (viajan en registros enteros, como en el x86 de goalc)
+(defun t-float ((a float) (b float))
+  (the int (* 1000.0 (+ (* a b) (/ a b) (fmin a b) (fmax a b) (- a b)))))
+
+(defun t-f2i ((x float))
+  (the int x))
+
+(defun t-i2f ((x int))
+  (* 0.5 (the float x)))
+
+(defun t-fcmp ((a float) (b float))
+  (+ (if (< a b) 1 0) (if (= a b) 10 0) (if (> a b) 100 0)))
