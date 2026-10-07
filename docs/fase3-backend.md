@@ -163,23 +163,85 @@ Se cambia `(i64 × n) → i64` por **`(i64 × 8) → i64` para todas**, y el lla
 | `0005` | `goalc`: objetos GOAL para wasm (stubs, estáticos, módulo incrustado, `__link`), ABI de 8 argumentos |
 | `0006` | Runtime: instanciar el código wasm al enlazar (`klink` de Jak 2), llamadas C ↔ GOAL, `GOAL_C_FN` |
 
-### Pendiente en la fase 3
-
-| Tarea | Estado |
-|---|---|
-| Aritmética, floats, control de flujo, llamadas, memoria | ✅ (3.2) |
-| Datos estáticos y enlace real en `klink` | ✅ (3.3) |
-| Llamadas a funciones C del runtime | ✅ (3.3) |
-| Registros `vf` → SIMD128 | Pendiente |
-| Pila de GOAL (`new 'stack`, `IR_GetStackAddr`), behaviors (`self`/`pp`), `arg3_is_pp` | Pendiente |
-| Compilar el kernel GOAL real (`KERNEL.CGO`: `gcommon`, `gkernel`...) con el backend | Siguiente objetivo; incluye las `asm-func` del kernel |
-| Suspend/resume con JSPI dentro del runtime | Pendiente; coste medido (3.1) |
-| Jak 1 y Jak 3 en `klink` | Pendiente (solo Jak 2 enlaza wasm) |
-
 ### Reproducir
 
 ```sh
 web/build_runtime.sh
 JAK_PROJECT=web/work/jak-project backend/test.sh            # tests unitarios + oráculo x86
 JAK_PROJECT=web/work/jak-project backend/test_runtime.sh    # GOAL/wasm dentro del runtime, en Chromium
+```
+
+## 3.4 El kernel GOAL de Jak 2, compilado a wasm, ejecuta procesos
+
+> **Resultado: el kernel GOAL real de Jak 2 (`KERNEL.CGO`: `gcommon`, `gkernel`, `gstring`, `gstate`... 226 funciones) está compilado a WebAssembly y arranca en Chromium.** Construye sus pools de procesos, pasa la comprobación de versión del runtime y ejecuta el despachador en cada frame. Un objeto de prueba crea un proceso con las macros del juego, y el kernel lo planifica: el proceso se suspende y se reanuda entre frames, usa `catch`/`throw`, cambia de estado con `go` y se desactiva al terminar.
+
+```
+[info] Got correct kernel version 2.0
+kernel: machine started
+[GOAL/wasm] proceso arrancado en #<process process running :state #f :stack 0/256 :heap 384/16384 @ #x1d99b4>
+[GOAL/wasm] proceso: frame 0 (reanudado por el kernel)
+[GOAL/wasm] proceso: frame 1 (reanudado por el kernel)
+[GOAL/wasm] proceso: frame 2 (reanudado por el kernel)
+[GOAL/wasm] throw desde dentro del catch con 70
+[GOAL/wasm] catch-frame devolvió 70
+[GOAL/wasm] estado procs-final, argumento 42
+[GOAL/wasm] procs-final: frame 0
+[GOAL/wasm] procs-final: frame 1
+[GOAL/wasm] fin del estado: el proceso se desactiva
+```
+
+Programa de prueba: [`backend/tests/runtime/procs.gc`](../backend/tests/runtime/procs.gc). El `#<process ...>` lo imprime el método `print` del tipo `process`, código GOAL del kernel. Después el kernel sigue ejecutando frames sin procesos, estable.
+
+### El problema: las `asm-func` del kernel
+
+En x86, el kernel cambia de proceso con ensamblador escrito en GOAL: guarda registros, copia la pila del proceso a una zona de respaldo y salta a direcciones guardadas. Wasm no tiene pila direccionable ni saltos arbitrarios. Sustitución:
+
+| Primitiva x86 | Qué hace | En wasm |
+|---|---|---|
+| `thread-resume` | Restaura pila y registros, salta al `pc` del hilo | Arranca o despierta la **pila JSPI** del hilo; el hilo EE (kernel) queda suspendido hasta que el proceso cede |
+| `thread-suspend` | Guarda pila y registros, vuelve al kernel | Cede a la pila del kernel (JSPI); la pila GOAL se respalda igual que en x86 |
+| `set-to-run-bootstrap` | Primer código de un hilo: llama a la función guardada | Función GOAL normal, que corre en la pila nueva |
+| `return-from-thread(-dead)`, `abandon-thread` | Vuelve al kernel desde el proceso | Excepción `ThreadExit` |
+| `go` (desde el hilo principal) | Reinicia la pila y salta al código del nuevo estado | Excepción `ThreadRestart`, recogida al inicio de la pila del proceso |
+| `catch-frame` / `throw-dispatch` | `setjmp`/`longjmp` | `try`/`catch` C++ con la excepción `GoalThrow` |
+| `reset-and-call` | trans/post en un hilo temporal | Llamada con la pila GOAL del hilo, recogiendo `ThreadExit` |
+
+- **La contabilidad sigue en GOAL.** El parche `0008` añade a `gkernel.gc` y `gstate.gc` una rama `(#cond ((eq? INSTRUCTION_SET 'wasm) ...))` con versiones GOAL de esas funciones. Mantienen la pila de respaldo, `stack-frame-top`, el estado del proceso y `top-thread` como en x86, y solo llaman al runtime (`jakompiled-*`) para lo que GOAL no puede hacer. **El kernel x86 compilado con los parches es idéntico byte a byte al original.**
+- **Excepciones wasm nativas** (`-fwasm-exceptions`). JSPI no puede suspender a través de frames JS, y las excepciones de Emscripten basadas en JS los añaden. Con las nativas, el `throw` atraviesa frames C++ y GOAL sin problemas.
+- **Dos pilas por proceso, más la GOAL.** Cada pila JSPI de proceso tiene además su propia **pila C** (`__stack_pointer` de Emscripten, 256 KB), que se cambia en cada reanudación y suspensión. Sin eso, los frames C++ de un proceso suspendido quedarían debajo del kernel y se pisarían. La pila GOAL (`env.sp`) y `pp` (`env.pp`) son globals wasm compartidos por todos los módulos.
+- **JSPI con pthreads en Emscripten 6 funciona.** Lo verifiqué antes con un ejemplo mínimo: suspender dentro de `main` (con `PROXY_TO_PTHREAD`) y dentro de un pthread creado.
+
+### Cambios en el backend
+
+- `pp` (proceso actual, `r13`) y el puntero de pila GOAL son **globals `i64` mutables** importados (`env.pp`, `env.sp`). Los registros que el compilador fija a `r13` (`self` de los behaviors, `rlet` sobre `pp`) leen y escriben `env.pp`; `r14` (tabla de símbolos) lee `s7`.
+- **Variables en la pila** (`new 'stack`, `IR_GetStackAddr`): marco alineado a 16 bytes en la pila GOAL, que vive en memoria GOAL como en la PS2.
+- `INSTRUCTION_SET` vale `'wasm` al compilar con `goalc-wasm`; `(break)` → `unreachable`.
+- `goalc-wasm --out-dir` compila varios ficheros en orden, como la construcción de un DGO. `--trap-unsupported` convierte en trampa (con nombre) las funciones que el backend aún no soporta: hoy, solo `print` de `vec4s`, que recibe un valor de 128 bits.
+
+### Parches
+
+| Parche | Contenido |
+|---|---|
+| `0007` | `goalc`: `pp`/`sp` globales, pila GOAL, `INSTRUCTION_SET 'wasm`, compilación multi-fichero |
+| `0008` | `goal_src/jak2/kernel`: versiones wasm de las `asm-func` del kernel (+172 líneas) |
+| `0009` | Runtime: procesos sobre pilas JSPI, excepciones, primitivas `jakompiled-*`; 80 registros más a `GOAL_C_FN` |
+
+### Pendiente en la fase 3
+
+| Tarea | Estado |
+|---|---|
+| Aritmética, floats, control de flujo, llamadas, memoria | ✅ (3.2) |
+| Datos estáticos, enlace en `klink`, llamadas C ↔ GOAL | ✅ (3.3) |
+| Kernel GOAL completo, procesos, suspend/resume, `go`, `catch`/`throw` | ✅ (3.4) |
+| Registros `vf` → SIMD128 | Pendiente: lo necesita el motor (`engine/math`...), no el kernel |
+| Argumentos y retornos de 128 bits en llamadas | Pendiente (1 función del kernel) |
+| Funciones mips2c (C++ llamado desde GOAL con el ABI de la PS2) | Pendiente: las usa el motor |
+| Compilar `GAME.CGO` (motor del juego) con el backend | Siguiente objetivo |
+
+### Reproducir
+
+```sh
+web/build_runtime.sh                                       # gk, Binaryen, goalc-wasm y KERNEL.CGO en wasm
+JAK_PROJECT=web/work/jak-project backend/test.sh           # tests unitarios + oráculo x86
+JAK_PROJECT=web/work/jak-project backend/test_runtime.sh   # hello + kernel con procesos, en Chromium
 ```

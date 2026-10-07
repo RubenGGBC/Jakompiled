@@ -1,0 +1,47 @@
+;;-*-Lisp-*-
+;; Fase 3: procesos GOAL compilados a wasm sobre el kernel GOAL real (también compilado a wasm).
+;; Se añade como último objeto de KERNEL.CGO. Su código de nivel superior crea un proceso, y el
+;; kernel lo ejecuta en los frames siguientes:
+;;  - suspend: el proceso cede el control al kernel y se reanuda en el frame siguiente (JSPI)
+;;  - catch/throw: salida no local a un catch-frame (excepción wasm)
+;;  - go: cambio de estado, que reinicia el hilo principal en el código del nuevo estado
+;;  - al acabar el código del estado, el proceso se desactiva (return-from-thread-dead)
+
+(defun procs-thrower ((x int))
+  (format 0 "[GOAL/wasm] throw desde dentro del catch con ~D~%" (* x 10))
+  (throw 'procs-tag (* x 10))
+  (format 0 "[GOAL/wasm] ERROR: throw no debería volver~%")
+  0
+  )
+
+(defstate procs-final (process)
+  :code (behavior ((x int))
+    (format 0 "[GOAL/wasm] estado procs-final, argumento ~D~%" x)
+    (dotimes (i 2)
+      (suspend)
+      (format 0 "[GOAL/wasm] procs-final: frame ~D~%" i)
+      )
+    (format 0 "[GOAL/wasm] fin del estado: el proceso se desactiva~%")
+    )
+  )
+
+(defun procs-main ((n int))
+  (format 0 "[GOAL/wasm] proceso arrancado en ~A~%" (with-pp pp))
+  (dotimes (i n)
+    (suspend)
+    (format 0 "[GOAL/wasm] proceso: frame ~D (reanudado por el kernel)~%" i)
+    )
+  (let ((params (new 'stack-no-clear 'array 'uint64 6)))
+    (set! (-> params 0) 7)
+    (let ((r (new 'stack 'catch-frame 'procs-tag procs-thrower params)))
+      (format 0 "[GOAL/wasm] catch-frame devolvió ~D~%" r)
+      )
+    )
+  (with-pp
+    (go-hook pp procs-final 42)
+    )
+  (format 0 "[GOAL/wasm] ERROR: go no debería volver~%")
+  )
+
+(format 0 "[GOAL/wasm] creando el proceso de prueba~%")
+(process-spawn-function process procs-main 3 :to *active-pool*)

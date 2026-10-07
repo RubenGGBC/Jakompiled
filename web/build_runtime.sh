@@ -4,8 +4,8 @@
 #   1. Clona jak-project en el commit de referencia y aplica patches/jak-project
 #   2. Compila gk.js + gk.wasm con Emscripten (emsdk activo: source emsdk_env.sh)
 #   3. Compila Binaryen y goalc en nativo (incluido goalc-wasm, el backend wasm de la fase 3)
-#      y genera KERNEL.CGO desde el código fuente (sin ISO)
-#   4. Lo copia todo a web/dist
+#   4. Compila el kernel GOAL a wasm y monta KERNEL.CGO (backend/build_kernel.sh, sin ISO)
+#   5. Lo copia todo a web/dist
 #
 # Uso: ./build_runtime.sh [directorio-de-trabajo]   (por defecto: web/work)
 # Requisitos: git, cmake, ninja, clang, nasm, emsdk (emcc en el PATH)
@@ -44,13 +44,16 @@ if [ ! -f "$binaryen/install/include/binaryen-c.h" ]; then
   ninja -C "$binaryen/build" install >/dev/null
 fi
 
-echo "== goalc y goalc-wasm (nativo) y KERNEL.CGO"
+echo "== goalc y goalc-wasm (nativo)"
 cmake -S "$src" -B "$src/build/Release/bin" -G Ninja -DCMAKE_BUILD_TYPE=Release \
   -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ \
   -DSDL_X11=OFF -DSDL_WAYLAND=OFF -DSDL_UNIX_CONSOLE_BUILD=ON \
   -DBINARYEN_ROOT="$binaryen/install" >/dev/null
 ninja -C "$src/build/Release/bin" goalc goalc-wasm
-"$src/build/Release/bin/goalc/goalc" --proj-path "$src" --game jak2 --cmd "(build-kernel)" >/dev/null
+
+echo "== KERNEL.CGO (kernel GOAL compilado a wasm)"
+mkdir -p "$src/out/jak2/iso"
+JAK_PROJECT="$src" "$repo/backend/build_kernel.sh" "$src/out/jak2/iso/KERNEL.CGO"
 
 echo "== dist"
 JAK_WEB="$src" JAK_PROJECT="$src" "$here/build_dist.sh"

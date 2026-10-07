@@ -94,7 +94,7 @@ ISO del usuario → extractor → decompilador → código .gc (GOAL)
 - [x] Tests con programas GOAL fuera del juego, p. ej. `(format #t "hola")` (corre dentro del runtime en Chromium, 3.3)
 - [x] Modelo de enlace: módulo por objeto, `Memory` y `Table` compartidas (módulo incrustado en el objeto GOAL, 3.3)
 - [ ] Registros `vf` → SIMD128
-- [ ] Suspend/resume: JSPI, con Asyncify como plan B
+- [x] Suspend/resume: JSPI, con Asyncify como plan B (JSPI, 3.4: el kernel GOAL real ejecuta procesos en Chromium)
 
 **Salida:** el kernel GOAL de Jak 1 compilado a wasm arranca y ejecuta procesos que se suspenden y reanudan.
 

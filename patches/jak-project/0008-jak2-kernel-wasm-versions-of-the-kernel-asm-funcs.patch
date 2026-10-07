@@ -1,0 +1,326 @@
+From c703d4a36c453dbaf016221856ee7810232d95b4 Mon Sep 17 00:00:00 2001
+From: Jakompiled <itsrufer@gmail.com>
+Date: Wed, 7 Oct 2026 16:52:57 +0000
+Subject: [PATCH 8/9] jak2 kernel: wasm versions of the kernel asm-funcs
+
+thread-suspend, thread-resume, set-to-run-bootstrap, reset-and-call,
+return-from-thread(-dead), catch-frame new, throw-dispatch, the
+abandon-thread macro and go's restart of the main thread get an
+INSTRUCTION_SET 'wasm branch that keeps the GOAL bookkeeping and calls
+runtime primitives (jakompiled-*) for stack switching and non-local
+exits. The x86 build is byte-identical to before.
+---
+ goal_src/jak2/kernel/gkernel-h.gc |   3 +-
+ goal_src/jak2/kernel/gkernel.gc   | 177 ++++++++++++++++++++++++++++--
+ goal_src/jak2/kernel/gstate.gc    |   5 +
+ 3 files changed, 176 insertions(+), 9 deletions(-)
+
+diff --git a/goal_src/jak2/kernel/gkernel-h.gc b/goal_src/jak2/kernel/gkernel-h.gc
+index dad97392..7b0791b3 100644
+--- a/goal_src/jak2/kernel/gkernel-h.gc
++++ b/goal_src/jak2/kernel/gkernel-h.gc
+@@ -631,7 +631,8 @@
+   "suspend the current process, to be resumed on the next frame."
+   `(rlet ((pp :reg r13 :reset-here #t))
+          ;; debug check for stack overflow here, where we can easily print the process name.
+-         (#when (or KERNEL_DEBUG)
++         ;; Jakompiled: wasm has no rsp; thread-suspend checks the stack size anyway
++         (#when (and KERNEL_DEBUG (not (eq? INSTRUCTION_SET 'wasm)))
+            (rlet ((sp :reg rsp :reset-here #t :type int)
+                   (off :reg r15 :type uint))
+                  (let* ((sp-goal (- sp off))
+diff --git a/goal_src/jak2/kernel/gkernel.gc b/goal_src/jak2/kernel/gkernel.gc
+index 78bc343a..09c3fd01 100644
+--- a/goal_src/jak2/kernel/gkernel.gc
++++ b/goal_src/jak2/kernel/gkernel.gc
+@@ -441,6 +441,27 @@
+ ;; to get back to the kernel, we use this global symbol.
+ (define-extern *kernel-sp* pointer)
+ 
++;; Jakompiled: runtime primitives used by the wasm versions of the kernel asm-funcs
++(#when (eq? INSTRUCTION_SET 'wasm)
++(define-extern jakompiled-get-sp (function pointer))
++(define-extern jakompiled-thread-exit (function none))
++(define-extern jakompiled-thread-restart (function function object object object object pointer none))
++(define-extern jakompiled-thread-resume (function cpu-thread pointer pointer none))
++(define-extern jakompiled-thread-suspend (function none))
++(define-extern jakompiled-call-on-stack (function function pointer object))
++(define-extern jakompiled-catch (function catch-frame function (pointer uint64) object))
++(define-extern jakompiled-throw (function catch-frame object none))
++)
++
++(#cond
++  ((eq? INSTRUCTION_SET 'wasm)
++   ;; Jakompiled: wasm version, see web/goal_kernel_web.cpp
++   (defun return-from-thread ()
++     "Leave the current thread and return to the kernel (wasm: ThreadExit)."
++     (jakompiled-thread-exit)
++     (none)
++     ))
++  (#t
+ (defun return-from-thread ()
+   "Context switch to the saved kernel context now.
+   This is intended to be jumped to with the ret instruction (return trampoline)
+@@ -499,8 +520,20 @@
+      (.ret)
+      )
+     ))
+-  )
++  )))
+ 
++(#cond
++  ((eq? INSTRUCTION_SET 'wasm)
++   ;; Jakompiled: wasm version, see web/goal_kernel_web.cpp
++   (defun return-from-thread-dead ()
++     "Like return-from-thread, but deactivate the process first."
++     (rlet ((pp :reg r13 :type process))
++       (deactivate pp)
++       )
++     (jakompiled-thread-exit)
++     (none)
++     ))
++  (#t
+ (defun return-from-thread-dead ()
+   "Like return from thread, but we clean up our process with deactivate first.
+   The return register is not preserved here, instead we return the value of deactivate"
+@@ -560,7 +593,7 @@
+      (.ret)
+      )
+     ))
+-  )
++  )))
+ 
+ (defmacro abandon-thread ()
+   ;; abandon this one too.
+@@ -571,6 +604,8 @@
+   ;; temporary, but if this turns out to be false, we will need to change this.
+   ;; keep #cond inside the quasiquote so it remains in the macro expansion
+   `(#cond
++    ((eq? INSTRUCTION_SET 'wasm)
++     (jakompiled-thread-exit))
+     ((eq? INSTRUCTION_SET 'arm64)
+      ;; branch to return-from-thread through the executable alias
+      (rlet ((temp)
+@@ -586,6 +621,20 @@
+        (.push temp)
+        (.ret)))))
+ 
++(#cond
++  ((eq? INSTRUCTION_SET 'wasm)
++   ;; Jakompiled: wasm version, see web/goal_kernel_web.cpp
++   (defun reset-and-call ((this thread) (func function))
++     "Make the given thread the top thread and call the function on its stack. Returning from the
++     thread (return-from-thread, abandon-thread) ends the call."
++     (rlet ((pp :reg r13 :type process))
++       (set! pp (-> this process))
++       (set! (-> pp status) 'running)
++       (set! (-> pp top-thread) (the cpu-thread this))
++       (jakompiled-call-on-stack func (-> this stack-top))
++       )
++     ))
++  (#t
+ (defun reset-and-call ((this thread) (func function))
+   "Make the given thread the top thread, reset the stack, and call the function.
+   Sets up a return trampoline so when the function returns it will return to the
+@@ -677,8 +726,39 @@
+      (.jr func)
+      )
+     ))
+-  )
++  )))
+ 
++(#cond
++  ((eq? INSTRUCTION_SET 'wasm)
++   ;; Jakompiled: wasm version, see web/goal_kernel_web.cpp
++   (defmethod thread-suspend ((unused cpu-thread))
++     "Suspend the thread and return to the kernel. Like the x86 version, the thread comes in pp
++     (the suspend macro passes 0 as the argument). The GOAL stack is backed up like on x86; the
++     wasm stack of the thread is kept by JSPI until the kernel resumes it."
++     (let* ((this (rlet ((pp :reg r13 :type cpu-thread)) pp))
++            (sp (jakompiled-get-sp))
++            (proc (-> this process)))
++       (set! (-> this sp) sp)
++       ;; pc 0: resume the suspended wasm stack (thread-resume)
++       (set! (-> this pc) (the pointer 0))
++       (when (> (process-stack-used proc) (-> this stack-size))
++         (format 0 "ERROR: ~A used too much stack to suspend~%" proc)
++         (break)
++         )
++       (set! (-> proc status) 'suspended)
++       (let ((cur (the (pointer uint64) (-> this stack-top)))
++             (save (&+ (the (pointer uint64) (-> this stack)) (-> this stack-size))))
++         (while (> (the int cur) (the int sp))
++           (set! cur (the (pointer uint64) (&- cur 8)))
++           (set! save (the (pointer uint64) (&- save 8)))
++           (set! (-> save) (-> cur))
++           )
++         )
++       )
++     (jakompiled-thread-suspend)
++     (none)
++     ))
++  (#t
+ (defmethod thread-suspend ((unused cpu-thread))
+   "Suspend the thread and return to the kernel."
+ 
+@@ -877,8 +957,33 @@
+      )
+     ))
+   (none)
+-  )
++  )))
+ 
++(#cond
++  ((eq? INSTRUCTION_SET 'wasm)
++   ;; Jakompiled: wasm version, see web/goal_kernel_web.cpp
++   (defmethod thread-resume ((thread-to-resume cpu-thread))
++     "Resume a suspended thread, or start one prepared by set-to-run. Kernel only."
++     (let* ((this thread-to-resume)
++            (sp (-> this sp)))
++       (let ((cur (the (pointer uint64) (-> this stack-top)))
++             (restore (&+ (the (pointer uint64) (-> this stack)) (-> this stack-size))))
++         (while (> (the int cur) (the int sp))
++           (set! cur (the (pointer uint64) (&- cur 8)))
++           (set! restore (the (pointer uint64) (&- restore 8)))
++           (set! (-> cur) (-> restore))
++           )
++         )
++       (set! (-> (-> this process) top-thread) this)
++       (set! (-> (-> this process) status) 'running)
++       (rlet ((pp :reg r13 :type process))
++         (set! pp (-> this process))
++         )
++       (jakompiled-thread-resume this (-> this pc) sp)
++       )
++     (none)
++     ))
++  (#t
+ (defmethod thread-resume ((thread-to-resume cpu-thread))
+   "Resume a suspended thread. Call this from the kernel only.
+    This is also used to start a thread initialized with set-to-run.
+@@ -1097,7 +1202,7 @@
+      )
+     ))
+   (none)
+-  )
++  )))
+ ;; decomp deviation
+ 
+ 
+@@ -2055,6 +2160,28 @@
+ ;; The catch frames are managed per process (you can't throw to a frame outside your process)
+ ;; But otherwise it is fully dynamic.
+ 
++(#cond
++  ((eq? INSTRUCTION_SET 'wasm)
++   ;; Jakompiled: wasm version, see web/goal_kernel_web.cpp
++   (defmethod new catch-frame ((allocation symbol) (type-to-make type) (name symbol) (func function) (param-block (pointer uint64)))
++     "Run func in a catch frame with the first 6 parameters. Returns its result, or the value
++     passed to throw-dispatch for this frame."
++     (rlet ((pp :reg r13 :type process))
++       (let ((this (the catch-frame (&+ (the pointer allocation) *gtype-basic-offset*))))
++         (set! (-> this type) type-to-make)
++         (set! (-> this name) name)
++         (set! (-> this sp) (the int (jakompiled-get-sp)))
++         (set! (-> this next) (-> pp stack-frame-top))
++         (set! (-> pp stack-frame-top) this)
++         (let ((ret (jakompiled-catch this func param-block)))
++           ;; throw-dispatch already did this when the function threw: setting it again is harmless
++           (set! (-> pp stack-frame-top) (-> this next))
++           ret
++           )
++         )
++       )
++     ))
++  (#t
+ (defmethod new catch-frame ((allocation symbol) (type-to-make type) (name symbol) (func function) (param-block (pointer uint64)))
+   "Run func in a catch frame with the given 8 parameters.
+   The return value is the result of the function.
+@@ -2241,8 +2368,20 @@
+        )
+      )
+     ))
+-  )
++  )))
+ 
++(#cond
++  ((eq? INSTRUCTION_SET 'wasm)
++   ;; Jakompiled: wasm version, see web/goal_kernel_web.cpp
++   (defun throw-dispatch ((this catch-frame) value)
++     "Return value from the new catch-frame call that created this frame."
++     (rlet ((pp :reg r13 :type process))
++       (set! (-> pp stack-frame-top) (-> this next))
++       )
++     (jakompiled-throw this value)
++     (none)
++     ))
++  (#t
+ (defun throw-dispatch ((this catch-frame) value)
+   "Throw the given value to the catch frame.
+   Only can throw a 64-bit value. The original could throw 128 bits."
+@@ -2380,7 +2519,7 @@
+      (.ret)
+      )
+     ))
+-  )
++  )))
+ 
+ (defun throw ((name symbol) value)
+   "Dynamic throw."
+@@ -2670,6 +2809,28 @@
+     )
+   )
+ 
++(#cond
++  ((eq? INSTRUCTION_SET 'wasm)
++   ;; Jakompiled: wasm version, see web/goal_kernel_web.cpp
++   (defun set-to-run-bootstrap ()
++     "First function of a thread prepared by set-to-run: call the function stashed in the saved
++     registers, then deactivate the process when it returns."
++     (rlet ((pp :reg r13 :type process))
++       (let ((thread (-> pp main-thread)))
++         ((the (function object object object object object object object) (-> thread rreg 0))
++          (-> thread rreg 1)
++          (-> thread rreg 2)
++          (-> thread rreg 3)
++          (-> thread rreg 4)
++          (-> thread rreg 5)
++          (-> thread rreg 6)
++          )
++         )
++       )
++     (return-from-thread-dead)
++     (none)
++     ))
++  (#t
+ (defun set-to-run-bootstrap ()
+   "This function is a clever hack.
+    To reset a thread to running a new function, we stash the arguments as saved registers.
+@@ -2743,7 +2904,7 @@
+      (.add a5 a5)
+      )
+     ))
+-  )
++  )))
+ ;; decomp deviation
+ 
+ (defun set-to-run ((thread cpu-thread) (func function) a0 a1 a2 a3 a4 a5)
+diff --git a/goal_src/jak2/kernel/gstate.gc b/goal_src/jak2/kernel/gstate.gc
+index 6797cc15..5176e750 100644
+--- a/goal_src/jak2/kernel/gstate.gc
++++ b/goal_src/jak2/kernel/gstate.gc
+@@ -433,6 +433,11 @@ It type checks the arguments for the entry function.
+          ;; - make sure that when this code returns, we do a deactivate
+          ;; - reset the stack to the top, so we can't just call the code.
+          (#cond
++          ((eq? INSTRUCTION_SET 'wasm)
++           ;; Jakompiled: restart the main thread on the new state's code (wasm: ThreadRestart,
++           ;; caught where the thread's wasm stack starts). It returns into return-from-thread-dead.
++           (jakompiled-thread-restart (-> new-state code) arg0 arg1 arg2 arg3 (-> pp main-thread stack-top))
++           #f)
+           ((eq? INSTRUCTION_SET 'arm64)
+            (rlet ((func)
+                   (sp :reg sp :type uint)
+-- 
+2.43.0
+

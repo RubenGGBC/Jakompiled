@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
-# Fase 3: prueba de punta a punta. Compila tests/runtime/hello.gc con goalc-wasm a un objeto GOAL,
-# lo empaqueta como KERNEL.CGO y arranca el runtime (gk en wasm) en Chromium headless: el runtime
-# carga el objeto, instancia su módulo wasm y ejecuta su código, que imprime con _format.
+# Fase 3: pruebas de punta a punta en Chromium headless, con el runtime (gk) compilado a wasm.
+#
+#  1. hello: un objeto GOAL suelto como KERNEL.CGO; llama a funciones C del runtime (_format).
+#  2. procs: el kernel GOAL real de Jak 2 compilado a wasm, más un objeto que crea un proceso:
+#     suspend/resume entre frames (JSPI), catch/throw, go y desactivación del proceso.
 #
 # Uso: JAK_PROJECT=/ruta/a/jak-project-con-parches ./test_runtime.sh
 #   Necesita web/dist montado (web/build_runtime.sh) y Playwright (PLAYWRIGHT=ruta a playwright).
@@ -11,15 +13,26 @@ web="$here/../web"
 goalc_wasm="${GOALC_WASM:-$JAK_PROJECT/build/Release/bin/goalc/goalc-wasm}"
 work="$(mktemp -d)"
 trap 'rm -rf "$work"; [ -n "${server:-}" ] && kill $server' EXIT
+status=0
 
-"$goalc_wasm" --proj-path "$JAK_PROJECT" --shared-memory "$here/tests/runtime/hello.gc" "$work/hello.o" \
-  | grep -v "debug\]" || true
-# una copia de dist con este objeto como KERNEL.CGO
-cp -r "$web/dist" "$work/dist"
-python3 "$here/make_dgo.py" "$work/dist/data/KERNEL.CGO" "$work/hello.o"
+run_case() {  # nombre, KERNEL.CGO, regex de éxito
+  rm -rf "$work/dist" && cp -r "$web/dist" "$work/dist"
+  cp "$2" "$work/dist/data/KERNEL.CGO"
+  echo "== $1"
+  node "$web/test-boot.mjs" "http://localhost:$port/" 60 "$3" | grep -E "GOAL/wasm|\[test\]" || status=1
+}
 
 port=$((20000 + RANDOM % 20000))
 node "$web/serve.mjs" "$work/dist" "$port" >/dev/null &
 server=$!
+mkdir -p "$work/dist"
 sleep 1
-node "$web/test-boot.mjs" "http://localhost:$port/" 60 "\[GOAL/wasm\] flotante" | grep -E "GOAL/wasm|\[test\]"
+
+"$goalc_wasm" --proj-path "$JAK_PROJECT" --shared-memory "$here/tests/runtime/hello.gc" "$work/hello.o" \
+  | grep -v "debug\]" || true
+python3 "$here/make_dgo.py" "$work/hello.CGO" "$work/hello.o" >/dev/null
+run_case hello "$work/hello.CGO" "\[GOAL/wasm\] flotante"
+
+GOALC_WASM="$goalc_wasm" "$here/build_kernel.sh" "$work/procs.CGO" "$here/tests/runtime/procs.gc" >/dev/null
+run_case procs "$work/procs.CGO" "el proceso se desactiva"
+exit $status

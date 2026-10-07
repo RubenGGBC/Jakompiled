@@ -1,0 +1,700 @@
+From 6c8a9743bd289de4d6932a25dc0869806f0a4ba6 Mon Sep 17 00:00:00 2001
+From: Jakompiled <itsrufer@gmail.com>
+Date: Wed, 7 Oct 2026 16:52:58 +0000
+Subject: [PATCH 9/9] runtime: GOAL processes on JSPI stacks
+
+web/goal_kernel_web.cpp implements the jakompiled-* kernel primitives:
+each process main thread runs on its own JSPI stack (and its own C
+stack), the kernel suspends the EE thread while a process runs, and
+return-from-thread, go and throw are C++ exceptions. Built with -sJSPI
+and -fwasm-exceptions. Also converts the C functions registered through
+make_func_symbol_func (common kmachine) to GOAL_C_FN adapters.
+---
+ game/CMakeLists.txt             |   3 +-
+ game/kernel/common/kmachine.cpp | 169 +++++++++---------
+ game/kernel/jak2/kscheme.cpp    |   9 +
+ web/CMakeLists.txt              |  10 +-
+ web/asm_funcs_web.cpp           |  29 ++-
+ web/goal_kernel_web.cpp         | 300 ++++++++++++++++++++++++++++++++
+ web/goal_wasm_link.cpp          |   5 +-
+ 7 files changed, 428 insertions(+), 97 deletions(-)
+ create mode 100644 web/goal_kernel_web.cpp
+
+diff --git a/game/CMakeLists.txt b/game/CMakeLists.txt
+index 25bcae96..323152a8 100644
+--- a/game/CMakeLists.txt
++++ b/game/CMakeLists.txt
+@@ -12,7 +12,8 @@ endif()
+ if(EMSCRIPTEN)
+     # Jakompiled web: no native code to jump into, the GOAL call trampolines are stubs
+     set(OG_ASM_FUNCS_FILE ${CMAKE_CURRENT_LIST_DIR}/../web/asm_funcs_web.cpp
+-                          ${CMAKE_CURRENT_LIST_DIR}/../web/goal_wasm_link.cpp)
++                          ${CMAKE_CURRENT_LIST_DIR}/../web/goal_wasm_link.cpp
++                          ${CMAKE_CURRENT_LIST_DIR}/../web/goal_kernel_web.cpp)
+ elseif(ARM64_ARCH)
+     # Add your ARM64-specific configuration or build options here
+     set(OG_ASM_FUNCS_FILE kernel/asm_funcs_arm64.s)
+diff --git a/game/kernel/common/kmachine.cpp b/game/kernel/common/kmachine.cpp
+index bc2c52d8..7bef5721 100644
+--- a/game/kernel/common/kmachine.cpp
++++ b/game/kernel/common/kmachine.cpp
+@@ -1,4 +1,5 @@
+ #include "kmachine.h"
++#include "game/kernel/common/goal_c_fn.h"
+ 
+ #include <random>
+ 
+@@ -1112,124 +1113,116 @@ void init_common_pc_port_functions(
+   g_pc_port_funcs.intern_from_c = intern_from_c_func;
+   g_pc_port_funcs.make_string_from_c = make_string_from_c_func;
+   // Get a 300MHz timer value. Called from EE thread
+-  make_func_symbol_func("__read-ee-timer", (void*)read_ee_timer);
++  make_func_symbol_func("__read-ee-timer", GOAL_C_FN(read_ee_timer));
+   // Do a fast memory copy.
+-  make_func_symbol_func("__mem-move", (void*)pc_memmove);
++  make_func_symbol_func("__mem-move", GOAL_C_FN(pc_memmove));
+   // Called from game thread to submit rendering DMA chain.
+-  make_func_symbol_func("__send-gfx-dma-chain", (void*)send_gfx_dma_chain);
++  make_func_symbol_func("__send-gfx-dma-chain", GOAL_C_FN(send_gfx_dma_chain));
+   // Called from game thread to upload a texture outside of the main DMA chain.
+-  make_func_symbol_func("__pc-texture-upload-now", (void*)pc_texture_upload_now);
+-  make_func_symbol_func("__pc-texture-relocate", (void*)pc_texture_relocate);
++  make_func_symbol_func("__pc-texture-upload-now", GOAL_C_FN(pc_texture_upload_now));
++  make_func_symbol_func("__pc-texture-relocate", GOAL_C_FN(pc_texture_relocate));
+   // Called from the game thread at initialization. The game thread is the only one to touch the
+   // mips2c function table (through the linker and ugh this function), so no locking is needed.
+-  make_func_symbol_func("__pc-get-mips2c", (void*)pc_get_mips2c);
+-  make_func_symbol_func("__pc-force-reload-all-levels", (void*)pc_force_reload_all);
+-  make_func_symbol_func("__pc-force-reload-level", (void*)pc_force_reload_level);
+-  make_func_symbol_func("__pc-force-reload-common-level", (void*)pc_force_reload_common);
++  make_func_symbol_func("__pc-get-mips2c", GOAL_C_FN(pc_get_mips2c));
++  make_func_symbol_func("__pc-force-reload-all-levels", GOAL_C_FN(pc_force_reload_all));
++  make_func_symbol_func("__pc-force-reload-level", GOAL_C_FN(pc_force_reload_level));
++  make_func_symbol_func("__pc-force-reload-common-level", GOAL_C_FN(pc_force_reload_common));
+ 
+   // -- DISPLAY RELATED --
+   // Returns the name of the display with the given id or #f if not found / empty
+-  make_func_symbol_func("pc-get-display-id", (void*)pc_get_display_id);
+-  make_func_symbol_func("pc-set-display-id!", (void*)pc_set_display_id);
+-  make_func_symbol_func("pc-get-display-name", (void*)pc_get_display_name);
+-  make_func_symbol_func("pc-get-display-mode", (void*)pc_get_display_mode);
+-  make_func_symbol_func("pc-set-display-mode!", (void*)pc_set_display_mode);
+-  make_func_symbol_func("pc-get-display-count", (void*)pc_get_display_count);
++  make_func_symbol_func("pc-get-display-id", GOAL_C_FN(pc_get_display_id));
++  make_func_symbol_func("pc-set-display-id!", GOAL_C_FN(pc_set_display_id));
++  make_func_symbol_func("pc-get-display-name", GOAL_C_FN(pc_get_display_name));
++  make_func_symbol_func("pc-get-display-mode", GOAL_C_FN(pc_get_display_mode));
++  make_func_symbol_func("pc-set-display-mode!", GOAL_C_FN(pc_set_display_mode));
++  make_func_symbol_func("pc-get-display-count", GOAL_C_FN(pc_get_display_count));
+   // Returns resolution of the monitor's current display mode
+-  make_func_symbol_func("pc-get-active-display-size", (void*)pc_get_active_display_size);
++  make_func_symbol_func("pc-get-active-display-size", GOAL_C_FN(pc_get_active_display_size));
+   // Returns the current refresh rate of the currently selected monitor's display mode.
+-  make_func_symbol_func("pc-get-active-display-refresh-rate",
+-                        (void*)pc_get_active_display_refresh_rate);
++  make_func_symbol_func("pc-get-active-display-refresh-rate", GOAL_C_FN(pc_get_active_display_refresh_rate));
+   // Returns size of window. Called from game thread
+-  make_func_symbol_func("pc-get-window-size", (void*)pc_get_window_size);
++  make_func_symbol_func("pc-get-window-size", GOAL_C_FN(pc_get_window_size));
+   // Returns scale of window. This is for DPI stuff.
+-  make_func_symbol_func("pc-get-window-scale", (void*)pc_get_window_scale);
+-  make_func_symbol_func("pc-set-window-size!", (void*)pc_set_window_size);
+-  make_func_symbol_func("pc-get-num-resolutions", (void*)pc_get_num_resolutions);
+-  make_func_symbol_func("pc-get-resolution", (void*)pc_get_resolution);
+-  make_func_symbol_func("pc-is-supported-resolution?", (void*)pc_is_supported_resolution);
++  make_func_symbol_func("pc-get-window-scale", GOAL_C_FN(pc_get_window_scale));
++  make_func_symbol_func("pc-set-window-size!", GOAL_C_FN(pc_set_window_size));
++  make_func_symbol_func("pc-get-num-resolutions", GOAL_C_FN(pc_get_num_resolutions));
++  make_func_symbol_func("pc-get-resolution", GOAL_C_FN(pc_get_resolution));
++  make_func_symbol_func("pc-is-supported-resolution?", GOAL_C_FN(pc_is_supported_resolution));
+ 
+   // -- INPUT RELATED --
+   // Returns the name of the display with the given id or #f if not found / empty
+-  make_func_symbol_func("pc-get-controller-name", (void*)pc_get_controller_name);
+-  make_func_symbol_func("pc-get-current-bind", (void*)pc_get_current_bind);
+-  make_func_symbol_func("pc-get-controller-count", (void*)pc_get_controller_count);
+-  make_func_symbol_func("pc-get-controller-index", (void*)pc_get_controller_index);
+-  make_func_symbol_func("pc-set-controller!", (void*)pc_set_controller);
+-  make_func_symbol_func("pc-get-keyboard-enabled?", (void*)pc_get_keyboard_enabled);
+-  make_func_symbol_func("pc-set-keyboard-enabled!", (void*)pc_set_keyboard_enabled);
+-  make_func_symbol_func("pc-set-mouse-options!", (void*)pc_set_mouse_options);
+-  make_func_symbol_func("pc-set-mouse-camera-sens!", (void*)pc_set_mouse_camera_sens);
+-  make_func_symbol_func("pc-ignore-background-controller-events!",
+-                        (void*)pc_ignore_background_controller_events);
+-  make_func_symbol_func("pc-current-controller-has-led?", (void*)pc_current_controller_has_led);
+-  make_func_symbol_func("pc-current-controller-has-rumble?",
+-                        (void*)pc_current_controller_has_rumble);
+-  make_func_symbol_func("pc-set-controller-led!", (void*)pc_set_controller_led);
+-  make_func_symbol_func("pc-waiting-for-bind?", (void*)pc_waiting_for_bind);
+-  make_func_symbol_func("pc-set-waiting-for-bind!", (void*)pc_set_waiting_for_bind);
+-  make_func_symbol_func("pc-stop-waiting-for-bind!", (void*)pc_stop_waiting_for_bind);
+-  make_func_symbol_func("pc-reset-bindings-to-defaults!", (void*)pc_reset_bindings_to_defaults);
+-  make_func_symbol_func("pc-set-auto-hide-cursor!", (void*)pc_set_auto_hide_cursor);
+-  make_func_symbol_func("pc-get-pressure-sensitivity-enabled?",
+-                        (void*)pc_get_pressure_sensitivity_enabled);
+-  make_func_symbol_func("pc-set-pressure-sensitivity-enabled!",
+-                        (void*)pc_set_pressure_sensitivity_enabled);
+-  make_func_symbol_func("pc-set-axis-scale!", (void*)pc_set_axis_scale);
+-  make_func_symbol_func("pc-get-axis-scale", (void*)pc_get_axis_scale);
+-  make_func_symbol_func("pc-current-controller-has-pressure-sensitivity?",
+-                        (void*)pc_current_controller_has_pressure_sensitivity);
+-  make_func_symbol_func("pc-current-controller-has-trigger-effect-support?",
+-                        (void*)pc_current_controller_has_trigger_effect_support);
+-  make_func_symbol_func("pc-get-trigger-effects-enabled?", (void*)pc_get_trigger_effects_enabled);
+-  make_func_symbol_func("pc-set-trigger-effects-enabled!", (void*)pc_set_trigger_effects_enabled);
+-  make_func_symbol_func("pc-clear-trigger-effect!", (void*)pc_clear_trigger_effect);
+-  make_func_symbol_func("pc-send-trigger-effect-feedback!", (void*)pc_send_trigger_effect_feedback);
+-  make_func_symbol_func("pc-send-trigger-effect-vibrate!", (void*)pc_send_trigger_effect_vibrate);
+-  make_func_symbol_func("pc-send-trigger-effect-weapon!", (void*)pc_send_trigger_effect_weapon);
+-  make_func_symbol_func("pc-send-trigger-rumble!", (void*)pc_send_trigger_rumble);
++  make_func_symbol_func("pc-get-controller-name", GOAL_C_FN(pc_get_controller_name));
++  make_func_symbol_func("pc-get-current-bind", GOAL_C_FN(pc_get_current_bind));
++  make_func_symbol_func("pc-get-controller-count", GOAL_C_FN(pc_get_controller_count));
++  make_func_symbol_func("pc-get-controller-index", GOAL_C_FN(pc_get_controller_index));
++  make_func_symbol_func("pc-set-controller!", GOAL_C_FN(pc_set_controller));
++  make_func_symbol_func("pc-get-keyboard-enabled?", GOAL_C_FN(pc_get_keyboard_enabled));
++  make_func_symbol_func("pc-set-keyboard-enabled!", GOAL_C_FN(pc_set_keyboard_enabled));
++  make_func_symbol_func("pc-set-mouse-options!", GOAL_C_FN(pc_set_mouse_options));
++  make_func_symbol_func("pc-set-mouse-camera-sens!", GOAL_C_FN(pc_set_mouse_camera_sens));
++  make_func_symbol_func("pc-ignore-background-controller-events!", GOAL_C_FN(pc_ignore_background_controller_events));
++  make_func_symbol_func("pc-current-controller-has-led?", GOAL_C_FN(pc_current_controller_has_led));
++  make_func_symbol_func("pc-current-controller-has-rumble?", GOAL_C_FN(pc_current_controller_has_rumble));
++  make_func_symbol_func("pc-set-controller-led!", GOAL_C_FN(pc_set_controller_led));
++  make_func_symbol_func("pc-waiting-for-bind?", GOAL_C_FN(pc_waiting_for_bind));
++  make_func_symbol_func("pc-set-waiting-for-bind!", GOAL_C_FN(pc_set_waiting_for_bind));
++  make_func_symbol_func("pc-stop-waiting-for-bind!", GOAL_C_FN(pc_stop_waiting_for_bind));
++  make_func_symbol_func("pc-reset-bindings-to-defaults!", GOAL_C_FN(pc_reset_bindings_to_defaults));
++  make_func_symbol_func("pc-set-auto-hide-cursor!", GOAL_C_FN(pc_set_auto_hide_cursor));
++  make_func_symbol_func("pc-get-pressure-sensitivity-enabled?", GOAL_C_FN(pc_get_pressure_sensitivity_enabled));
++  make_func_symbol_func("pc-set-pressure-sensitivity-enabled!", GOAL_C_FN(pc_set_pressure_sensitivity_enabled));
++  make_func_symbol_func("pc-set-axis-scale!", GOAL_C_FN(pc_set_axis_scale));
++  make_func_symbol_func("pc-get-axis-scale", GOAL_C_FN(pc_get_axis_scale));
++  make_func_symbol_func("pc-current-controller-has-pressure-sensitivity?", GOAL_C_FN(pc_current_controller_has_pressure_sensitivity));
++  make_func_symbol_func("pc-current-controller-has-trigger-effect-support?", GOAL_C_FN(pc_current_controller_has_trigger_effect_support));
++  make_func_symbol_func("pc-get-trigger-effects-enabled?", GOAL_C_FN(pc_get_trigger_effects_enabled));
++  make_func_symbol_func("pc-set-trigger-effects-enabled!", GOAL_C_FN(pc_set_trigger_effects_enabled));
++  make_func_symbol_func("pc-clear-trigger-effect!", GOAL_C_FN(pc_clear_trigger_effect));
++  make_func_symbol_func("pc-send-trigger-effect-feedback!", GOAL_C_FN(pc_send_trigger_effect_feedback));
++  make_func_symbol_func("pc-send-trigger-effect-vibrate!", GOAL_C_FN(pc_send_trigger_effect_vibrate));
++  make_func_symbol_func("pc-send-trigger-effect-weapon!", GOAL_C_FN(pc_send_trigger_effect_weapon));
++  make_func_symbol_func("pc-send-trigger-rumble!", GOAL_C_FN(pc_send_trigger_rumble));
+ 
+   // graphics things
+-  make_func_symbol_func("pc-set-vsync", (void*)pc_set_vsync);
+-  make_func_symbol_func("pc-set-msaa", (void*)pc_set_msaa);
+-  make_func_symbol_func("pc-set-frame-rate", (void*)pc_set_frame_rate);
+-  make_func_symbol_func("pc-set-game-resolution", (void*)pc_set_game_resolution);
+-  make_func_symbol_func("pc-set-brightness-contrast", (void*)pc_set_brightness_contrast);
+-  make_func_symbol_func("pc-set-letterbox", (void*)pc_set_letterbox);
+-  make_func_symbol_func("pc-renderer-tree-set-lod", (void*)pc_renderer_tree_set_lod);
+-  make_func_symbol_func("pc-set-collision-mode", (void*)Gfx::CollisionRendererSetMode);
+-  make_func_symbol_func("pc-set-collision-mask", (void*)pc_set_collision_mask);
+-  make_func_symbol_func("pc-get-collision-mask", (void*)pc_get_collision_mask);
+-  make_func_symbol_func("pc-set-collision-wireframe", (void*)pc_set_collision_wireframe);
+-  make_func_symbol_func("pc-set-collision", (void*)pc_set_collision);
+-  make_func_symbol_func("pc-set-gfx-hack", (void*)pc_set_gfx_hack);
++  make_func_symbol_func("pc-set-vsync", GOAL_C_FN(pc_set_vsync));
++  make_func_symbol_func("pc-set-msaa", GOAL_C_FN(pc_set_msaa));
++  make_func_symbol_func("pc-set-frame-rate", GOAL_C_FN(pc_set_frame_rate));
++  make_func_symbol_func("pc-set-game-resolution", GOAL_C_FN(pc_set_game_resolution));
++  make_func_symbol_func("pc-set-brightness-contrast", GOAL_C_FN(pc_set_brightness_contrast));
++  make_func_symbol_func("pc-set-letterbox", GOAL_C_FN(pc_set_letterbox));
++  make_func_symbol_func("pc-renderer-tree-set-lod", GOAL_C_FN(pc_renderer_tree_set_lod));
++  make_func_symbol_func("pc-set-collision-mode", GOAL_C_FN(Gfx::CollisionRendererSetMode));
++  make_func_symbol_func("pc-set-collision-mask", GOAL_C_FN(pc_set_collision_mask));
++  make_func_symbol_func("pc-get-collision-mask", GOAL_C_FN(pc_get_collision_mask));
++  make_func_symbol_func("pc-set-collision-wireframe", GOAL_C_FN(pc_set_collision_wireframe));
++  make_func_symbol_func("pc-set-collision", GOAL_C_FN(pc_set_collision));
++  make_func_symbol_func("pc-set-gfx-hack", GOAL_C_FN(pc_set_gfx_hack));
+ 
+   // -- OTHER --
+   // Return the current OS as a symbol. Actually returns what it was compiled for!
+-  make_func_symbol_func("pc-get-os", (void*)pc_get_os);
+-  make_func_symbol_func("pc-get-unix-timestamp", (void*)pc_get_unix_timestamp);
+-  make_func_symbol_func("pc-treat-pad0-as-pad1", (void*)pc_treat_pad0_as_pad1);
+-  make_func_symbol_func("pc-is-imgui-visible?", (void*)pc_is_imgui_visible);
++  make_func_symbol_func("pc-get-os", GOAL_C_FN(pc_get_os));
++  make_func_symbol_func("pc-get-unix-timestamp", GOAL_C_FN(pc_get_unix_timestamp));
++  make_func_symbol_func("pc-treat-pad0-as-pad1", GOAL_C_FN(pc_treat_pad0_as_pad1));
++  make_func_symbol_func("pc-is-imgui-visible?", GOAL_C_FN(pc_is_imgui_visible));
+ 
+   // file related functions
+-  make_func_symbol_func("pc-filepath-exists?", (void*)pc_filepath_exists);
+-  make_func_symbol_func("pc-mkdir-file-path", (void*)pc_mkdir_filepath);
++  make_func_symbol_func("pc-filepath-exists?", GOAL_C_FN(pc_filepath_exists));
++  make_func_symbol_func("pc-mkdir-file-path", GOAL_C_FN(pc_mkdir_filepath));
+ 
+   // discord rich presence
+-  make_func_symbol_func("pc-discord-rpc-set", (void*)set_discord_rpc);
++  make_func_symbol_func("pc-discord-rpc-set", GOAL_C_FN(set_discord_rpc));
+ 
+   // profiler
+-  make_func_symbol_func("pc-prof", (void*)pc_prof);
++  make_func_symbol_func("pc-prof", GOAL_C_FN(pc_prof));
+ 
+   // RNG
+-  make_func_symbol_func("pc-rand", (void*)pc_rand);
++  make_func_symbol_func("pc-rand", GOAL_C_FN(pc_rand));
+ 
+   // text
+-  make_func_symbol_func("pc-encode-utf8-string", (void*)pc_encode_utf8_string);
++  make_func_symbol_func("pc-encode-utf8-string", GOAL_C_FN(pc_encode_utf8_string));
+ 
+   // debugging tools
+-  make_func_symbol_func("pc-filter-debug-string?", (void*)pc_filter_debug_string);
+-  make_func_symbol_func("pc-screen-shot", (void*)pc_screen_shot);
+-  make_func_symbol_func("pc-register-screen-shot-settings",
+-                        (void*)pc_register_screen_shot_settings);
++  make_func_symbol_func("pc-filter-debug-string?", GOAL_C_FN(pc_filter_debug_string));
++  make_func_symbol_func("pc-screen-shot", GOAL_C_FN(pc_screen_shot));
++  make_func_symbol_func("pc-register-screen-shot-settings", GOAL_C_FN(pc_register_screen_shot_settings));
+ }
+diff --git a/game/kernel/jak2/kscheme.cpp b/game/kernel/jak2/kscheme.cpp
+index 653125f8..ebc02ce9 100644
+--- a/game/kernel/jak2/kscheme.cpp
++++ b/game/kernel/jak2/kscheme.cpp
+@@ -1,6 +1,11 @@
+ 
+ #include "kscheme.h"
+ #include "game/kernel/common/goal_c_fn.h"
++#ifdef __EMSCRIPTEN__
++namespace jakompiled {
++void register_kernel_primitives();  // web/goal_kernel_web.cpp
++}
++#endif
+ 
+ #include <cstdio>
+ #include <cstring>
+@@ -1709,6 +1714,10 @@ int InitHeapAndSymbol() {
+   Ptr<Type>(u32_in_fixed_sym(FIX_SYM_OBJECT_TYPE))->new_method =
+       make_function_from_c(GOAL_C_FN(alloc_heap_object), true);
+ 
++#ifdef __EMSCRIPTEN__
++  // Jakompiled web: primitives used by the wasm versions of the kernel asm-funcs
++  jakompiled::register_kernel_primitives();
++#endif
+   make_function_symbol_from_c("string->symbol", GOAL_C_FN(intern));
+   make_function_symbol_from_c("print", GOAL_C_FN(sprint));
+   make_function_symbol_from_c("inspect", GOAL_C_FN(inspect_object));
+diff --git a/web/CMakeLists.txt b/web/CMakeLists.txt
+index d302c5e0..fc04a5fb 100644
+--- a/web/CMakeLists.txt
++++ b/web/CMakeLists.txt
+@@ -22,12 +22,15 @@ set(CMAKE_MODULE_PATH ${OG_ROOT}/third-party/cmake/modules/)
+ # -D__linux__: OpenGOAL picks its platform code with #ifdef __linux__ / _WIN32 / __APPLE__.
+ #   Emscripten's libc is musl, so the Linux paths are the right ones; the few that
+ #   really are Linux-only are patched with __EMSCRIPTEN__.
+-set(WEB_FLAGS "-pthread -msimd128 -msse4.2 -fexceptions -D__linux__=1 -D__linux=1")
++# -fwasm-exceptions: native wasm exception handling. The GOAL kernel's non-local exits are C++
++#   exceptions that unwind through GOAL code, and JSPI can't suspend through the JS frames that
++#   Emscripten's JS-based exceptions add.
++set(WEB_FLAGS "-pthread -msimd128 -msse4.2 -fwasm-exceptions -D__linux__=1 -D__linux=1")
+ set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} ${WEB_FLAGS}")
+ set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} ${WEB_FLAGS} \
+   -Wno-c++11-narrowing -Wno-deprecated-this-capture -Wno-missing-field-initializers \
+   -Wno-sign-compare -Wno-ignored-qualifiers -Wno-nontrivial-memaccess -D_CRT_SECURE_NO_WARNINGS")
+-set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -pthread -fexceptions")
++set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -pthread -fwasm-exceptions")
+ set(THIRDPARTY_IGNORED_WARNINGS "-Wno-everything")
+ 
+ function(build_third_party_lib dir_name target_name)
+@@ -95,6 +98,9 @@ target_link_options(gk PRIVATE
+   -sMAXIMUM_MEMORY=4GB
+   # GOAL code is instantiated at runtime and added to the function table
+   -sALLOW_TABLE_GROWTH
++  # JSPI: GOAL process threads are suspendable wasm stacks (web/goal_kernel_web.cpp)
++  -sJSPI
++  -sSTACK_OVERFLOW_CHECK=0
+   -sENVIRONMENT=web,worker
+   -sEXIT_RUNTIME
+   -sFORCE_FILESYSTEM
+diff --git a/web/asm_funcs_web.cpp b/web/asm_funcs_web.cpp
+index 04a60008..af250959 100644
+--- a/web/asm_funcs_web.cpp
++++ b/web/asm_funcs_web.cpp
+@@ -11,8 +11,16 @@
+ #include <cstdlib>
+ #include <cstring>
+ 
++#include "common/goal_constants.h"
++#include "game/kernel/common/kscheme.h"
++
+ extern uint8_t* g_ee_main_mem;
+ 
++namespace jakompiled {
++uint64_t goal_stack_pointer();
++void set_goal_stack_pointer(uint64_t v);
++}  // namespace jakompiled
++
+ namespace {
+ using GoalFunction = uint64_t (*)(uint64_t, uint64_t, uint64_t, uint64_t, uint64_t, uint64_t,
+                                   uint64_t, uint64_t);
+@@ -39,13 +47,24 @@ GoalFunction goal_function(const char* trampoline, const void* function_object)
+ 
+ extern "C" {
+ 
+-// kscheme: call_goal / call_goal_on_stack. The GOAL stack argument is not used yet: GOAL stack
+-// frames live in wasm locals and in the C stack of the calling thread.
++// kscheme: call_goal / call_goal_on_stack. GOAL stack variables live on the GOAL stack, whose
++// pointer is the env.sp global (web/goal_kernel_web.cpp).
+ uint64_t _call_goal_asm_systemv(uint64_t a0, uint64_t a1, uint64_t a2, void* fptr, void*, void*) {
+-  return goal_function("call_goal", fptr)(a0, a1, a2, 0, 0, 0, 0, 0);
++  const uint64_t saved_sp = jakompiled::goal_stack_pointer();
++  if (!saved_sp) {
++    // first call into GOAL: start on the kernel stack, like call_goal_on_stack
++    jakompiled::set_goal_stack_pointer(EE_MAIN_MEM_SIZE - GOAL_STACK_TOP_OFFSET);
++  }
++  const uint64_t result = goal_function("call_goal", fptr)(a0, a1, a2, 0, 0, 0, 0, 0);
++  jakompiled::set_goal_stack_pointer(saved_sp);
++  return result;
+ }
+-uint64_t _call_goal_on_stack_asm_systemv(uint64_t, uint64_t, uint64_t, void* fptr, void*, void*) {
+-  return goal_function("call_goal_on_stack", fptr)(0, 0, 0, 0, 0, 0, 0, 0);
++uint64_t _call_goal_on_stack_asm_systemv(uint64_t rsp, uint64_t, uint64_t, void* fptr, void*, void*) {
++  const uint64_t saved_sp = jakompiled::goal_stack_pointer();
++  jakompiled::set_goal_stack_pointer(rsp - (uint64_t)(uintptr_t)g_ee_main_mem);
++  const uint64_t result = goal_function("call_goal_on_stack", fptr)(0, 0, 0, 0, 0, 0, 0, 0);
++  jakompiled::set_goal_stack_pointer(saved_sp);
++  return result;
+ }
+ 
+ // mips2c: calls from translated C++ back into GOAL
+diff --git a/web/goal_kernel_web.cpp b/web/goal_kernel_web.cpp
+new file mode 100644
+index 00000000..f910b33f
+--- /dev/null
++++ b/web/goal_kernel_web.cpp
+@@ -0,0 +1,300 @@
++// Jakompiled web: runtime primitives behind the wasm versions of the GOAL kernel asm-funcs
++// (goal_src/jak2/kernel/gkernel.gc, gstate.gc, under INSTRUCTION_SET 'wasm).
++//
++// On x86 the kernel switches between processes by saving registers, copying stacks and jumping
++// to saved addresses. Wasm can't do any of that, so:
++//
++//  - Every process main thread runs on its own JSPI stack ("fiber"). The kernel's thread-resume
++//    calls jakompiled-thread-resume, which starts or wakes the fiber and suspends the kernel
++//    (EE thread) until the fiber calls jakompiled-thread-suspend or ends.
++//  - Non-local exits are C++ exceptions (built with -fwasm-exceptions, so they unwind through
++//    GOAL wasm frames and don't put JS frames on the stack, which JSPI can't suspend through):
++//      ThreadExit     return-from-thread, return-from-thread-dead, abandon-thread
++//      ThreadRestart  go, from the main thread: restart the thread on the new state's code
++//      GoalThrow      throw-dispatch: return a value from a catch frame
++//  - Each fiber has its own C stack (Emscripten's __stack_pointer), switched on every resume
++//    and suspend: C++ frames of a suspended fiber must not be overwritten by the kernel.
++//  - The GOAL stack pointer and pp are wasm globals shared by all GOAL modules (env.sp, env.pp);
++//    the GOAL code saves and restores the GOAL stack contents like on x86.
++
++#include <cstdint>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <unordered_map>
++
++#include <emscripten.h>
++
++#include "common/common_types.h"
++#include "common/goal_constants.h"
++#include "common/log/log.h"
++
++#include "game/kernel/common/goal_c_fn.h"
++#include "game/kernel/jak2/kscheme.h"
++
++extern u8* g_ee_main_mem;
++
++namespace {
++
++constexpr u32 kFiberCStackSize = 256 * 1024;
++
++struct ThreadExit {};
++struct ThreadRestart {
++  u64 code;
++  u64 args[4];
++  u64 stack_top;
++};
++struct GoalThrow {
++  u64 frame;
++  u64 value;
++};
++
++using GoalFunction = u64 (*)(u64, u64, u64, u64, u64, u64, u64, u64);
++
++GoalFunction goal_function(u64 function_object) {
++  u32 table_index;
++  memcpy(&table_index, g_ee_main_mem + (u32)function_object, 4);
++  if (!table_index) {
++    lg::die("jakompiled: call to GOAL function object 0x{:x} without wasm code", function_object);
++  }
++  return (GoalFunction)(uintptr_t)table_index;
++}
++
++// C stacks of the fibers, by thread (GOAL address)
++std::unordered_map<u32, u8*> g_fiber_c_stacks;
++
++}  // namespace
++
++// ---- JS side: GOAL globals and fibers. State lives in globalThis.jak of the EE worker.
++
++EM_JS_DEPS(jakompiled_kernel, "$stackSave,$stackRestore");
++
++EM_JS(void, js_kernel_init, (), {
++  if (globalThis.jak) return;
++  globalThis.jak = {
++    sp : new WebAssembly.Global({value : 'i64', mutable : true}, 0n),
++    pp : new WebAssembly.Global({value : 'i64', mutable : true}, 0n),
++    fibers : new Map(),  // thread -> {wake, sp}
++    kernelWake : null,
++    fiberMain : null,
++  };
++});
++
++EM_JS(uint64_t, js_get_sp, (), { return globalThis.jak.sp.value; });
++EM_JS(void, js_set_sp, (uint64_t v), { globalThis.jak.sp.value = v; });
++
++// Kernel side: start (pc != 0) or wake (pc == 0) the fiber of a thread, and wait until it
++// suspends (returns 0) or ends (returns 1).
++// clang-format off
++EM_ASYNC_JS(int, js_resume, (uint32_t thread, uint32_t pc, uint32_t c_stack_top), {
++  const J = globalThis.jak;
++  const kernelSP = stackSave();
++  const finished = await new Promise((resolve) => {
++    J.kernelWake = resolve;
++    if (pc === 0) {
++      const f = J.fibers.get(thread);
++      if (!f || !f.wake) {
++        err(`[jakompiled] thread-resume: thread 0x${thread.toString(16)} has no suspended stack`);
++        resolve(1);
++        return;
++      }
++      const wake = f.wake;
++      f.wake = null;
++      wake();
++    } else {
++      // a new fiber (also when set-to-run reset a suspended thread: its old stack is dropped)
++      J.fibers.set(thread, {wake : null, sp : 0});
++      J.fiberMain ??= WebAssembly.promising(wasmExports['jakompiled_fiber_main']);
++      stackRestore(c_stack_top);
++      J.fiberMain(thread, pc).catch((e) => {
++        err(`[jakompiled] process thread 0x${thread.toString(16)} crashed: ${e}`);
++        J.fibers.delete(thread);
++        J.kernelWake?.(1);
++      });
++    }
++  });
++  stackRestore(kernelSP);
++  return finished;
++});
++
++// Fiber side: give control back to the kernel until it resumes this thread.
++EM_ASYNC_JS(void, js_suspend, (uint32_t thread), {
++  const J = globalThis.jak;
++  const f = J.fibers.get(thread);
++  f.sp = stackSave();
++  const woken = new Promise((resolve) => { f.wake = resolve; });
++  const wake = J.kernelWake;
++  J.kernelWake = null;
++  wake(0);
++  await woken;
++  stackRestore(f.sp);
++});
++// clang-format on
++
++// Fiber side: the fiber's code ended, the kernel can continue.
++EM_JS(void, js_fiber_done, (uint32_t thread), {
++  const J = globalThis.jak;
++  J.fibers.delete(thread);
++  const wake = J.kernelWake;
++  J.kernelWake = null;
++  if (wake) wake(1);
++});
++
++namespace {
++
++u32 g_current_fiber_thread = 0;
++
++u64 get_sp() {
++  return js_get_sp();
++}
++
++void set_sp(u64 v) {
++  js_set_sp(v);
++}
++
++// ---- primitives called from GOAL (registered by register_kernel_primitives)
++
++u64 jakompiled_get_sp() {
++  return get_sp();
++}
++
++void jakompiled_thread_exit() {
++  throw ThreadExit{};
++}
++
++void jakompiled_thread_restart(u64 code, u64 a0, u64 a1, u64 a2, u64 a3, u64 stack_top) {
++  throw ThreadRestart{code, {a0, a1, a2, a3}, stack_top};
++}
++
++void jakompiled_throw(u64 frame, u64 value) {
++  throw GoalThrow{frame, value};
++}
++
++u64 jakompiled_call_on_stack(u64 func, u64 stack_top) {
++  const u64 saved_sp = get_sp();
++  set_sp(stack_top);
++  u64 result = 0;
++  try {
++    result = goal_function(func)(0, 0, 0, 0, 0, 0, 0, 0);
++  } catch (ThreadExit&) {
++    result = 0;
++  }
++  set_sp(saved_sp);
++  return result;
++}
++
++u64 jakompiled_catch(u64 frame, u64 func, u64 param_block) {
++  u64 p[6];
++  memcpy(p, g_ee_main_mem + (u32)param_block, sizeof(p));
++  const u64 saved_sp = get_sp();
++  try {
++    return goal_function(func)(p[0], p[1], p[2], p[3], p[4], p[5], 0, 0);
++  } catch (GoalThrow& t) {
++    if (t.frame != frame) {
++      throw;
++    }
++    set_sp(saved_sp);
++    return t.value;
++  }
++}
++
++void jakompiled_thread_resume(u64 thread, u64 pc, u64 sp) {
++  const u64 kernel_sp = get_sp();
++  const u32 t = (u32)thread;
++  set_sp(sp);
++  u32 c_stack_top = 0;
++  if (pc != 0) {
++    // new fiber: fresh C stack (the old one, if set-to-run reset a suspended thread, is dropped)
++    auto& stack = g_fiber_c_stacks[t];
++    if (!stack) {
++      stack = (u8*)aligned_alloc(16, kFiberCStackSize);
++    }
++    c_stack_top = (u32)(uintptr_t)(stack + kFiberCStackSize);
++  }
++  const u32 prev = g_current_fiber_thread;
++  g_current_fiber_thread = t;
++  const int finished = js_resume(t, (u32)pc, c_stack_top);
++  g_current_fiber_thread = prev;
++  if (finished) {
++    auto it = g_fiber_c_stacks.find(t);
++    if (it != g_fiber_c_stacks.end()) {
++      free(it->second);
++      g_fiber_c_stacks.erase(it);
++    }
++  }
++  set_sp(kernel_sp);
++}
++
++void jakompiled_thread_suspend() {
++  if (!g_current_fiber_thread) {
++    lg::die("jakompiled: suspend outside of a process main thread");
++  }
++  const u32 me = g_current_fiber_thread;
++  js_suspend(me);
++  g_current_fiber_thread = me;
++}
++
++}  // namespace
++
++// Entry of a fiber: run the thread's code (set-to-run-bootstrap), restarting it on go.
++extern "C" EMSCRIPTEN_KEEPALIVE uint64_t jakompiled_fiber_main(uint32_t thread, uint32_t pc) {
++  g_current_fiber_thread = thread;
++  u64 code = pc;
++  u64 args[4] = {0, 0, 0, 0};
++  // on x86 the code of a state is entered with return-from-thread-dead as its return address
++  const u64 return_from_thread_dead = jak2::intern_from_c("return-from-thread-dead")->value();
++  bool exiting = false;
++  for (;;) {
++    try {
++      goal_function(code)(args[0], args[1], args[2], args[3], 0, 0, 0, 0);
++      if (exiting) {
++        break;
++      }
++      // the code returned: continue in return-from-thread-dead (deactivate, back to the kernel)
++      code = return_from_thread_dead;
++      memset(args, 0, sizeof(args));
++      exiting = true;
++    } catch (ThreadRestart& r) {
++      exiting = false;
++      code = r.code;
++      memcpy(args, r.args, sizeof(args));
++      set_sp(r.stack_top);
++    } catch (ThreadExit&) {
++      break;
++    } catch (GoalThrow& t) {
++      lg::error("jakompiled: throw to catch frame 0x{:x} escaped process thread 0x{:x}", t.frame,
++                thread);
++      break;
++    }
++  }
++  js_fiber_done(thread);
++  return 0;
++}
++
++namespace jakompiled {
++
++u64 goal_stack_pointer() {
++  return get_sp();
++}
++
++void set_goal_stack_pointer(u64 v) {
++  set_sp(v);
++}
++
++void kernel_init() {
++  js_kernel_init();
++}
++
++void register_kernel_primitives() {
++  using jak2::make_function_symbol_from_c;
++  make_function_symbol_from_c("jakompiled-get-sp", GOAL_C_FN(jakompiled_get_sp));
++  make_function_symbol_from_c("jakompiled-thread-exit", GOAL_C_FN(jakompiled_thread_exit));
++  make_function_symbol_from_c("jakompiled-thread-restart", GOAL_C_FN(jakompiled_thread_restart));
++  make_function_symbol_from_c("jakompiled-thread-resume", GOAL_C_FN(jakompiled_thread_resume));
++  make_function_symbol_from_c("jakompiled-thread-suspend", GOAL_C_FN(jakompiled_thread_suspend));
++  make_function_symbol_from_c("jakompiled-call-on-stack", GOAL_C_FN(jakompiled_call_on_stack));
++  make_function_symbol_from_c("jakompiled-catch", GOAL_C_FN(jakompiled_catch));
++  make_function_symbol_from_c("jakompiled-throw", GOAL_C_FN(jakompiled_throw));
++}
++
++}  // namespace jakompiled
+diff --git a/web/goal_wasm_link.cpp b/web/goal_wasm_link.cpp
+index 820219d5..dbff74d5 100644
+--- a/web/goal_wasm_link.cpp
++++ b/web/goal_wasm_link.cpp
+@@ -55,7 +55,8 @@ EM_JS(int, jakompiled_instantiate,
+     return 0;
+   }
+   const imports = {
+-    env: { mem: wasmMemory, table: wasmTable, s7: BigInt(s7) },
++    // sp and pp are shared by every GOAL module (web/goal_kernel_web.cpp)
++    env: { mem: wasmMemory, table: wasmTable, s7: BigInt(s7), sp: globalThis.jak.sp, pp: globalThis.jak.pp },
+     seg: { main: BigInt(seg_main), debug: BigInt(seg_debug), "top-level": BigInt(seg_top) },
+     sym: {},
+   };
+@@ -78,6 +79,7 @@ EM_JS(int, jakompiled_instantiate,
+ // clang-format on
+ 
+ namespace jakompiled {
++void kernel_init();
+ 
+ void link_wasm_object(const ObjectFileHeader* ofh, const char* name) {
+   const u32 entry = ofh->code_infos[TOP_LEVEL_SEGMENT].offset + 4;
+@@ -94,6 +96,7 @@ void link_wasm_object(const ObjectFileHeader* ofh, const char* name) {
+     lg::die("jakompiled: object {}: bad wasm module header", name);
+   }
+   lg::debug("[jakompiled] {}: instantiating {} byte wasm module", name, size);
++  kernel_init();
+   if (!jakompiled_instantiate(header + 8, size, s7.offset, ofh->code_infos[0].offset,
+                               ofh->code_infos[1].offset, ofh->code_infos[2].offset, name)) {
+     lg::die("jakompiled: could not load the wasm code of {}", name);
+-- 
+2.43.0
+

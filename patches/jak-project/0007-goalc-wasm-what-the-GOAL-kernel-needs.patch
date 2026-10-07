@@ -1,0 +1,460 @@
+From abb61ad3756dcd6a900d08669cc0aaff5edf230a Mon Sep 17 00:00:00 2001
+From: Jakompiled <itsrufer@gmail.com>
+Date: Wed, 7 Oct 2026 16:52:57 +0000
+Subject: [PATCH 7/9] goalc wasm: what the GOAL kernel needs
+
+- pp and the GOAL stack pointer are mutable i64 globals shared by every
+  module (env.pp, env.sp); registers pinned to r13 (pp) use env.pp and
+  the symbol table register (r14) reads s7
+- stack variables: 16-byte aligned frame on the GOAL stack
+- (break) traps; INSTRUCTION_SET is 'wasm when compiling with goalc-wasm
+- goalc-wasm: compile several files in order (--out-dir), --report and
+  --trap-unsupported (unsupported functions become traps), keep names
+---
+ goalc/compiler/IR.h            |   2 +
+ goalc/compiler/IR_wasm.cpp     |   9 +++
+ goalc/wasm/WasmCodegen.cpp     | 141 +++++++++++++++++++++++++++++++--
+ goalc/wasm/WasmCodegen.h       |  28 +++++++
+ goalc/wasm/goalc_wasm_main.cpp |  51 +++++++++++-
+ 5 files changed, 225 insertions(+), 6 deletions(-)
+
+diff --git a/goalc/compiler/IR.h b/goalc/compiler/IR.h
+index 27daf978..c7aef5e1 100644
+--- a/goalc/compiler/IR.h
++++ b/goalc/compiler/IR.h
+@@ -450,6 +450,7 @@ class IR_GetStackAddr : public IR {
+                         const AllocationResult& allocs,
+                         emitter::IR_Record irec) override;
+ 
++  void do_codegen_wasm(wasm_backend::FunctionGen& gen) override;
+  private:
+   const RegVal* m_dest = nullptr;
+   int m_slot = -1;
+@@ -616,6 +617,7 @@ class IR_AsmBreak : public IR_Asm {
+   void do_codegen_arm64(emitter::ObjectGenerator* gen,
+                         const AllocationResult& allocs,
+                         emitter::IR_Record irec) override;
++  void do_codegen_wasm(wasm_backend::FunctionGen& gen) override;
+ };
+ 
+ class IR_AsmFNop : public IR_Asm {
+diff --git a/goalc/compiler/IR_wasm.cpp b/goalc/compiler/IR_wasm.cpp
+index cf58239d..f6ac5f71 100644
+--- a/goalc/compiler/IR_wasm.cpp
++++ b/goalc/compiler/IR_wasm.cpp
+@@ -445,3 +445,12 @@ void IR_StaticVarLoad::do_codegen_wasm(FunctionGen& gen) {
+ void IR_StaticVarAddr::do_codegen_wasm(FunctionGen& gen) {
+   gen.emit(gen.set(m_dest, gen.mod()->static_addr(m_src)));
+ }
++
++void IR_GetStackAddr::do_codegen_wasm(FunctionGen& gen) {
++  gen.emit(gen.set(m_dest, gen.stack_slot_addr(m_slot)));
++}
++
++void IR_AsmBreak::do_codegen_wasm(FunctionGen& gen) {
++  // (break): an exception on x86 (int3), a trap in wasm
++  gen.emit(BinaryenUnreachable(gen.module()));
++}
+diff --git a/goalc/wasm/WasmCodegen.cpp b/goalc/wasm/WasmCodegen.cpp
+index bafd9b80..e6901c1b 100644
+--- a/goalc/wasm/WasmCodegen.cpp
++++ b/goalc/wasm/WasmCodegen.cpp
+@@ -18,6 +18,7 @@
+ #include "goalc/compiler/StaticObject.h"
+ #include "goalc/debugger/DebugInfo.h"
+ #include "goalc/emitter/ObjectGenerator.h"
++#include "goalc/emitter/Register.h"
+ 
+ #include "fmt/format.h"
+ 
+@@ -79,14 +80,39 @@ BinaryenType FunctionGen::type_of(const RegVal* rv) const {
+   return wasm_type_for_class(rv->ireg().reg_class);
+ }
+ 
++bool FunctionGen::is_pp(const RegVal* rv) const {
++  return m_pp_iregs.count(rv->ireg().id) > 0;
++}
++
+ BinaryenExpressionRef FunctionGen::get(const RegVal* rv) {
++  if (is_pp(rv)) {
++    return m_mod->get_pp();
++  }
++  if (m_st_iregs.count(rv->ireg().id)) {
++    return m_mod->s7();
++  }
+   return BinaryenLocalGet(module(), local_index(rv), type_of(rv));
+ }
+ 
+ BinaryenExpressionRef FunctionGen::set(const RegVal* rv, BinaryenExpressionRef value) {
++  if (is_pp(rv)) {
++    return m_mod->set_pp(value);
++  }
++  if (m_st_iregs.count(rv->ireg().id)) {
++    unsupported("writing the symbol table register");
++  }
+   return BinaryenLocalSet(module(), local_index(rv), value);
+ }
+ 
++BinaryenExpressionRef FunctionGen::stack_slot_addr(int slot) {
++  if (m_frame_base_local < 0 || slot * 8 >= m_stack_frame_size) {
++    throw std::runtime_error("wasm backend: stack slot outside of the function's frame");
++  }
++  return BinaryenBinary(module(), BinaryenAddInt64(),
++                        BinaryenLocalGet(module(), m_frame_base_local, BinaryenTypeInt64()),
++                        BinaryenConst(module(), BinaryenLiteralInt64(slot * 8)));
++}
++
+ BinaryenExpressionRef FunctionGen::goal_addr(BinaryenExpressionRef goal_ptr_i64) {
+   return BinaryenUnary(module(), BinaryenWrapInt64(), goal_ptr_i64);
+ }
+@@ -120,6 +146,9 @@ void FunctionGen::set_params(const std::vector<RegVal*>& args) {
+     unsupported("more than 8 arguments");
+   }
+   for (auto* arg : args) {
++    if (is_pp(arg)) {
++      continue;  // behavior self: comes from pp, not from an argument
++    }
+     if (arg->ireg().reg_class != RegClass::GPR_64) {
+       unsupported("a 128-bit function argument");
+     }
+@@ -142,9 +171,33 @@ void FunctionGen::set_return_reg(const RegVal* rv) {
+   m_return_reg = rv;
+ }
+ 
++void FunctionGen::emit_trap_stub() {
++  std::vector<BinaryenType> params(kGoalArgCount, BinaryenTypeInt64());
++  auto name = m_mod->export_name(m_env);
++  BinaryenAddFunction(module(), name.c_str(),
++                      BinaryenTypeCreate(params.data(), (BinaryenIndex)params.size()),
++                      BinaryenTypeInt64(), nullptr, 0, BinaryenUnreachable(module()));
++  BinaryenAddFunctionExport(module(), name.c_str(), name.c_str());
++}
++
+ void FunctionGen::run() {
+   const auto& code = m_env->code();
+ 
++  // registers pinned to a physical register for the whole function: pp becomes the pp global,
++  // anything else is x86-specific code that has no wasm meaning
++  for (auto& c : m_env->constraints()) {
++    if (!c.contrain_everywhere) {
++      continue;
++    }
++    if (c.desired_register == emitter::R13) {
++      m_pp_iregs[c.ireg.id] = true;
++    } else if (c.desired_register == emitter::R14) {
++      m_st_iregs[c.ireg.id] = true;  // symbol table register: s7
++    } else {
++      unsupported(fmt::format("a variable pinned to register {}", c.desired_register.print(emitter::InstructionSet::X86)));
++    }
++  }
++
+   // the arguments have to be known before any other local is created
+   bool has_params = false;
+   for (auto& ir : code) {
+@@ -158,6 +211,25 @@ void FunctionGen::run() {
+     set_params({});
+   }
+ 
++  // stack variables: reserve a 16-byte aligned frame on the GOAL stack
++  m_stack_frame_size = m_env->stack_slots_used_for_stack_vars() * 8;
++  std::vector<BinaryenExpressionRef> prologue;
++  if (m_stack_frame_size > 0) {
++    m_saved_sp_local = (int)m_local_types.size();
++    m_local_types.push_back(BinaryenTypeInt64());
++    m_frame_base_local = (int)m_local_types.size();
++    m_local_types.push_back(BinaryenTypeInt64());
++    prologue.push_back(BinaryenLocalSet(module(), m_saved_sp_local, m_mod->get_sp()));
++    auto new_sp = BinaryenBinary(
++        module(), BinaryenAndInt64(),
++        BinaryenBinary(module(), BinaryenSubInt64(), m_mod->get_sp(),
++                       BinaryenConst(module(), BinaryenLiteralInt64(m_stack_frame_size))),
++        BinaryenConst(module(), BinaryenLiteralInt64(-16)));
++    prologue.push_back(BinaryenLocalSet(module(), m_frame_base_local, new_sp));
++    prologue.push_back(
++        m_mod->set_sp(BinaryenLocalGet(module(), m_frame_base_local, BinaryenTypeInt64())));
++  }
++
+   // basic block leaders: function start, branch targets and instructions after a branch
+   std::set<int> leaders = {0};
+   for (int i = 0; i < (int)code.size(); i++) {
+@@ -198,8 +270,15 @@ void FunctionGen::run() {
+     blocks[b].falls_through = m_cur_falls_through;
+   }
+ 
++  // prologue at the start of the entry block
++  blocks.front().exprs.insert(blocks.front().exprs.begin(), prologue.begin(), prologue.end());
++
+   // the exit block returns the return register (functions returning none return 0)
+   auto& exit_block = blocks.back();
++  if (m_stack_frame_size > 0) {
++    exit_block.exprs.push_back(
++        m_mod->set_sp(BinaryenLocalGet(module(), m_saved_sp_local, BinaryenTypeInt64())));
++  }
+   if (m_return_reg) {
+     exit_block.exprs.push_back(BinaryenReturn(module(), get(m_return_reg)));
+   } else {
+@@ -285,6 +364,34 @@ BinaryenExpressionRef ModuleGen::s7() {
+   return import_global(kEnvModule, kS7Global, "s7");
+ }
+ 
++void ModuleGen::import_mutable_global(const char* name) {
++  auto key = std::string(kEnvModule) + "." + name;
++  if (m_imported_globals.find(key) == m_imported_globals.end()) {
++    BinaryenAddGlobalImport(m_module, name, kEnvModule, name, BinaryenTypeInt64(), true);
++    m_imported_globals[key] = name;
++  }
++}
++
++BinaryenExpressionRef ModuleGen::get_pp() {
++  import_mutable_global(kPPGlobal);
++  return BinaryenGlobalGet(m_module, kPPGlobal, BinaryenTypeInt64());
++}
++
++BinaryenExpressionRef ModuleGen::set_pp(BinaryenExpressionRef value) {
++  import_mutable_global(kPPGlobal);
++  return BinaryenGlobalSet(m_module, kPPGlobal, value);
++}
++
++BinaryenExpressionRef ModuleGen::get_sp() {
++  import_mutable_global(kSPGlobal);
++  return BinaryenGlobalGet(m_module, kSPGlobal, BinaryenTypeInt64());
++}
++
++BinaryenExpressionRef ModuleGen::set_sp(BinaryenExpressionRef value) {
++  import_mutable_global(kSPGlobal);
++  return BinaryenGlobalSet(m_module, kSPGlobal, value);
++}
++
+ BinaryenExpressionRef ModuleGen::symbol_addr(const std::string& name) {
+   return import_global(kSymbolModule, name, "sym:" + name);
+ }
+@@ -341,13 +448,35 @@ std::string ModuleGen::export_name(const FunctionEnv* f) const {
+ }
+ 
+ std::vector<u8> ModuleGen::run() {
++  bool failed = false;
+   for (auto& f : m_env->functions()) {
+-    if (f->is_asm_func) {
+-      throw std::runtime_error(
+-          fmt::format("wasm backend: asm-func {} needs a hand-written wasm version", f->name()));
++    try {
++      if (f->is_asm_func) {
++        throw std::runtime_error(
++            fmt::format("wasm backend: asm-func {} needs a hand-written wasm version", f->name()));
++      }
++      FunctionGen fg(this, f.get());
++      fg.run();
++    } catch (std::exception& e) {
++      if (!m_options.unsupported_report) {
++        throw;
++      }
++      m_options.unsupported_report->push_back(fmt::format("{}: {}", m_env->name(), e.what()));
++      if (m_options.trap_unsupported) {
++        // a partially built function may have been added: replace it with the trap stub
++        auto name = export_name(f.get());
++        if (BinaryenGetFunction(m_module, name.c_str())) {
++          BinaryenRemoveExport(m_module, name.c_str());
++          BinaryenRemoveFunction(m_module, name.c_str());
++        }
++        FunctionGen(this, f.get()).emit_trap_stub();
++      } else {
++        failed = true;
++      }
+     }
+-    FunctionGen fg(this, f.get());
+-    fg.run();
++  }
++  if (failed) {
++    throw std::runtime_error(fmt::format("wasm backend: {} has unsupported code", m_env->name()));
+   }
+   if (m_layout) {
+     add_link_function();
+@@ -361,6 +490,8 @@ std::vector<u8> ModuleGen::run() {
+     BinaryenSetShrinkLevel(0);
+     BinaryenModuleOptimize(m_module);
+   }
++  // keep the name section: stack traces in the browser show GOAL function names
++  BinaryenSetDebugInfo(true);
+   auto result = BinaryenModuleAllocateAndWrite(m_module, nullptr);
+   std::vector<u8> bytes((u8*)result.binary, (u8*)result.binary + result.binaryBytes);
+   free(result.binary);
+diff --git a/goalc/wasm/WasmCodegen.h b/goalc/wasm/WasmCodegen.h
+index f912c050..06a3b8cd 100644
+--- a/goalc/wasm/WasmCodegen.h
++++ b/goalc/wasm/WasmCodegen.h
+@@ -21,6 +21,10 @@
+  *    function's index in the imported table. Calls load it and use call_indirect.
+  *  - s7 (symbol table) and every symbol / function object used are imported i64 globals, so the
+  *    loader decides their addresses when it instantiates the module.
++ *  - pp (the current process, r13 on x86) and the GOAL stack pointer are mutable i64 globals
++ *    shared by every module (env.pp, env.sp). Registers the compiler pins to pp (behavior self,
++ *    rlet on r13) read and write env.pp. Functions with stack variables reserve a 16-byte aligned
++ *    frame on the GOAL stack, which lives in GOAL memory like on the PS2.
+  */
+ 
+ #include <cstdint>
+@@ -47,6 +51,8 @@ constexpr const char* kEnvModule = "env";
+ constexpr const char* kMemoryName = "mem";
+ constexpr const char* kTableName = "table";
+ constexpr const char* kS7Global = "s7";
++constexpr const char* kPPGlobal = "pp";  // current process
++constexpr const char* kSPGlobal = "sp";  // GOAL stack pointer
+ constexpr const char* kSymbolModule = "sym";     // sym.<name>: GOAL address of a symbol
+ constexpr const char* kFunctionModule = "func";  // func.<name>: GOAL address of a function
+ constexpr const char* kSegmentModule = "seg";    // seg.<n>: GOAL address of segment n
+@@ -74,6 +80,12 @@ struct Layout {
+ struct Options {
+   bool shared_memory = false;  // the runtime uses a SharedArrayBuffer (pthreads)
+   bool optimize = true;        // run Binaryen's optimizer (-O2)
++  // instead of stopping at the first unsupported IR instruction, collect one message per
++  // function in this list and throw at the end (goalc-wasm --report)
++  std::vector<std::string>* unsupported_report = nullptr;
++  // compile functions the backend can't handle yet to a stub that traps ("unreachable"), and
++  // list them in unsupported_report, instead of failing the whole object
++  bool trap_unsupported = false;
+ };
+ 
+ class ModuleGen;
+@@ -102,6 +114,11 @@ class FunctionGen {
+   void set_goto(int target_ir);
+   void set_params(const std::vector<RegVal*>& args);
+   void set_return_reg(const RegVal* rv);
++  // replace this function's body with a trap (Options::trap_unsupported)
++  void emit_trap_stub();
++
++  // address of a stack variable slot (IR_GetStackAddr)
++  BinaryenExpressionRef stack_slot_addr(int slot);
+ 
+   // GOAL memory helpers: address operand and immediate offset for a GOAL pointer + offset
+   BinaryenExpressionRef goal_addr(BinaryenExpressionRef goal_ptr_i64);
+@@ -119,6 +136,7 @@ class FunctionGen {
+   };
+ 
+   int local_index(const RegVal* rv);
++  bool is_pp(const RegVal* rv) const;
+ 
+   ModuleGen* m_mod;
+   FunctionEnv* m_env;
+@@ -130,6 +148,11 @@ class FunctionGen {
+   int m_cur_branch_target = -1;
+   BinaryenExpressionRef m_cur_branch_cond = nullptr;
+   bool m_cur_falls_through = true;
++  std::unordered_map<int, bool> m_pp_iregs;  // iregs pinned to pp everywhere
++  std::unordered_map<int, bool> m_st_iregs;  // iregs pinned to the symbol table register
++  int m_stack_frame_size = 0;                // bytes of stack variables
++  int m_saved_sp_local = -1;                 // sp at entry, restored at exit
++  int m_frame_base_local = -1;               // start of this function's stack frame
+ };
+ 
+ /*!
+@@ -145,6 +168,10 @@ class ModuleGen {
+   GameVersion version() const { return m_version; }
+ 
+   BinaryenExpressionRef s7();
++  BinaryenExpressionRef get_pp();
++  BinaryenExpressionRef set_pp(BinaryenExpressionRef value);
++  BinaryenExpressionRef get_sp();
++  BinaryenExpressionRef set_sp(BinaryenExpressionRef value);
+   BinaryenExpressionRef symbol_addr(const std::string& name);
+   BinaryenExpressionRef function_addr(const FunctionEnv* f);
+   BinaryenExpressionRef static_addr(const StaticObject* s);
+@@ -156,6 +183,7 @@ class ModuleGen {
+                                       const std::string& field,
+                                       const std::string& internal);
+   BinaryenExpressionRef segment_addr(int seg, int offset);
++  void import_mutable_global(const char* name);
+   void add_link_function();
+ 
+   FileEnv* m_env;
+diff --git a/goalc/wasm/goalc_wasm_main.cpp b/goalc/wasm/goalc_wasm_main.cpp
+index 85a6bd9d..faa8cb5d 100644
+--- a/goalc/wasm/goalc_wasm_main.cpp
++++ b/goalc/wasm/goalc_wasm_main.cpp
+@@ -3,6 +3,12 @@
+  *
+  *   goalc-wasm [--game jak2] [--proj-path dir] [--no-opt] [--shared-memory] [--print-ir]
+  *              <in.gc> <out.wasm | out.o>
++ *   goalc-wasm [options] [--report] --out-dir <dir> <in1.gc> <in2.gc> ...
++ *
++ * With --out-dir, the files are compiled in order by the same compiler (like a DGO build, where
++ * each file sees the types and symbols defined by the previous ones) to <dir>/<name>.o.
++ * --report lists every function the backend can't compile yet instead of stopping at the first.
++ * --trap-unsupported compiles those functions to a stub that traps, so the object still builds.
+  *
+  * With a .o output it writes a GOAL object file for the wasm runtime (static data, function
+  * objects and the embedded module, see codegen_wasm_object) and the module next to it (.wasm).
+@@ -27,6 +33,8 @@ int main(int argc, char** argv) {
+   std::string game = "jak2";
+   wasm_backend::Options options;
+   bool print_ir = false;
++  bool report = false;
++  std::optional<fs::path> out_dir;
+   std::optional<fs::path> proj_path;
+   std::vector<std::string> positional;
+   for (int i = 1; i < argc; i++) {
+@@ -39,13 +47,20 @@ int main(int argc, char** argv) {
+       options.optimize = false;
+     } else if (a == "--shared-memory") {
+       options.shared_memory = true;
++    } else if (a == "--report") {
++      report = true;
++    } else if (a == "--trap-unsupported") {
++      report = true;
++      options.trap_unsupported = true;
++    } else if (a == "--out-dir" && i + 1 < argc) {
++      out_dir = fs::path(argv[++i]);
+     } else if (a == "--print-ir") {
+       print_ir = true;
+     } else {
+       positional.push_back(a);
+     }
+   }
+-  if (positional.size() != 2) {
++  if (out_dir ? positional.empty() : positional.size() != 2) {
+     fprintf(stderr,
+             "usage: goalc-wasm [--game jak2] [--proj-path dir] [--no-opt] [--shared-memory] "
+             "[--print-ir] in.gc out.wasm\n");
+@@ -58,6 +73,40 @@ int main(int argc, char** argv) {
+ 
+   const auto version = game_name_to_version(game);
+   Compiler compiler(version, emitter::InstructionSet::X86);
++  // GOAL source can select wasm-specific code with (#cond ((eq? INSTRUCTION_SET 'wasm) ...))
++  compiler.get_goos().set_global_variable_to_symbol("INSTRUCTION_SET", "wasm");
++
++  if (out_dir) {
++    std::vector<std::string> unsupported;
++    if (report) {
++      options.unsupported_report = &unsupported;
++    }
++    int failed = 0;
++    for (auto& input : positional) {
++      const auto path = fs::absolute(input).string();
++      const auto name = fs::path(input).stem().string();
++      try {
++        auto code = compiler.get_goos().reader.read_from_file({path});
++        auto* file_env = compiler.compile_object_file(name, code, true);
++        auto obj = wasm_backend::codegen_wasm_object(file_env, version, &compiler.type_system(),
++                                                     options);
++        auto out = fs::absolute(*out_dir) / (name + ".o");
++        file_util::write_binary_file(out, obj.object.data(), obj.object.size());
++        printf("%s: %zu bytes (module %zu bytes), %zu functions\n", out.string().c_str(),
++               obj.object.size(), obj.module.size(), file_env->functions().size());
++      } catch (std::exception& e) {
++        failed++;
++        printf("FAILED %s: %s\n", name.c_str(), e.what());
++        if (!report) {
++          return 1;
++        }
++      }
++    }
++    for (auto& line : unsupported) {
++      printf("  %s\n", line.c_str());
++    }
++    return failed ? 1 : 0;
++  }
+   // the reader resolves relative paths against the project directory
+   const auto in = fs::absolute(positional[0]).string();
+   auto code = compiler.get_goos().reader.read_from_file({in});
+-- 
+2.43.0
+
