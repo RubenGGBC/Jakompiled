@@ -16,7 +16,7 @@
   (+ (shl a n) (sar a 2) (shr a 1)))
 
 (defun t-logic ((a int) (b int))
-  (logxor (logand a b) (logior a 7) (lognot b)))
+  (logxor (logxor (logand a b) (logior a 7)) (lognot b)))
 
 ;; ---- control de flujo
 (defun t-cond ((x int))
@@ -44,6 +44,8 @@
   (> x 3))
 
 ;; ---- llamadas (a través del símbolo, como en el juego)
+(define-extern t-fact (function int int))
+
 (defun t-fact ((n int))
   (if (<= n 1)
       1

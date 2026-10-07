@@ -1,5 +1,7 @@
 // Fase 3: carga un módulo generado por goalc-wasm, lo enlaza y comprueba cada función.
-// Uso: node run_tests.mjs tests/basic.wasm
+// Uso: node run_tests.mjs tests/basic.wasm [tests/basic.oracle-x86.txt]
+//   El segundo argumento compara, caso a caso, con los resultados del x86 real de goalc
+//   (generados por oracle/goal_oracle.cpp).
 import { readFileSync } from "node:fs";
 
 const EE_BASE = 0x01000000; // WASM_EE_MAIN_MEM_BASE (common/goal_constants.h)
@@ -77,7 +79,7 @@ for (const [x, want] of [[0, 0n], [5, 1n], [10, 0n]]) check(`t-bool ${x}`, call(
 check("t-sym-bool 5 == #t", call("t-sym-bool", 5), BigInt(S7 + TRUE_OFF));
 check("t-sym-bool 1 == #f", call("t-sym-bool", 1), BigInt(S7));
 check("t-fact 10 (recursiva, vía símbolo)", call("t-fact", 10), 3628800n);
-check("t-fact 20", call("t-fact", 20), 2432902008176640000n);
+check("t-fact 20 (multiplicación de 32 bits, como en PS2)", call("t-fact", 20), -2102132736n);
 check("t-call3 1 2 3", call("t-call3", 1, 2, 3), 6n);
 check("t-global-set 7", call("t-global-set", 7), 21n);
 check("*t-global* en memoria", symValue("*t-global*"), 21);
@@ -105,6 +107,28 @@ check("t-fcmp 1 2", call("t-fcmp", f32bits(1), f32bits(2)), 1n);
 check("t-fcmp 2 2", call("t-fcmp", f32bits(2), f32bits(2)), 10n);
 check("t-fcmp 3 2", call("t-fcmp", f32bits(3), f32bits(2)), 100n);
 check("t-fcmp NaN 2 (comiss: < y = ciertos)", call("t-fcmp", f32bits(NaN), f32bits(2)), 11n);
+
+// ---- comparación con el x86 nativo de goalc
+if (process.argv[3]) {
+  console.log("\n== comparación con x86 (goalc nativo)");
+  let same = 0, diff = 0;
+  for (const line of readFileSync(process.argv[3], "utf8").split("\n")) {
+    const m = line.match(/^ORACLE \((\S+)(.*)\) => (-?\d+)$/);
+    if (!m) continue;
+    const [, fn, argText, nativeText] = m;
+    const args = [...argText.matchAll(/\(the-as float #x([0-9a-f]+)\)|(-?\d+)/g)].map((a) =>
+      a[1] !== undefined ? BigInt("0x" + a[1]) : BigInt(a[2]));
+    const wasm = BigInt.asIntN(64, ex[fn](...args));
+    const native = BigInt(nativeText);
+    if (wasm === native) same++;
+    else {
+      diff++;
+      console.log(`DIFF (${fn}${argText}): wasm ${wasm}, x86 ${native}`);
+    }
+  }
+  console.log(`${same} iguales a x86, ${diff} distintos`);
+  if (diff) fail += diff;
+}
 
 console.log(`\n${pass} ok, ${fail} fallos`);
 process.exit(fail ? 1 : 0);

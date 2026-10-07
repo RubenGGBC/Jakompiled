@@ -1,0 +1,1283 @@
+From 03543419775d5d66bc4838e2648267bddbb485d2 Mon Sep 17 00:00:00 2001
+From: Jakompiled <itsrufer@gmail.com>
+Date: Wed, 7 Oct 2026 15:36:48 +0000
+Subject: [PATCH 4/4] goalc: WebAssembly backend (first subset)
+
+Translates goalc IR to wasm with Binaryen, without register allocation:
+every IRegister becomes a wasm local and basic blocks are structured by
+Binaryen's Relooper. Covers integer and float math, conditional branches,
+calls through symbols (call_indirect), symbol values, memory loads and
+stores and float constants. Corner cases follow the x86 backend bit for
+bit (cvttss2si, minss/maxss, comiss with NaN, 32-bit ops sign extension).
+
+goalc-wasm compiles a .gc file to a .wasm module. Binaryen is required:
+configure with -DBINARYEN_ROOT=<prefix>.
+---
+ common/goal_constants.h        |   8 +-
+ goalc/CMakeLists.txt           |  14 ++
+ goalc/compiler/IR.h            |  31 +++
+ goalc/compiler/IR_wasm.cpp     | 430 +++++++++++++++++++++++++++++++++
+ goalc/wasm/WasmCodegen.cpp     | 317 ++++++++++++++++++++++++
+ goalc/wasm/WasmCodegen.h       | 144 +++++++++++
+ goalc/wasm/goalc_wasm_main.cpp |  83 +++++++
+ 7 files changed, 1024 insertions(+), 3 deletions(-)
+ create mode 100644 goalc/compiler/IR_wasm.cpp
+ create mode 100644 goalc/wasm/WasmCodegen.cpp
+ create mode 100644 goalc/wasm/WasmCodegen.h
+ create mode 100644 goalc/wasm/goalc_wasm_main.cpp
+
+diff --git a/common/goal_constants.h b/common/goal_constants.h
+index d7324726..ceeda326 100644
+--- a/common/goal_constants.h
++++ b/common/goal_constants.h
+@@ -108,12 +108,14 @@ constexpr u32 GOAL_MEMUSAGE_METHOD = 8;  // method ID of GOAL mem-usage
+ constexpr int EE_MAIN_MEM_LOW_PROTECT = 512 * 1024;
+ constexpr int EE_MAIN_MEM_SIZE = 128 * (1 << 20);  // 128 MB, same as PS2 TOOL
+ constexpr u64 EE_MAIN_MEM_MAP = 0x2123000000;      // intentionally > 32-bit to catch pointer bugs
+-#ifdef __EMSCRIPTEN__
+ // Jakompiled web: EE memory lives at a fixed address of the wasm linear memory, so a
+ // GOAL pointer maps to a wasm address by a constant offset that compiled GOAL code can
+ // fold into the immediate offset of its loads and stores. The linker must place
+-// everything else above it (-sGLOBAL_BASE >= WEB_EE_MAIN_MEM_BASE + EE_MAIN_MEM_SIZE).
+-constexpr u32 WEB_EE_MAIN_MEM_BASE = 0x01000000;
++// everything else above it (-sGLOBAL_BASE >= WASM_EE_MAIN_MEM_BASE + EE_MAIN_MEM_SIZE).
++// Shared by the runtime (Emscripten build) and goalc's wasm backend.
++constexpr u32 WASM_EE_MAIN_MEM_BASE = 0x01000000;
++#ifdef __EMSCRIPTEN__
++constexpr u32 WEB_EE_MAIN_MEM_BASE = WASM_EE_MAIN_MEM_BASE;
+ #endif
+ 
+ // when true, attempt to map the EE memory in the low 2 GB of RAM
+diff --git a/goalc/CMakeLists.txt b/goalc/CMakeLists.txt
+index 0c93cb38..abd7948d 100644
+--- a/goalc/CMakeLists.txt
++++ b/goalc/CMakeLists.txt
+@@ -42,6 +42,8 @@ add_library(compiler
+         compiler/Env.cpp
+         compiler/Val.cpp
+         compiler/IR.cpp
++        compiler/IR_wasm.cpp
++        wasm/WasmCodegen.cpp
+         compiler/CompilerSettings.cpp
+         compiler/CodeGenerator.cpp
+         compiler/StaticObject.cpp
+@@ -87,17 +89,29 @@ add_library(compiler
+ 
+ target_link_libraries(compiler common Zydis capstone tiny_gltf decomp)
+ 
++# Jakompiled: the wasm backend emits modules through Binaryen (https://github.com/WebAssembly/binaryen)
++set(BINARYEN_ROOT "" CACHE PATH "Binaryen install prefix (include/binaryen-c.h, lib/libbinaryen)")
++if(NOT BINARYEN_ROOT)
++    message(FATAL_ERROR "goalc's wasm backend needs Binaryen: configure with -DBINARYEN_ROOT=<prefix>")
++endif()
++find_library(BINARYEN_LIB binaryen PATHS ${BINARYEN_ROOT}/lib NO_DEFAULT_PATH REQUIRED)
++target_include_directories(compiler SYSTEM PUBLIC ${BINARYEN_ROOT}/include)
++target_link_libraries(compiler ${BINARYEN_LIB})
++set_target_properties(compiler PROPERTIES INSTALL_RPATH ${BINARYEN_ROOT}/lib)
++
+ if (WIN32)
+     target_link_libraries(compiler mman)
+ endif ()
+ 
+ add_executable(goalc main.cpp)
+ add_executable(goalc-simple simple_main.cpp)
++add_executable(goalc-wasm wasm/goalc_wasm_main.cpp)
+ 
+ add_executable(build_level build_level/main.cpp)
+ add_executable(build_actor build_actor/main.cpp)
+ 
+ target_link_libraries(goalc common Zydis capstone compiler)
+ target_link_libraries(goalc-simple common Zydis capstone compiler)
++target_link_libraries(goalc-wasm common compiler)
+ target_link_libraries(build_level common Zydis capstone compiler)
+ target_link_libraries(build_actor common Zydis capstone compiler)
+diff --git a/goalc/compiler/IR.h b/goalc/compiler/IR.h
+index 5d0b027b..90882af0 100644
+--- a/goalc/compiler/IR.h
++++ b/goalc/compiler/IR.h
+@@ -9,6 +9,10 @@
+ #include "goalc/emitter/Register.h"
+ #include "goalc/regalloc/allocator_interface.h"
+ 
++namespace wasm_backend {
++class FunctionGen;
++}
++
+ class IR {
+  public:
+   virtual std::string print() = 0;
+@@ -23,6 +27,10 @@ class IR {
+     (void)constraints;
+     (void)my_id;
+   }
++  // Jakompiled wasm backend (goalc/compiler/IR_wasm.cpp)
++  virtual void do_codegen_wasm(wasm_backend::FunctionGen& gen);
++  // IR index this instruction may jump to, or -1
++  virtual int wasm_branch_target() const { return -1; }
+   virtual ~IR() = default;
+ };
+ 
+@@ -40,6 +48,7 @@ class IR_Return : public IR {
+                         emitter::IR_Record irec) override;
+   const RegVal* value() { return m_value; }
+ 
++  void do_codegen_wasm(wasm_backend::FunctionGen& gen) override;
+  protected:
+   const RegVal* m_return_reg = nullptr;
+   const RegVal* m_value = nullptr;
+@@ -58,6 +67,7 @@ class IR_LoadConstant64 : public IR {
+                         const AllocationResult& allocs,
+                         emitter::IR_Record irec) override;
+ 
++  void do_codegen_wasm(wasm_backend::FunctionGen& gen) override;
+  protected:
+   const RegVal* m_dest = nullptr;
+   u64 m_value = 0;
+@@ -75,6 +85,7 @@ class IR_LoadSymbolPointer : public IR {
+                         const AllocationResult& allocs,
+                         emitter::IR_Record irec) override;
+ 
++  void do_codegen_wasm(wasm_backend::FunctionGen& gen) override;
+  protected:
+   const RegVal* m_dest = nullptr;
+   std::string m_name;
+@@ -92,6 +103,7 @@ class IR_SetSymbolValue : public IR {
+                         const AllocationResult& allocs,
+                         emitter::IR_Record irec) override;
+ 
++  void do_codegen_wasm(wasm_backend::FunctionGen& gen) override;
+  protected:
+   const SymbolVal* m_dest = nullptr;
+   const RegVal* m_src = nullptr;
+@@ -109,6 +121,7 @@ class IR_GetSymbolValue : public IR {
+                         const AllocationResult& allocs,
+                         emitter::IR_Record irec) override;
+ 
++  void do_codegen_wasm(wasm_backend::FunctionGen& gen) override;
+  protected:
+   const RegVal* m_dest = nullptr;
+   const SymbolVal* m_src = nullptr;
+@@ -127,6 +140,7 @@ class IR_RegSet : public IR {
+                         const AllocationResult& allocs,
+                         emitter::IR_Record irec) override;
+ 
++  void do_codegen_wasm(wasm_backend::FunctionGen& gen) override;
+  protected:
+   const RegVal* m_dest = nullptr;
+   const RegVal* m_src = nullptr;
+@@ -149,6 +163,7 @@ class IR_FunctionCall : public IR {
+                         emitter::IR_Record irec) override;
+   void add_constraints(std::vector<IRegConstraint>* constraints, int my_id) override;
+ 
++  void do_codegen_wasm(wasm_backend::FunctionGen& gen) override;
+  protected:
+   const RegVal* m_func = nullptr;
+   const RegVal* m_ret = nullptr;
+@@ -203,6 +218,7 @@ class IR_StaticVarLoad : public IR {
+                         const AllocationResult& allocs,
+                         emitter::IR_Record irec) override;
+ 
++  void do_codegen_wasm(wasm_backend::FunctionGen& gen) override;
+  protected:
+   const RegVal* m_dest = nullptr;
+   const StaticObject* m_src = nullptr;
+@@ -220,6 +236,7 @@ class IR_FunctionAddr : public IR {
+                         const AllocationResult& allocs,
+                         emitter::IR_Record irec) override;
+ 
++  void do_codegen_wasm(wasm_backend::FunctionGen& gen) override;
+  protected:
+   const RegVal* m_dest = nullptr;
+   FunctionEnv* m_src = nullptr;
+@@ -266,6 +283,7 @@ class IR_IntegerMath : public IR {
+                         emitter::IR_Record irec) override;
+   IntegerMathKind get_kind() const { return m_kind; }
+ 
++  void do_codegen_wasm(wasm_backend::FunctionGen& gen) override;
+  protected:
+   IntegerMathKind m_kind;
+   RegVal* m_dest;
+@@ -289,6 +307,7 @@ class IR_FloatMath : public IR {
+                         emitter::IR_Record irec) override;
+   FloatMathKind get_kind() const { return m_kind; }
+ 
++  void do_codegen_wasm(wasm_backend::FunctionGen& gen) override;
+  protected:
+   FloatMathKind m_kind;
+   RegVal* m_dest;
+@@ -321,6 +340,8 @@ class IR_GotoLabel : public IR {
+                         const AllocationResult& allocs,
+                         emitter::IR_Record irec) override;
+ 
++  void do_codegen_wasm(wasm_backend::FunctionGen& gen) override;
++  int wasm_branch_target() const override;
+  protected:
+   const Label* m_dest = nullptr;
+   bool m_resolved = false;
+@@ -342,6 +363,8 @@ class IR_ConditionalBranch : public IR {
+   Condition condition;
+   Label label;
+ 
++  void do_codegen_wasm(wasm_backend::FunctionGen& gen) override;
++  int wasm_branch_target() const override;
+  private:
+   bool m_resolved = false;
+ };
+@@ -357,6 +380,7 @@ class IR_Null : public IR {
+   void do_codegen_arm64(emitter::ObjectGenerator* gen,
+                         const AllocationResult& allocs,
+                         emitter::IR_Record irec) override;
++  void do_codegen_wasm(wasm_backend::FunctionGen& gen) override;
+ };
+ 
+ class IR_ValueReset : public IR {
+@@ -371,6 +395,8 @@ class IR_ValueReset : public IR {
+                         const AllocationResult& allocs,
+                         emitter::IR_Record irec) override;
+ 
++  void do_codegen_wasm(wasm_backend::FunctionGen& gen) override;
++  const std::vector<RegVal*>& args() const { return m_args; }
+  private:
+   std::vector<RegVal*> m_args;
+ };
+@@ -387,6 +413,7 @@ class IR_FloatToInt : public IR {
+                         const AllocationResult& allocs,
+                         emitter::IR_Record irec) override;
+ 
++  void do_codegen_wasm(wasm_backend::FunctionGen& gen) override;
+  private:
+   const RegVal* m_dest = nullptr;
+   const RegVal* m_src = nullptr;
+@@ -404,6 +431,7 @@ class IR_IntToFloat : public IR {
+                         const AllocationResult& allocs,
+                         emitter::IR_Record irec) override;
+ 
++  void do_codegen_wasm(wasm_backend::FunctionGen& gen) override;
+  private:
+   const RegVal* m_dest = nullptr;
+   const RegVal* m_src = nullptr;
+@@ -437,6 +465,7 @@ class IR_Nop : public IR {
+   void do_codegen_arm64(emitter::ObjectGenerator* gen,
+                         const AllocationResult& allocs,
+                         emitter::IR_Record irec) override;
++  void do_codegen_wasm(wasm_backend::FunctionGen& gen) override;
+ };
+ 
+ class IR_Asm : public IR {
+@@ -464,6 +493,7 @@ class IR_LoadConstOffset : public IR_Asm {
+                         const AllocationResult& allocs,
+                         emitter::IR_Record irec) override;
+ 
++  void do_codegen_wasm(wasm_backend::FunctionGen& gen) override;
+  private:
+   const RegVal* m_dest = nullptr;
+   int m_offset = 0;
+@@ -487,6 +517,7 @@ class IR_StoreConstOffset : public IR_Asm {
+                         const AllocationResult& allocs,
+                         emitter::IR_Record irec) override;
+ 
++  void do_codegen_wasm(wasm_backend::FunctionGen& gen) override;
+  private:
+   const RegVal* m_value = nullptr;
+   int m_offset = 0;
+diff --git a/goalc/compiler/IR_wasm.cpp b/goalc/compiler/IR_wasm.cpp
+new file mode 100644
+index 00000000..3cda804a
+--- /dev/null
++++ b/goalc/compiler/IR_wasm.cpp
+@@ -0,0 +1,430 @@
++/*!
++ * @file IR_wasm.cpp
++ * WebAssembly code generation for each IR instruction (Jakompiled).
++ *
++ * Every function here reproduces the exact result of the x86 codegen in IR.cpp, including the
++ * corner cases x86 defines and wasm doesn't (or defines differently): float -> int conversion of
++ * NaN / out of range values, minss/maxss with NaN, comiss with NaN, sign extension of 32-bit ops.
++ */
++
++#include "IR.h"
++
++#include "common/symbols.h"
++
++#include "goalc/compiler/Env.h"
++#include "goalc/compiler/StaticObject.h"
++#include "goalc/wasm/WasmCodegen.h"
++
++using wasm_backend::FunctionGen;
++
++namespace {
++
++BinaryenExpressionRef i64_const(FunctionGen& g, s64 v) {
++  return BinaryenConst(g.module(), BinaryenLiteralInt64(v));
++}
++
++BinaryenExpressionRef i32_const(FunctionGen& g, s32 v) {
++  return BinaryenConst(g.module(), BinaryenLiteralInt32(v));
++}
++
++BinaryenExpressionRef f32_const(FunctionGen& g, float v) {
++  return BinaryenConst(g.module(), BinaryenLiteralFloat32(v));
++}
++
++BinaryenExpressionRef unary(FunctionGen& g, BinaryenOp op, BinaryenExpressionRef a) {
++  return BinaryenUnary(g.module(), op, a);
++}
++
++BinaryenExpressionRef binary(FunctionGen& g,
++                             BinaryenOp op,
++                             BinaryenExpressionRef a,
++                             BinaryenExpressionRef b) {
++  return BinaryenBinary(g.module(), op, a, b);
++}
++
++bool is_simd128(RegClass rc) {
++  return rc == RegClass::VECTOR_FLOAT || rc == RegClass::INT_128;
++}
++
++// value of src converted to the class of dst, following regset_common in IR.cpp
++BinaryenExpressionRef convert_for_regset(FunctionGen& g, const RegVal* dst, const RegVal* src) {
++  auto m = g.module();
++  const auto sc = src->ireg().reg_class;
++  const auto dc = dst->ireg().reg_class;
++  auto v = g.get(src);
++  if (sc == dc || (is_simd128(sc) && is_simd128(dc))) {
++    return v;
++  }
++  if (sc == RegClass::FLOAT && dc == RegClass::GPR_64) {
++    // movd r32, xmm; movsxd
++    return unary(g, BinaryenExtendSInt32(), unary(g, BinaryenReinterpretFloat32(), v));
++  }
++  if (sc == RegClass::GPR_64 && dc == RegClass::FLOAT) {
++    // movd xmm, r32
++    return unary(g, BinaryenReinterpretInt32(), unary(g, BinaryenWrapInt64(), v));
++  }
++  if (is_simd128(sc) && dc == RegClass::FLOAT) {
++    return BinaryenSIMDExtract(m, BinaryenExtractLaneVecF32x4(), v, 0);
++  }
++  if (sc == RegClass::FLOAT && is_simd128(dc)) {
++    // movss xmm, xmm only replaces the low lane
++    return BinaryenSIMDReplace(m, BinaryenReplaceLaneVecF32x4(), g.get(dst), 0, v);
++  }
++  if (sc == RegClass::GPR_64 && is_simd128(dc)) {
++    // movq xmm, r64 zeroes the upper 64 bits
++    uint8_t zero[16] = {};
++    return BinaryenSIMDReplace(m, BinaryenReplaceLaneVecI64x2(),
++                               BinaryenConst(m, BinaryenLiteralVec128(zero)), 0, v);
++  }
++  if (is_simd128(sc) && dc == RegClass::GPR_64) {
++    return BinaryenSIMDExtract(m, BinaryenExtractLaneVecI64x2(), v, 0);
++  }
++  g.unsupported("register move between these classes");
++}
++
++// Value slot of a symbol, relative to the symbol pointer.
++s64 symbol_value_offset(GameVersion version) {
++  return version == GameVersion::Jak1 ? 0 : -1;
++}
++
++}  // namespace
++
++void IR::do_codegen_wasm(FunctionGen& gen) {
++  gen.unsupported(fmt::format("IR instruction \"{}\"", print()));
++}
++
++void IR_Return::do_codegen_wasm(FunctionGen& gen) {
++  gen.set_return_reg(m_return_reg);
++  gen.emit(gen.set(m_return_reg, convert_for_regset(gen, m_return_reg, m_value)));
++}
++
++void IR_LoadConstant64::do_codegen_wasm(FunctionGen& gen) {
++  if (m_dest->ireg().reg_class != RegClass::GPR_64) {
++    gen.unsupported("load constant into a non-GPR");
++  }
++  gen.emit(gen.set(m_dest, i64_const(gen, (s64)m_value)));
++}
++
++void IR_LoadSymbolPointer::do_codegen_wasm(FunctionGen& gen) {
++  BinaryenExpressionRef value;
++  if (m_name == "#f") {
++    value = gen.mod()->s7();
++  } else if (m_name == "#t") {
++    value = binary(gen, BinaryenAddInt64(), gen.mod()->s7(),
++                   i64_const(gen, true_symbol_offset(gen.version())));
++  } else if (m_name == "_empty_") {
++    value = binary(gen, BinaryenAddInt64(), gen.mod()->s7(),
++                   i64_const(gen, empty_pair_offset_from_s7(gen.version())));
++  } else {
++    value = gen.mod()->symbol_addr(m_name);
++  }
++  if (m_dest->ireg().reg_class != RegClass::GPR_64) {
++    gen.unsupported("symbol pointer into a non-GPR");
++  }
++  gen.emit(gen.set(m_dest, value));
++}
++
++void IR_SetSymbolValue::do_codegen_wasm(FunctionGen& gen) {
++  // store32 [st + sym]
++  gen.emit(BinaryenStore(gen.module(), 4, gen.mem_offset(symbol_value_offset(gen.version())), 1,
++                         gen.goal_addr(gen.mod()->symbol_addr(m_dest->name())), gen.get(m_src),
++                         BinaryenTypeInt64(), wasm_backend::kMemoryName));
++}
++
++void IR_GetSymbolValue::do_codegen_wasm(FunctionGen& gen) {
++  auto load = BinaryenLoad(gen.module(), 4, m_sext, gen.mem_offset(symbol_value_offset(gen.version())),
++                           1, BinaryenTypeInt64(), gen.goal_addr(gen.mod()->symbol_addr(m_src->name())),
++                           wasm_backend::kMemoryName);
++  gen.emit(gen.set(m_dest, load));
++}
++
++void IR_RegSet::do_codegen_wasm(FunctionGen& gen) {
++  gen.emit(gen.set(m_dest, convert_for_regset(gen, m_dest, m_src)));
++}
++
++void IR_FunctionCall::do_codegen_wasm(FunctionGen& gen) {
++  std::vector<BinaryenExpressionRef> args;
++  std::vector<BinaryenType> params;
++  for (auto* arg : m_args) {
++    if (arg->ireg().reg_class != RegClass::GPR_64) {
++      gen.unsupported("a 128-bit function argument");
++    }
++    args.push_back(gen.get(arg));
++    params.push_back(BinaryenTypeInt64());
++  }
++  if (m_ret->ireg().reg_class != RegClass::GPR_64) {
++    gen.unsupported("a 128-bit return value");
++  }
++  // the function object holds the table index of the code
++  auto table_index = BinaryenLoad(gen.module(), 4, false, gen.mem_offset(0), 4, BinaryenTypeInt32(),
++                                  gen.goal_addr(gen.get(m_func)), wasm_backend::kMemoryName);
++  auto call = BinaryenCallIndirect(gen.module(), wasm_backend::kTableName, table_index, args.data(),
++                                   (BinaryenIndex)args.size(),
++                                   BinaryenTypeCreate(params.data(), (BinaryenIndex)params.size()),
++                                   BinaryenTypeInt64());
++  gen.emit(gen.set(m_ret, call));
++}
++
++void IR_FunctionAddr::do_codegen_wasm(FunctionGen& gen) {
++  gen.emit(gen.set(m_dest, gen.mod()->function_addr(m_src)));
++}
++
++void IR_IntegerMath::do_codegen_wasm(FunctionGen& gen) {
++  auto d = [&]() { return gen.get(m_dest); };
++  auto a = [&]() { return gen.get(m_arg); };
++  auto d32 = [&]() { return unary(gen, BinaryenWrapInt64(), d()); };
++  auto a32 = [&]() { return unary(gen, BinaryenWrapInt64(), a()); };
++  auto sext = [&](BinaryenExpressionRef v) { return unary(gen, BinaryenExtendSInt32(), v); };
++  BinaryenExpressionRef r = nullptr;
++  switch (m_kind) {
++    case IntegerMathKind::ADD_64:
++      r = binary(gen, BinaryenAddInt64(), d(), a());
++      break;
++    case IntegerMathKind::SUB_64:
++      r = binary(gen, BinaryenSubInt64(), d(), a());
++      break;
++    case IntegerMathKind::AND_64:
++      r = binary(gen, BinaryenAndInt64(), d(), a());
++      break;
++    case IntegerMathKind::OR_64:
++      r = binary(gen, BinaryenOrInt64(), d(), a());
++      break;
++    case IntegerMathKind::XOR_64:
++      r = binary(gen, BinaryenXorInt64(), d(), a());
++      break;
++    case IntegerMathKind::NOT_64:
++      r = binary(gen, BinaryenXorInt64(), d(), i64_const(gen, -1));
++      break;
++    // variable shifts: x86 and wasm both use the low 6 bits of the count
++    case IntegerMathKind::SHLV_64:
++      r = binary(gen, BinaryenShlInt64(), d(), a());
++      break;
++    case IntegerMathKind::SHRV_64:
++      r = binary(gen, BinaryenShrUInt64(), d(), a());
++      break;
++    case IntegerMathKind::SARV_64:
++      r = binary(gen, BinaryenShrSInt64(), d(), a());
++      break;
++    case IntegerMathKind::SHL_64:
++      r = binary(gen, BinaryenShlInt64(), d(), i64_const(gen, m_shift_amount));
++      break;
++    case IntegerMathKind::SHR_64:
++      r = binary(gen, BinaryenShrUInt64(), d(), i64_const(gen, m_shift_amount));
++      break;
++    case IntegerMathKind::SAR_64:
++      r = binary(gen, BinaryenShrSInt64(), d(), i64_const(gen, m_shift_amount));
++      break;
++    case IntegerMathKind::IMUL_64:
++      r = binary(gen, BinaryenMulInt64(), d(), a());
++      break;
++    // 32-bit ops sign extend their result, like the PS2
++    case IntegerMathKind::IMUL_32:
++      r = sext(binary(gen, BinaryenMulInt32(), d32(), a32()));
++      break;
++    case IntegerMathKind::IDIV_32:
++      r = sext(binary(gen, BinaryenDivSInt32(), d32(), a32()));
++      break;
++    case IntegerMathKind::UDIV_32:
++      r = sext(binary(gen, BinaryenDivUInt32(), d32(), a32()));
++      break;
++    case IntegerMathKind::IMOD_32:
++      r = sext(binary(gen, BinaryenRemSInt32(), d32(), a32()));
++      break;
++    case IntegerMathKind::UMOD_32:
++      r = sext(binary(gen, BinaryenRemUInt32(), d32(), a32()));
++      break;
++    default:
++      gen.unsupported("this integer math operation");
++  }
++  gen.emit(gen.set(m_dest, r));
++}
++
++void IR_FloatMath::do_codegen_wasm(FunctionGen& gen) {
++  auto d = [&]() { return gen.get(m_dest); };
++  auto a = [&]() { return gen.get(m_arg); };
++  BinaryenExpressionRef r = nullptr;
++  switch (m_kind) {
++    case FloatMathKind::DIV_SS:
++      r = binary(gen, BinaryenDivFloat32(), d(), a());
++      break;
++    case FloatMathKind::MUL_SS:
++      r = binary(gen, BinaryenMulFloat32(), d(), a());
++      break;
++    case FloatMathKind::ADD_SS:
++      r = binary(gen, BinaryenAddFloat32(), d(), a());
++      break;
++    case FloatMathKind::SUB_SS:
++      r = binary(gen, BinaryenSubFloat32(), d(), a());
++      break;
++    // minss/maxss: dst = (dst < src) ? dst : src  (src if either is NaN, src for +0/-0)
++    case FloatMathKind::MIN_SS:
++      r = BinaryenSelect(gen.module(), binary(gen, BinaryenLtFloat32(), d(), a()), d(), a());
++      break;
++    case FloatMathKind::MAX_SS:
++      r = BinaryenSelect(gen.module(), binary(gen, BinaryenGtFloat32(), d(), a()), d(), a());
++      break;
++    case FloatMathKind::SQRT_SS:
++      r = unary(gen, BinaryenSqrtFloat32(), a());
++      break;
++    default:
++      gen.unsupported("this float math operation");
++  }
++  gen.emit(gen.set(m_dest, r));
++}
++
++void IR_FloatToInt::do_codegen_wasm(FunctionGen& gen) {
++  // cvttss2si r32: NaN and out of range give 0x80000000; then movsxd
++  auto x = [&]() { return gen.get(m_src); };
++  auto in_range = binary(gen, BinaryenAndInt32(),
++                         binary(gen, BinaryenLtFloat32(), x(), f32_const(gen, 2147483648.0f)),
++                         binary(gen, BinaryenGeFloat32(), x(), f32_const(gen, -2147483648.0f)));
++  auto r = BinaryenSelect(gen.module(), in_range, unary(gen, BinaryenTruncSatSFloat32ToInt32(), x()),
++                          i32_const(gen, INT32_MIN));
++  gen.emit(gen.set(m_dest, unary(gen, BinaryenExtendSInt32(), r)));
++}
++
++void IR_IntToFloat::do_codegen_wasm(FunctionGen& gen) {
++  // cvtsi2ss xmm, r32
++  gen.emit(gen.set(m_dest, unary(gen, BinaryenConvertSInt32ToFloat32(),
++                                 unary(gen, BinaryenWrapInt64(), gen.get(m_src)))));
++}
++
++void IR_GotoLabel::do_codegen_wasm(FunctionGen& gen) {
++  gen.set_goto(m_dest->idx);
++}
++
++int IR_GotoLabel::wasm_branch_target() const {
++  return m_dest->idx;
++}
++
++void IR_ConditionalBranch::do_codegen_wasm(FunctionGen& gen) {
++  auto a = [&]() { return gen.get(condition.a); };
++  auto b = [&]() { return gen.get(condition.b); };
++  BinaryenExpressionRef cond = nullptr;
++  if (condition.is_float) {
++    // comiss + unsigned jumps: unordered (NaN) sets ZF, PF and CF, so je/jb/jbe are taken
++    auto unordered = [&]() {
++      return binary(gen, BinaryenOrInt32(), binary(gen, BinaryenNeFloat32(), a(), a()),
++                    binary(gen, BinaryenNeFloat32(), b(), b()));
++    };
++    auto or_unordered = [&](BinaryenExpressionRef c) {
++      return binary(gen, BinaryenOrInt32(), c, unordered());
++    };
++    switch (condition.kind) {
++      case ConditionKind::EQUAL:
++        cond = or_unordered(binary(gen, BinaryenEqFloat32(), a(), b()));
++        break;
++      case ConditionKind::NOT_EQUAL:
++        cond = unary(gen, BinaryenEqZInt32(),
++                     or_unordered(binary(gen, BinaryenEqFloat32(), a(), b())));
++        break;
++      case ConditionKind::LT:
++        cond = or_unordered(binary(gen, BinaryenLtFloat32(), a(), b()));
++        break;
++      case ConditionKind::LEQ:
++        cond = or_unordered(binary(gen, BinaryenLeFloat32(), a(), b()));
++        break;
++      case ConditionKind::GT:
++        cond = binary(gen, BinaryenGtFloat32(), a(), b());
++        break;
++      case ConditionKind::GEQ:
++        cond = binary(gen, BinaryenGeFloat32(), a(), b());
++        break;
++      default:
++        gen.unsupported("this float condition");
++    }
++  } else {
++    const bool s = condition.is_signed;
++    BinaryenOp op;
++    switch (condition.kind) {
++      case ConditionKind::EQUAL:
++        op = BinaryenEqInt64();
++        break;
++      case ConditionKind::NOT_EQUAL:
++        op = BinaryenNeInt64();
++        break;
++      case ConditionKind::LT:
++        op = s ? BinaryenLtSInt64() : BinaryenLtUInt64();
++        break;
++      case ConditionKind::LEQ:
++        op = s ? BinaryenLeSInt64() : BinaryenLeUInt64();
++        break;
++      case ConditionKind::GT:
++        op = s ? BinaryenGtSInt64() : BinaryenGtUInt64();
++        break;
++      case ConditionKind::GEQ:
++        op = s ? BinaryenGeSInt64() : BinaryenGeUInt64();
++        break;
++      default:
++        gen.unsupported("this integer condition");
++    }
++    cond = binary(gen, op, a(), b());
++  }
++  gen.set_conditional_branch(label.idx, cond);
++}
++
++int IR_ConditionalBranch::wasm_branch_target() const {
++  return label.idx;
++}
++
++void IR_Null::do_codegen_wasm(FunctionGen& gen) {
++  (void)gen;
++}
++
++void IR_ValueReset::do_codegen_wasm(FunctionGen& gen) {
++  (void)gen;  // arguments are bound to wasm params in FunctionGen::run
++}
++
++void IR_Nop::do_codegen_wasm(FunctionGen& gen) {
++  (void)gen;
++}
++
++void IR_LoadConstOffset::do_codegen_wasm(FunctionGen& gen) {
++  const auto rc = m_dest->ireg().reg_class;
++  auto ptr = gen.goal_addr(gen.get(m_base));
++  const u32 off = gen.mem_offset(m_offset);
++  BinaryenExpressionRef load = nullptr;
++  if (rc == RegClass::GPR_64) {
++    load = BinaryenLoad(gen.module(), m_info.size, m_info.sign_extend, off, 1, BinaryenTypeInt64(),
++                        ptr, wasm_backend::kMemoryName);
++  } else if (rc == RegClass::FLOAT && m_info.size == 4) {
++    load = BinaryenLoad(gen.module(), 4, false, off, 1, BinaryenTypeFloat32(), ptr,
++                        wasm_backend::kMemoryName);
++  } else if (is_simd128(rc) && m_info.size == 16) {
++    load = BinaryenLoad(gen.module(), 16, false, off, 1, BinaryenTypeVec128(), ptr,
++                        wasm_backend::kMemoryName);
++  } else {
++    gen.unsupported("this memory load");
++  }
++  gen.emit(gen.set(m_dest, load));
++}
++
++void IR_StoreConstOffset::do_codegen_wasm(FunctionGen& gen) {
++  const auto rc = m_value->ireg().reg_class;
++  auto ptr = gen.goal_addr(gen.get(m_base));
++  const u32 off = gen.mem_offset(m_offset);
++  BinaryenType type;
++  if (rc == RegClass::GPR_64) {
++    type = BinaryenTypeInt64();
++  } else if (rc == RegClass::FLOAT && m_size == 4) {
++    type = BinaryenTypeFloat32();
++  } else if (is_simd128(rc) && m_size == 16) {
++    type = BinaryenTypeVec128();
++  } else {
++    gen.unsupported("this memory store");
++  }
++  gen.emit(BinaryenStore(gen.module(), m_size, off, 1, ptr, gen.get(m_value), type,
++                         wasm_backend::kMemoryName));
++}
++
++void IR_StaticVarLoad::do_codegen_wasm(FunctionGen& gen) {
++  // float constants live in the object's static data on x86; in wasm they are immediates
++  if (auto* f = dynamic_cast<const StaticFloat*>(m_src)) {
++    if (m_dest->ireg().reg_class != RegClass::FLOAT) {
++      gen.unsupported("a static float loaded into a non-float register");
++    }
++    gen.emit(gen.set(m_dest, f32_const(gen, f->value)));
++    return;
++  }
++  gen.unsupported("loading static data other than a float constant");
++}
+diff --git a/goalc/wasm/WasmCodegen.cpp b/goalc/wasm/WasmCodegen.cpp
+new file mode 100644
+index 00000000..2d365ac3
+--- /dev/null
++++ b/goalc/wasm/WasmCodegen.cpp
+@@ -0,0 +1,317 @@
++/*!
++ * @file WasmCodegen.cpp
++ * WebAssembly backend for goalc (Jakompiled). See WasmCodegen.h for the ABI.
++ */
++
++#include "WasmCodegen.h"
++
++#include <cstdlib>
++#include <map>
++#include <set>
++#include <stdexcept>
++
++#include "common/goal_constants.h"
++#include "common/symbols.h"
++
++#include "goalc/compiler/Env.h"
++#include "goalc/compiler/IR.h"
++
++#include "fmt/format.h"
++
++namespace wasm_backend {
++
++namespace {
++constexpr u32 kPageSize = 64 * 1024;
++// the imported memory must at least cover EE memory
++constexpr u32 kMinMemoryPages = (WASM_EE_MAIN_MEM_BASE + EE_MAIN_MEM_SIZE) / kPageSize;
++constexpr u32 kMaxMemoryPages = 65536;  // 4 GB
++
++BinaryenType wasm_type_for_class(RegClass rc) {
++  switch (rc) {
++    case RegClass::GPR_64:
++      return BinaryenTypeInt64();
++    case RegClass::FLOAT:
++      return BinaryenTypeFloat32();
++    case RegClass::INT_128:
++    case RegClass::VECTOR_FLOAT:
++      return BinaryenTypeVec128();
++    default:
++      throw std::runtime_error("wasm backend: register with invalid class");
++  }
++}
++}  // namespace
++
++// ---------------------------------------------------------------------------------------------
++// FunctionGen
++// ---------------------------------------------------------------------------------------------
++
++FunctionGen::FunctionGen(ModuleGen* mod, FunctionEnv* env) : m_mod(mod), m_env(env) {}
++
++BinaryenModuleRef FunctionGen::module() const {
++  return m_mod->module();
++}
++
++GameVersion FunctionGen::version() const {
++  return m_mod->version();
++}
++
++void FunctionGen::unsupported(const std::string& what) const {
++  throw std::runtime_error(
++      fmt::format("wasm backend: {} is not supported yet (function {})", what, m_env->name()));
++}
++
++int FunctionGen::local_index(const RegVal* rv) {
++  const auto id = rv->ireg().id;
++  auto it = m_ireg_to_local.find(id);
++  if (it != m_ireg_to_local.end()) {
++    return it->second;
++  }
++  const int idx = (int)m_local_types.size();
++  m_local_types.push_back(wasm_type_for_class(rv->ireg().reg_class));
++  m_ireg_to_local[id] = idx;
++  return idx;
++}
++
++BinaryenType FunctionGen::type_of(const RegVal* rv) const {
++  return wasm_type_for_class(rv->ireg().reg_class);
++}
++
++BinaryenExpressionRef FunctionGen::get(const RegVal* rv) {
++  return BinaryenLocalGet(module(), local_index(rv), type_of(rv));
++}
++
++BinaryenExpressionRef FunctionGen::set(const RegVal* rv, BinaryenExpressionRef value) {
++  return BinaryenLocalSet(module(), local_index(rv), value);
++}
++
++BinaryenExpressionRef FunctionGen::goal_addr(BinaryenExpressionRef goal_ptr_i64) {
++  return BinaryenUnary(module(), BinaryenWrapInt64(), goal_ptr_i64);
++}
++
++u32 FunctionGen::mem_offset(s64 field_offset) const {
++  const s64 off = (s64)WASM_EE_MAIN_MEM_BASE + field_offset;
++  if (off < 0 || off > 0xffffffffLL) {
++    throw std::runtime_error(fmt::format("wasm backend: memory offset {} out of range", off));
++  }
++  return (u32)off;
++}
++
++void FunctionGen::set_conditional_branch(int target_ir, BinaryenExpressionRef cond) {
++  m_cur_branch_target = target_ir;
++  m_cur_branch_cond = cond;
++  m_cur_falls_through = true;
++}
++
++void FunctionGen::set_goto(int target_ir) {
++  m_cur_branch_target = target_ir;
++  m_cur_branch_cond = nullptr;
++  m_cur_falls_through = false;
++}
++
++void FunctionGen::set_params(const std::vector<RegVal*>& args) {
++  // the arguments are the first locals, in order, so they line up with the wasm params
++  if (!m_local_types.empty()) {
++    throw std::runtime_error("wasm backend: function arguments set after other locals");
++  }
++  for (auto* arg : args) {
++    if (arg->ireg().reg_class != RegClass::GPR_64) {
++      unsupported("a 128-bit function argument");
++    }
++    local_index(arg);
++  }
++  m_num_params = (int)args.size();
++}
++
++void FunctionGen::set_return_reg(const RegVal* rv) {
++  if (m_return_reg && m_return_reg->ireg().id != rv->ireg().id) {
++    throw std::runtime_error("wasm backend: function with two return registers");
++  }
++  if (rv->ireg().reg_class != RegClass::GPR_64) {
++    unsupported("a 128-bit return value");
++  }
++  m_return_reg = rv;
++}
++
++void FunctionGen::run() {
++  const auto& code = m_env->code();
++
++  // the arguments have to be known before any other local is created
++  for (auto& ir : code) {
++    if (auto* reset = dynamic_cast<IR_ValueReset*>(ir.get())) {
++      set_params(reset->args());
++      break;
++    }
++  }
++
++  // basic block leaders: function start, branch targets and instructions after a branch
++  std::set<int> leaders = {0};
++  for (int i = 0; i < (int)code.size(); i++) {
++    int target = code[i]->wasm_branch_target();
++    if (target >= 0) {
++      leaders.insert(target);
++      leaders.insert(i + 1);
++    }
++  }
++  // one extra block for the function exit
++  const int end_idx = (int)code.size();
++  leaders.insert(end_idx);
++
++  std::vector<Block> blocks;
++  std::map<int, int> block_of_leader;
++  for (int leader : leaders) {
++    if (leader > end_idx) {
++      continue;
++    }
++    block_of_leader[leader] = (int)blocks.size();
++    blocks.push_back(Block{leader});
++  }
++
++  // emit each block
++  for (size_t b = 0; b < blocks.size(); b++) {
++    const int first = blocks[b].first_ir;
++    const int last = (b + 1 < blocks.size()) ? blocks[b + 1].first_ir : end_idx;
++    m_cur_exprs.clear();
++    m_cur_branch_target = -1;
++    m_cur_branch_cond = nullptr;
++    m_cur_falls_through = true;
++    for (int i = first; i < last; i++) {
++      code[i]->do_codegen_wasm(*this);
++    }
++    blocks[b].exprs = m_cur_exprs;
++    blocks[b].branch_target = m_cur_branch_target;
++    blocks[b].branch_cond = m_cur_branch_cond;
++    blocks[b].falls_through = m_cur_falls_through;
++  }
++
++  // the exit block returns the return register (functions returning none return 0)
++  auto& exit_block = blocks.back();
++  if (m_return_reg) {
++    exit_block.exprs.push_back(BinaryenReturn(module(), get(m_return_reg)));
++  } else {
++    exit_block.exprs.push_back(BinaryenReturn(module(), BinaryenConst(module(), BinaryenLiteralInt64(0))));
++  }
++  exit_block.falls_through = false;
++
++  // structure the control flow
++  auto relooper = RelooperCreate(module());
++  std::vector<RelooperBlockRef> rblocks;
++  for (auto& blk : blocks) {
++    auto body = BinaryenBlock(module(), nullptr, blk.exprs.data(), (BinaryenIndex)blk.exprs.size(),
++                              BinaryenTypeNone());
++    rblocks.push_back(RelooperAddBlock(relooper, body));
++  }
++  for (size_t b = 0; b < blocks.size(); b++) {
++    auto& blk = blocks[b];
++    if (blk.branch_target >= 0) {
++      auto it = block_of_leader.find(blk.branch_target);
++      if (it == block_of_leader.end()) {
++        throw std::runtime_error("wasm backend: branch to an unknown label");
++      }
++      RelooperAddBranch(rblocks[b], rblocks[it->second], blk.branch_cond, nullptr);
++    }
++    if (blk.falls_through && (blk.branch_target < 0 || blk.branch_cond)) {
++      if (b + 1 >= blocks.size()) {
++        throw std::runtime_error("wasm backend: fell off the end of a function");
++      }
++      RelooperAddBranch(rblocks[b], rblocks[b + 1], nullptr, nullptr);
++    }
++  }
++  // the relooper needs one extra i32 local for its label helper
++  const int label_helper = (int)m_local_types.size();
++  m_local_types.push_back(BinaryenTypeInt32());
++  auto body = RelooperRenderAndDispose(relooper, rblocks[0], label_helper);
++
++  std::vector<BinaryenType> params(m_num_params, BinaryenTypeInt64());
++  std::vector<BinaryenType> vars(m_local_types.begin() + m_num_params, m_local_types.end());
++  auto name = m_mod->export_name(m_env);
++  BinaryenAddFunction(module(), name.c_str(),
++                      BinaryenTypeCreate(params.data(), (BinaryenIndex)params.size()),
++                      BinaryenTypeInt64(), vars.data(), (BinaryenIndex)vars.size(), body);
++  BinaryenAddFunctionExport(module(), name.c_str(), name.c_str());
++}
++
++// ---------------------------------------------------------------------------------------------
++// ModuleGen
++// ---------------------------------------------------------------------------------------------
++
++ModuleGen::ModuleGen(FileEnv* env, GameVersion version, const Options& options)
++    : m_env(env), m_version(version), m_options(options), m_module(BinaryenModuleCreate()) {
++  BinaryenModuleSetFeatures(m_module, BinaryenFeatureMVP() | BinaryenFeatureSIMD128() |
++                                          BinaryenFeatureNontrappingFPToInt() |
++                                          BinaryenFeatureMutableGlobals() |
++                                          BinaryenFeatureBulkMemory() |
++                                          BinaryenFeatureSignExt() |
++                                          (options.shared_memory ? BinaryenFeatureAtomics() : 0));
++  BinaryenSetMemory(m_module, kMinMemoryPages, kMaxMemoryPages, nullptr, nullptr, nullptr, nullptr,
++                    nullptr, nullptr, 0, options.shared_memory, false, kMemoryName);
++  BinaryenAddMemoryImport(m_module, kMemoryName, kEnvModule, kMemoryName, options.shared_memory);
++  BinaryenAddTable(m_module, kTableName, 0, 0xffffffff, BinaryenTypeFuncref(), nullptr);
++  BinaryenAddTableImport(m_module, kTableName, kEnvModule, kTableName);
++}
++
++ModuleGen::~ModuleGen() {
++  BinaryenModuleDispose(m_module);
++}
++
++BinaryenExpressionRef ModuleGen::import_global(const std::string& module,
++                                              const std::string& field,
++                                              const std::string& internal) {
++  auto key = module + "." + field;
++  if (m_imported_globals.find(key) == m_imported_globals.end()) {
++    BinaryenAddGlobalImport(m_module, internal.c_str(), module.c_str(), field.c_str(),
++                            BinaryenTypeInt64(), false);
++    m_imported_globals[key] = internal;
++  }
++  return BinaryenGlobalGet(m_module, m_imported_globals[key].c_str(), BinaryenTypeInt64());
++}
++
++BinaryenExpressionRef ModuleGen::s7() {
++  return import_global(kEnvModule, kS7Global, "s7");
++}
++
++BinaryenExpressionRef ModuleGen::symbol_addr(const std::string& name) {
++  return import_global(kSymbolModule, name, "sym:" + name);
++}
++
++BinaryenExpressionRef ModuleGen::function_addr(const FunctionEnv* f) {
++  auto name = export_name(f);
++  return import_global(kFunctionModule, name, "func:" + name);
++}
++
++std::string ModuleGen::export_name(const FunctionEnv* f) const {
++  return f->name();
++}
++
++std::vector<u8> ModuleGen::run() {
++  for (auto& f : m_env->functions()) {
++    if (f->is_asm_func) {
++      throw std::runtime_error(
++          fmt::format("wasm backend: asm-func {} needs a hand-written wasm version", f->name()));
++    }
++    FunctionGen fg(this, f.get());
++    fg.run();
++  }
++
++  if (!BinaryenModuleValidate(m_module)) {
++    throw std::runtime_error("wasm backend: generated module failed validation");
++  }
++  if (m_options.optimize) {
++    BinaryenSetOptimizeLevel(2);
++    BinaryenSetShrinkLevel(0);
++    BinaryenModuleOptimize(m_module);
++  }
++  auto result = BinaryenModuleAllocateAndWrite(m_module, nullptr);
++  std::vector<u8> bytes((u8*)result.binary, (u8*)result.binary + result.binaryBytes);
++  free(result.binary);
++  if (result.sourceMap) {
++    free(result.sourceMap);
++  }
++  return bytes;
++}
++
++std::vector<u8> codegen_wasm(FileEnv* env, GameVersion version, const Options& options) {
++  ModuleGen gen(env, version, options);
++  return gen.run();
++}
++
++}  // namespace wasm_backend
+diff --git a/goalc/wasm/WasmCodegen.h b/goalc/wasm/WasmCodegen.h
+new file mode 100644
+index 00000000..289d1d53
+--- /dev/null
++++ b/goalc/wasm/WasmCodegen.h
+@@ -0,0 +1,144 @@
++#pragma once
++
++/*!
++ * @file WasmCodegen.h
++ * WebAssembly backend for goalc (Jakompiled).
++ *
++ * Translates the IR of a FileEnv into a wasm module with Binaryen. Unlike the x86 and ARM64
++ * backends there is no register allocation: every IRegister becomes a wasm local and the engine
++ * (V8, SpiderMonkey...) allocates registers. Basic blocks are rebuilt from the IR labels and
++ * turned into structured control flow by Binaryen's Relooper.
++ *
++ * ABI (see docs/fase3-backend.md in Jakompiled):
++ *  - GOAL memory is the imported linear memory, at constant offset WASM_EE_MAIN_MEM_BASE.
++ *    A GOAL pointer p is accessed as load/store (wrap p) with immediate offset BASE + field.
++ *  - GPRs are i64 locals, floats f32, 128-bit registers v128.
++ *  - Every GOAL function has the wasm type (i64 x nargs) -> i64.
++ *  - A GOAL function value is the GOAL address of a function object whose first word holds the
++ *    function's index in the imported table. Calls load it and use call_indirect.
++ *  - s7 (symbol table) and every symbol / function object used are imported i64 globals, so the
++ *    loader decides their addresses when it instantiates the module.
++ */
++
++#include <cstdint>
++#include <memory>
++#include <string>
++#include <unordered_map>
++#include <vector>
++
++#include "common/common_types.h"
++#include "common/versions/versions.h"
++
++#include "binaryen-c.h"
++
++class FileEnv;
++class FunctionEnv;
++class RegVal;
++class StaticObject;
++
++namespace wasm_backend {
++
++// Imports, as module.field names
++constexpr const char* kEnvModule = "env";
++constexpr const char* kMemoryName = "mem";
++constexpr const char* kTableName = "table";
++constexpr const char* kS7Global = "s7";
++constexpr const char* kSymbolModule = "sym";     // sym.<name>: GOAL address of a symbol
++constexpr const char* kFunctionModule = "func";  // func.<name>: GOAL address of a function
++
++struct Options {
++  bool shared_memory = false;  // the runtime uses a SharedArrayBuffer (pthreads)
++  bool optimize = true;        // run Binaryen's optimizer (-O2)
++};
++
++class ModuleGen;
++
++/*!
++ * State for one function: locals, basic blocks under construction, branch targets.
++ * IR::do_codegen_wasm() appends expressions to the current block through this object.
++ */
++class FunctionGen {
++ public:
++  FunctionGen(ModuleGen* mod, FunctionEnv* env);
++  void run();
++
++  BinaryenModuleRef module() const;
++  ModuleGen* mod() const { return m_mod; }
++  GameVersion version() const;
++
++  // locals
++  BinaryenExpressionRef get(const RegVal* rv);
++  BinaryenExpressionRef set(const RegVal* rv, BinaryenExpressionRef value);
++  BinaryenType type_of(const RegVal* rv) const;
++
++  // emission into the current block
++  void emit(BinaryenExpressionRef e) { m_cur_exprs.push_back(e); }
++  void set_conditional_branch(int target_ir, BinaryenExpressionRef cond);
++  void set_goto(int target_ir);
++  void set_params(const std::vector<RegVal*>& args);
++  void set_return_reg(const RegVal* rv);
++
++  // GOAL memory helpers: address operand and immediate offset for a GOAL pointer + offset
++  BinaryenExpressionRef goal_addr(BinaryenExpressionRef goal_ptr_i64);
++  u32 mem_offset(s64 field_offset) const;
++
++  [[noreturn]] void unsupported(const std::string& what) const;
++
++ private:
++  struct Block {
++    int first_ir = 0;
++    std::vector<BinaryenExpressionRef> exprs;
++    int branch_target = -1;  // IR index, -1: none
++    BinaryenExpressionRef branch_cond = nullptr;  // null: unconditional
++    bool falls_through = true;
++  };
++
++  int local_index(const RegVal* rv);
++
++  ModuleGen* m_mod;
++  FunctionEnv* m_env;
++  std::vector<BinaryenType> m_local_types;  // params first, then other locals
++  std::unordered_map<int, int> m_ireg_to_local;
++  int m_num_params = 0;
++  const RegVal* m_return_reg = nullptr;
++  std::vector<BinaryenExpressionRef> m_cur_exprs;
++  int m_cur_branch_target = -1;
++  BinaryenExpressionRef m_cur_branch_cond = nullptr;
++  bool m_cur_falls_through = true;
++};
++
++/*!
++ * Builds the wasm module for a whole object file.
++ */
++class ModuleGen {
++ public:
++  ModuleGen(FileEnv* env, GameVersion version, const Options& options);
++  ~ModuleGen();
++  std::vector<u8> run();
++
++  BinaryenModuleRef module() const { return m_module; }
++  GameVersion version() const { return m_version; }
++
++  BinaryenExpressionRef s7();
++  BinaryenExpressionRef symbol_addr(const std::string& name);
++  BinaryenExpressionRef function_addr(const FunctionEnv* f);
++  std::string export_name(const FunctionEnv* f) const;
++
++ private:
++  BinaryenExpressionRef import_global(const std::string& module,
++                                      const std::string& field,
++                                      const std::string& internal);
++
++  FileEnv* m_env;
++  GameVersion m_version;
++  Options m_options;
++  BinaryenModuleRef m_module;
++  std::unordered_map<std::string, std::string> m_imported_globals;  // module.field -> internal
++};
++
++/*!
++ * Compile a FileEnv (after compile_object_file, without register allocation) to a wasm module.
++ */
++std::vector<u8> codegen_wasm(FileEnv* env, GameVersion version, const Options& options = {});
++
++}  // namespace wasm_backend
+diff --git a/goalc/wasm/goalc_wasm_main.cpp b/goalc/wasm/goalc_wasm_main.cpp
+new file mode 100644
+index 00000000..cc489fcd
+--- /dev/null
++++ b/goalc/wasm/goalc_wasm_main.cpp
+@@ -0,0 +1,83 @@
++/*!
++ * goalc-wasm: compile a GOAL source file to a WebAssembly module (Jakompiled).
++ *
++ *   goalc-wasm [--game jak2] [--proj-path dir] [--no-opt] [--shared-memory] [--print-ir]
++ *              <in.gc> <out.wasm>
++ *
++ * The object file is compiled with the normal goalc front end and then emitted by the wasm
++ * backend instead of register allocation + x86 codegen. Every function is exported under its
++ * goalc name; see goalc/wasm/WasmCodegen.h for the imports the module expects.
++ */
++
++#include <cstdio>
++#include <string>
++
++#include "common/log/log.h"
++#include "common/util/FileUtil.h"
++#include "common/versions/versions.h"
++
++#include "goalc/compiler/Compiler.h"
++#include "goalc/compiler/Env.h"
++#include "goalc/wasm/WasmCodegen.h"
++
++int main(int argc, char** argv) {
++  std::string game = "jak2";
++  wasm_backend::Options options;
++  bool print_ir = false;
++  std::optional<fs::path> proj_path;
++  std::vector<std::string> positional;
++  for (int i = 1; i < argc; i++) {
++    std::string a = argv[i];
++    if (a == "--game" && i + 1 < argc) {
++      game = argv[++i];
++    } else if (a == "--proj-path" && i + 1 < argc) {
++      proj_path = fs::path(argv[++i]);
++    } else if (a == "--no-opt") {
++      options.optimize = false;
++    } else if (a == "--shared-memory") {
++      options.shared_memory = true;
++    } else if (a == "--print-ir") {
++      print_ir = true;
++    } else {
++      positional.push_back(a);
++    }
++  }
++  if (positional.size() != 2) {
++    fprintf(stderr,
++            "usage: goalc-wasm [--game jak2] [--proj-path dir] [--no-opt] [--shared-memory] "
++            "[--print-ir] in.gc out.wasm\n");
++    return 1;
++  }
++
++  file_util::setup_project_path(proj_path);
++  lg::initialize();
++  lg::set_stdout_level(lg::level::warn);
++
++  const auto version = game_name_to_version(game);
++  Compiler compiler(version, emitter::InstructionSet::X86);
++  // the reader resolves relative paths against the project directory
++  const auto in = fs::absolute(positional[0]).string();
++  auto code = compiler.get_goos().reader.read_from_file({in});
++  auto name = fs::path(in).stem().string();
++
++  try {
++    auto* file_env = compiler.compile_object_file(name, code, true);
++    if (print_ir) {
++      file_env->debug_print_tl();
++      for (auto& f : file_env->functions()) {
++        printf("function %s\n", f->name().c_str());
++        for (auto& ir : f->code()) {
++          printf("  %s\n", ir->print().c_str());
++        }
++      }
++    }
++    auto bytes = wasm_backend::codegen_wasm(file_env, version, options);
++    file_util::write_binary_file(fs::absolute(positional[1]), bytes.data(), bytes.size());
++    printf("%s: %zu bytes, %zu functions\n", positional[1].c_str(), bytes.size(),
++           file_env->functions().size());
++  } catch (std::exception& e) {
++    fprintf(stderr, "goalc-wasm: %s\n", e.what());
++    return 1;
++  }
++  return 0;
++}
+-- 
+2.43.0
+

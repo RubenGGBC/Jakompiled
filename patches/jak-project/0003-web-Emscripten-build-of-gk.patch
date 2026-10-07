@@ -1,7 +1,7 @@
 From 455f6d93db2a81db0afa3f07c1467087d0dc6a6e Mon Sep 17 00:00:00 2001
 From: Jakompiled <itsrufer@gmail.com>
 Date: Wed, 7 Oct 2026 15:01:36 +0000
-Subject: [PATCH 3/3] web: Emscripten build of gk
+Subject: [PATCH 3/4] web: Emscripten build of gk
 
 web/CMakeLists.txt builds only what gk needs. libco runs cothreads on
 pthreads, curl/discord-rpc/cubeb are stubbed, and the GOAL call

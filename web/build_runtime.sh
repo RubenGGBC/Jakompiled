@@ -3,7 +3,8 @@
 #
 #   1. Clona jak-project en el commit de referencia y aplica patches/jak-project
 #   2. Compila gk.js + gk.wasm con Emscripten (emsdk activo: source emsdk_env.sh)
-#   3. Compila goalc en nativo y genera KERNEL.CGO desde el código fuente (sin ISO)
+#   3. Compila Binaryen y goalc en nativo (incluido goalc-wasm, el backend wasm de la fase 3)
+#      y genera KERNEL.CGO desde el código fuente (sin ISO)
 #   4. Lo copia todo a web/dist
 #
 # Uso: ./build_runtime.sh [directorio-de-trabajo]   (por defecto: web/work)
@@ -31,13 +32,24 @@ echo "== gk (wasm)"
 emcmake cmake -S "$src/web" -B "$src/build-web" -G Ninja -DCMAKE_BUILD_TYPE=Release >/dev/null
 ninja -C "$src/build-web" gk
 
-echo "== goalc (nativo) y KERNEL.CGO"
-if [ ! -x "$src/build/Release/bin/goalc/goalc" ]; then
-  cmake -S "$src" -B "$src/build/Release/bin" -G Ninja -DCMAKE_BUILD_TYPE=Release \
-    -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ \
-    -DSDL_X11=OFF -DSDL_WAYLAND=OFF -DSDL_UNIX_CONSOLE_BUILD=ON >/dev/null
-  ninja -C "$src/build/Release/bin" goalc
+echo "== Binaryen (lo usa el backend wasm de goalc)"
+binaryen="$work/binaryen"
+if [ ! -f "$binaryen/install/include/binaryen-c.h" ]; then
+  [ -d "$binaryen/.git" ] || git clone -q --depth 1 --branch version_133 \
+    https://github.com/WebAssembly/binaryen.git "$binaryen"
+  git -C "$binaryen" submodule update -q --init --depth 1
+  cmake -S "$binaryen" -B "$binaryen/build" -G Ninja -DCMAKE_BUILD_TYPE=Release \
+    -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ -DBUILD_TESTS=OFF -DBUILD_TOOLS=OFF \
+    -DENABLE_WERROR=OFF -DCMAKE_INSTALL_PREFIX="$binaryen/install" >/dev/null
+  ninja -C "$binaryen/build" install >/dev/null
 fi
+
+echo "== goalc y goalc-wasm (nativo) y KERNEL.CGO"
+cmake -S "$src" -B "$src/build/Release/bin" -G Ninja -DCMAKE_BUILD_TYPE=Release \
+  -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ \
+  -DSDL_X11=OFF -DSDL_WAYLAND=OFF -DSDL_UNIX_CONSOLE_BUILD=ON \
+  -DBINARYEN_ROOT="$binaryen/install" >/dev/null
+ninja -C "$src/build/Release/bin" goalc goalc-wasm
 "$src/build/Release/bin/goalc/goalc" --proj-path "$src" --game jak2 --cmd "(build-kernel)" >/dev/null
 
 echo "== dist"

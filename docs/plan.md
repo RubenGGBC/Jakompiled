@@ -90,8 +90,8 @@ ISO del usuario → extractor → decompilador → código .gc (GOAL)
 **Salida:** el kernel C++ arranca en el navegador e intenta cargar el primer DGO.
 
 ### Fase 3 — Backend wasm en `goalc` (2–4 meses)
-- [ ] Subconjunto mínimo: aritmética entera, llamadas, load/store
-- [ ] Tests con programas GOAL fuera del juego, p. ej. `(format #t "hola")`
+- [x] Subconjunto mínimo: aritmética entera, llamadas, load/store ([fase3-backend.md](fase3-backend.md): idéntico a x86 en 71/71 casos)
+- [ ] Tests con programas GOAL fuera del juego, p. ej. `(format #t "hola")` (sin runtime ya hechos; `format` necesita enlazar con el runtime)
 - [ ] Modelo de enlace: módulo por objeto, `Memory` y `Table` compartidas
 - [ ] Registros `vf` → SIMD128
 - [ ] Suspend/resume: JSPI, con Asyncify como plan B
