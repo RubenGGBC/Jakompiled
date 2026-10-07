@@ -1,0 +1,9 @@
+{
+  "name": "jakompiled-fase1-tools",
+  "private": true,
+  "description": "wabt (wat2wasm) y binaryen (wasm-opt) para el benchmark de la fase 1",
+  "dependencies": {
+    "binaryen": "^132.0.0",
+    "wabt": "^1.0.39"
+  }
+}
