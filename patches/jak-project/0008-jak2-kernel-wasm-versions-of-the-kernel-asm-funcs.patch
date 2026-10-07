@@ -1,7 +1,7 @@
 From c703d4a36c453dbaf016221856ee7810232d95b4 Mon Sep 17 00:00:00 2001
 From: Jakompiled <itsrufer@gmail.com>
 Date: Wed, 7 Oct 2026 16:52:57 +0000
-Subject: [PATCH 08/10] jak2 kernel: wasm versions of the kernel asm-funcs
+Subject: [PATCH 08/11] jak2 kernel: wasm versions of the kernel asm-funcs
 
 thread-suspend, thread-resume, set-to-run-bootstrap, reset-and-call,
 return-from-thread(-dead), catch-frame new, throw-dispatch, the

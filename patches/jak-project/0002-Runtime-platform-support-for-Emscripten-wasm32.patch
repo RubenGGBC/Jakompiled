@@ -1,7 +1,7 @@
 From fde327d2adedf000b32068e0e2091b462153bec4 Mon Sep 17 00:00:00 2001
 From: Jakompiled <itsrufer@gmail.com>
 Date: Wed, 7 Oct 2026 15:01:36 +0000
-Subject: [PATCH 02/10] Runtime: platform support for Emscripten (wasm32)
+Subject: [PATCH 02/11] Runtime: platform support for Emscripten (wasm32)
 
 - EE main memory at a fixed address of the wasm linear memory
 - software CRC32C (wasm has no crc32 instruction)

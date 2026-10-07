@@ -97,6 +97,7 @@ ISO del usuario → extractor → decompilador → código .gc (GOAL)
 - [x] Suspend/resume: JSPI, con Asyncify como plan B (JSPI, 3.4: el kernel GOAL real ejecuta procesos en Chromium)
 
 **Salida:** el kernel GOAL de Jak 1 compilado a wasm arranca y ejecuta procesos que se suspenden y reanudan.
+> **Conseguido (con Jak 2 en vez de Jak 1):** el kernel GOAL de Jak 2 ejecuta procesos con suspend/resume (3.4), y el motor completo (`GAME.CGO`) se carga y se ejecuta en el navegador hasta que necesita datos de la ISO (3.6).
 
 ### Fase 4 — Jak 1 arrancando (1–2 meses)
 - [ ] Renderer en WebGL2, o en WebGPU según el inventario de la fase 0

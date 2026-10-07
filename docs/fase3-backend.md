@@ -292,6 +292,56 @@ Los 71 casos de `basic.gc` siguen idénticos, y las pruebas `hello` y `procs` en
 |---|---|
 | `0010` | `goalc`: instrucciones vf y de enteros de 128 bits, `&var`, argumentos/retornos de 128 bits |
 
+## 3.6 El motor de Jak 2 se carga y se ejecuta en el navegador
+
+> **Resultado: con `?boot=game` el runtime arranca como el juego real (`-boot`), carga `GAME.CGO` compilado a wasm y enlaza y ejecuta 398 objetos del motor (5,5 MB de wasm) en ~1,3 s, hasta `texture-finish`.** Ese es el primer objeto que necesita las texturas del juego, que salen de la ISO del usuario (fase 4).
+
+```
+[info] got 437 objects, name GAME.CGO
+[debug] link finish: types-h
+...
+pckernel version: 0.2
+pc settings file write: "/home/web_user/.config/OpenGOAL/jak2/settings/pc-settings.gc"
+[debug] link finish: texture-upload
+[debug] link finish: texture-finish
+ERROR: could not resize texture pool to remove gamefont.
+RuntimeError: divide by zero   (method init-textures! texture-anim)
+```
+
+`texture-anim` divide por el tamaño de una textura que no existe. En x86 pasaría lo mismo (`idiv` por cero). El código GOAL se comporta igual; lo que faltan son los datos.
+
+### Cómo se monta
+
+[`backend/build_game.sh`](../backend/build_game.sh) compila los 436 objetos de código de `goal_src/jak2/dgos/game.gd`, en su orden, y monta un `GAME.CGO` **solo con código**. El `GAME.CGO` real lleva además ~30 ficheros de datos (`tpage-*.go`, `*-ag.go`) que salen de la ISO y no se incluyen.
+
+Para probar sin ISO, `EMPTY_TPAGE_DIR=1` añade un directorio de texturas vacío (`dir-tpages.go` con 0 entradas, generado por el propio `goalc`). No contiene ningún dato del juego. Sin él, el motor se queda esperando en `texture-upload` a cargar una textura que no existe.
+
+### Qué faltaba en el runtime
+
+Tres problemas, encontrados uno tras otro al arrancar:
+
+| Síntoma | Causa | Arreglo |
+|---|---|---|
+| `null function or function signature mismatch` en `lights` | `nothing` y `zero-func` los genera el kernel C como código x86 (`ret` = `0xc3`). En wasm, ese byte se leía como índice de tabla 195 | Son funciones C con la firma GOAL que devuelven 0 |
+| Funciones mips2c | Código MIPS traducido a C++, llamado con un trampolín x86 que monta el `ExecutionContext` (registros MIPS) en la pila | Un conjunto fijo de adaptadores con la firma GOAL. Wasm no tiene cierres, así que cada función registrada recibe uno. El adaptador monta el contexto igual que `_mips2c_call_systemv`: argumentos en `a0`–`t3`, `pp` en `s6`, `s7`, la pila GOAL falsa debajo y `v0` como resultado |
+| `kmalloc: !alloc mem in heap for #<process @ #x0>` | Las funciones C con `arg3_is_pp` (`new` de `basic`, `copy` de `basic`, `method-set!`) reciben el proceso actual como 4.º argumento: el trampolín x86 pone ahí `r13` | Un adaptador intermedio sustituye el 4.º argumento por `pp` |
+
+### Diagnóstico: `goalc-wasm --debug-calls`
+
+Un `call_indirect` que falla solo dice `null function or function signature mismatch`. Con `--debug-calls`, antes de cada llamada indirecta se llama a `env.check_call(índice, objeto función, punto de llamada)`. El runtime comprueba que el índice existe en la tabla y que la función tiene 8 parámetros. Si no, informa:
+
+```
+[jakompiled] lights: bad call at site 14: function object 0x1aff24, table index 195, 1 params
+```
+
+`goalc-wasm` imprime la lista de puntos de llamada (`lights site 14: top-level: call igpr-21 ...`), y así se llega a `(init-light-hash)`: un `defun-debug` que, sin segmento de depuración, apunta a `nothing`.
+
+### Parche
+
+| Parche | Contenido |
+|---|---|
+| `0011` | Runtime: mips2c, `nothing`/`zero-func`, `arg3_is_pp`; `goalc-wasm --debug-calls` |
+
 ### Pendiente en la fase 3
 
 | Tarea | Estado |
@@ -302,13 +352,14 @@ Los 71 casos de `basic.gc` siguen idénticos, y las pruebas `hello` y `procs` en
 | Registros `vf` → SIMD128, enteros de 128 bits | ✅ (3.5) |
 | Argumentos y retornos de 128 bits, `&var` | ✅ (3.5) |
 | Compilar `GAME.CGO` (motor del juego) con el backend | ✅ (3.5): 9.063 funciones, 0 trampas |
-| Funciones mips2c (C++ llamado desde GOAL con el ABI de la PS2) | Pendiente: las usa el motor |
-| Cargar y ejecutar `GAME.CGO` en el runtime web | Siguiente objetivo |
+| Funciones mips2c (C++ llamado desde GOAL con el ABI de la PS2) | ✅ (3.6) |
+| Cargar y ejecutar `GAME.CGO` en el runtime web | ✅ (3.6): hasta el primer objeto que necesita texturas de la ISO |
+| Rendimiento del código generado frente a x86 | Pendiente: medir con el juego en marcha (fase 4) |
 
 ### Reproducir
 
 ```sh
 web/build_runtime.sh                                       # gk, Binaryen, goalc-wasm y KERNEL.CGO en wasm
 JAK_PROJECT=web/work/jak-project backend/test.sh           # tests unitarios + oráculo x86
-JAK_PROJECT=web/work/jak-project backend/test_runtime.sh   # hello + kernel con procesos, en Chromium
+JAK_PROJECT=web/work/jak-project backend/test_runtime.sh   # hello, kernel con procesos y GAME.CGO, en Chromium
 ```

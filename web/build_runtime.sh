@@ -5,7 +5,9 @@
 #   2. Compila gk.js + gk.wasm con Emscripten (emsdk activo: source emsdk_env.sh)
 #   3. Compila Binaryen y goalc en nativo (incluido goalc-wasm, el backend wasm de la fase 3)
 #   4. Compila el kernel GOAL a wasm y monta KERNEL.CGO (backend/build_kernel.sh, sin ISO)
-#   5. Lo copia todo a web/dist
+#   5. Compila el motor a wasm y monta GAME.CGO solo con código (backend/build_game.sh, sin ISO;
+#      con un directorio de texturas vacío para poder probar el arranque con ?boot=game)
+#   6. Lo copia todo a web/dist
 #
 # Uso: ./build_runtime.sh [directorio-de-trabajo]   (por defecto: web/work)
 # Requisitos: git, cmake, ninja, clang, nasm, emsdk (emcc en el PATH)
@@ -54,6 +56,9 @@ ninja -C "$src/build/Release/bin" goalc goalc-wasm
 echo "== KERNEL.CGO (kernel GOAL compilado a wasm)"
 mkdir -p "$src/out/jak2/iso"
 JAK_PROJECT="$src" "$repo/backend/build_kernel.sh" "$src/out/jak2/iso/KERNEL.CGO"
+
+echo "== GAME.CGO (motor compilado a wasm, sin datos de la ISO)"
+EMPTY_TPAGE_DIR=1 JAK_PROJECT="$src" "$repo/backend/build_game.sh" "$src/out/jak2/iso/GAME.CGO"
 
 echo "== dist"
 JAK_WEB="$src" JAK_PROJECT="$src" "$here/build_dist.sh"

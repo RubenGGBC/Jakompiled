@@ -1,0 +1,414 @@
+From 14407e68cc013f719ab16f9ac34af1dee5466277 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Wed, 7 Oct 2026 17:38:00 +0000
+Subject: [PATCH 11/11] [jakompiled] runtime: the Jak 2 engine (GAME.CGO) links
+ and runs in the browser
+
+- mips2c functions: a pool of adapters with the GOAL function type that build the MIPS
+  ExecutionContext like _mips2c_call_systemv (fake GOAL stack below it, v0 as the result)
+- nothing / zero-func: wasm functions instead of x86 ret stubs
+- C functions with arg3_is_pp (new basic, copy basic, method-set!) get the current pp as their
+  4th argument through an intermediate adapter, like the x86 trampoline
+- goalc-wasm --debug-calls: check every call_indirect at runtime (env.check_call) and report
+  bad function objects with the call site
+---
+ game/kernel/common/codegen.h   | 23 +++++++++-
+ game/kernel/jak2/kscheme.cpp   | 36 ++++++++++++++-
+ game/mips2c/mips2c_table.cpp   | 80 +++++++++++++++++++++++++++++++++-
+ goalc/compiler/IR_wasm.cpp     | 13 +++++-
+ goalc/wasm/WasmCodegen.cpp     | 20 +++++++++
+ goalc/wasm/WasmCodegen.h       | 18 ++++++++
+ goalc/wasm/goalc_wasm_main.cpp |  2 +
+ web/goal_kernel_web.cpp        |  5 +++
+ web/goal_wasm_link.cpp         | 10 ++++-
+ 9 files changed, 200 insertions(+), 7 deletions(-)
+
+diff --git a/game/kernel/common/codegen.h b/game/kernel/common/codegen.h
+index 0b24beb5..fe65eeff 100644
+--- a/game/kernel/common/codegen.h
++++ b/game/kernel/common/codegen.h
+@@ -83,8 +83,25 @@ inline int emit_arm64_c_stub(u8* dst, u64 target, u64 trampoline, bool arg3_is_p
+ /*!
+  * Emits the host return stub used by GOAL `nothing`.
+  */
++#ifdef __EMSCRIPTEN__
++// Jakompiled web: a GOAL function object holds the wasm table index of its code (see
++// game/kernel/common/goal_c_fn.h). "nothing" and "zero-func" both return 0.
++inline u64 web_goal_zero_func(u64, u64, u64, u64, u64, u64, u64, u64) {
++  return 0;
++}
++
++inline int emit_web_zero_func(u8* dst) {
++  const u32 table_index = (u32)(uintptr_t)&web_goal_zero_func;
++  memcpy(dst, &table_index, 4);
++  memset(dst + 4, 0, 4);
++  return 8;
++}
++#endif
++
+ inline int emit_return_stub(u8* dst) {
+-#ifdef __aarch64__
++#ifdef __EMSCRIPTEN__
++  return emit_web_zero_func(dst);
++#elif defined __aarch64__
+   const u32 instr = 0xd65f03c0;  // ret
+   memcpy(dst, &instr, 4);
+   return 4;
+@@ -98,7 +115,9 @@ inline int emit_return_stub(u8* dst) {
+  * Emits a GOAL function that returns zero.
+  */
+ inline int emit_zero_stub(u8* dst) {
+-#ifdef __aarch64__
++#ifdef __EMSCRIPTEN__
++  return emit_web_zero_func(dst);
++#elif defined __aarch64__
+   // movz x0, #0 followed by ret
+   const u32 instrs[2] = {arm64::encode_movz_64(0, 0, 0), 0xd65f03c0};
+   memcpy(dst, instrs, 8);
+diff --git a/game/kernel/jak2/kscheme.cpp b/game/kernel/jak2/kscheme.cpp
+index ebc02ce9..6c54f77e 100644
+--- a/game/kernel/jak2/kscheme.cpp
++++ b/game/kernel/jak2/kscheme.cpp
+@@ -4,9 +4,11 @@
+ #ifdef __EMSCRIPTEN__
+ namespace jakompiled {
+ void register_kernel_primitives();  // web/goal_kernel_web.cpp
++unsigned long long goal_process_pointer();
+ }
+ #endif
+ 
++#include <array>
+ #include <cstdio>
+ #include <cstring>
+ 
+@@ -306,6 +308,36 @@ void _stack_call_arm64();
+ #endif
+ }
+ 
++#ifdef __EMSCRIPTEN__
++namespace {
++// arg3_is_pp: the x86 trampoline passes the current process (r13) as the 4th argument. In wasm
++// the function object points to one of these adapters instead, which calls the GOAL_C_FN adapter
++// with pp in its 4th argument.
++using WebGoalFn = u64 (*)(u64, u64, u64, u64, u64, u64, u64, u64);
++constexpr int kMaxPpFunctions = 16;
++WebGoalFn g_pp_targets[kMaxPpFunctions];
++int g_pp_target_count = 0;
++
++template <int Slot>
++u64 pp_adapter(u64 a0, u64 a1, u64 a2, u64, u64 a4, u64 a5, u64 a6, u64 a7) {
++  return g_pp_targets[Slot](a0, a1, a2, jakompiled::goal_process_pointer(), a4, a5, a6, a7);
++}
++
++template <int... Slots>
++constexpr auto make_pp_adapters(std::integer_sequence<int, Slots...>) {
++  return std::array<WebGoalFn, sizeof...(Slots)>{&pp_adapter<Slots>...};
++}
++const auto g_pp_adapters = make_pp_adapters(std::make_integer_sequence<int, kMaxPpFunctions>{});
++
++void* web_pp_function(void* func) {
++  ASSERT_MSG(g_pp_target_count < kMaxPpFunctions, "too many arg3_is_pp functions");
++  const int slot = g_pp_target_count++;
++  g_pp_targets[slot] = (WebGoalFn)func;
++  return (void*)g_pp_adapters[slot];
++}
++}  // namespace
++#endif
++
+ /*!
+  * This creates an OpenGOAL function from a C++ function. Only 6 arguments can be accepted.
+  * But calling this function is fast. It used to be really fast but wrong.
+@@ -316,7 +348,9 @@ Ptr<Function> make_function_from_c_systemv(void* func, bool arg3_is_pp) {
+ #ifdef __EMSCRIPTEN__
+   // Jakompiled web: func is a GOAL_C_FN adapter; the function object holds its wasm
+   // table index (and a zero word, like the stubs emitted by goalc for wasm).
+-  (void)arg3_is_pp;
++  if (arg3_is_pp) {
++    func = web_pp_function(func);
++  }
+   mem.cast<u32>().c()[0] = (u32)(uintptr_t)func;
+   mem.cast<u32>().c()[1] = 0;
+   return mem.cast<Function>();
+diff --git a/game/mips2c/mips2c_table.cpp b/game/mips2c/mips2c_table.cpp
+index ccd967ed..a16a3985 100644
+--- a/game/mips2c/mips2c_table.cpp
++++ b/game/mips2c/mips2c_table.cpp
+@@ -1,5 +1,11 @@
+ #include "mips2c_table.h"
+ 
++#include <array>
++#include <utility>
++#ifdef __EMSCRIPTEN__
++#include <alloca.h>
++#endif
++
+ #include "common/log/log.h"
+ #include "common/symbols.h"
+ 
+@@ -12,6 +18,13 @@
+ #include "game/kernel/jakx/kscheme.h"
+ #include "game/runtime.h"
+ 
++#ifdef __EMSCRIPTEN__
++namespace jakompiled {
++uint64_t goal_process_pointer();
++}
++extern u8* g_ee_main_mem;
++#endif
++
+ extern "C" {
+ #ifdef __aarch64__
+ #ifdef __APPLE__
+@@ -907,6 +920,60 @@ PerGameVersion<std::unordered_map<std::string, std::vector<void (*)()>>> gMips2C
+      {"cloth", {jakx::method_21_cloth_system::link}}},
+ };
+ 
++#ifdef __EMSCRIPTEN__
++// Jakompiled web: GOAL calls a mips2c function like any GOAL function, with call_indirect and the
++// uniform type (i64 x 8) -> i64. Wasm has no closures, so each registered function gets one adapter
++// from a fixed pool; the adapter does what _mips2c_call_systemv does on x86: build the MIPS register
++// state (ExecutionContext) with the GOAL fake stack below it, and return v0.
++namespace {
++constexpr int kMaxMips2cFunctions = 512;
++struct WebMips2c {
++  u64 (*exec)(void*) = nullptr;
++  u32 stack_size = 0;
++};
++WebMips2c g_web_mips2c[kMaxMips2cFunctions];
++int g_web_mips2c_count = 0;
++
++// sizes and register numbers as in asm_funcs_x86_64.asm
++constexpr u32 kContextSize = 1280;
++constexpr int kRegA0 = 4, kRegV0 = 2, kRegS6 = 22, kRegS7 = 23, kRegSp = 29;
++
++u64 web_mips2c_call(int slot, const u64 (&args)[8]) {
++  const auto& f = g_web_mips2c[slot];
++  // [GOAL fake stack (stack_size)][context]: the mips2c code moves sp down into the fake stack
++  u8* mem = (u8*)alloca(f.stack_size + kContextSize + 16);
++  u8* ctx = (u8*)(((uintptr_t)mem + f.stack_size + 15) & ~(uintptr_t)15);
++  memset(ctx, 0, kContextSize);
++  auto set_gpr = [&](int reg, u64 v) { memcpy(ctx + 16 * reg, &v, 8); };
++  for (int i = 0; i < 8; i++) {
++    set_gpr(kRegA0 + i, args[i]);  // a0-a3, t0-t3
++  }
++  set_gpr(kRegS6, jakompiled::goal_process_pointer());
++  set_gpr(kRegS7, s7.offset);
++  // the context is on the C stack, which is inside GOAL memory's address range in wasm
++  set_gpr(kRegSp, (u64)(ctx - g_ee_main_mem));
++  f.exec(ctx);
++  u64 v0;
++  memcpy(&v0, ctx + 16 * kRegV0, 8);
++  return v0;
++}
++
++template <int Slot>
++u64 web_mips2c_adapter(u64 a0, u64 a1, u64 a2, u64 a3, u64 a4, u64 a5, u64 a6, u64 a7) {
++  const u64 args[8] = {a0, a1, a2, a3, a4, a5, a6, a7};
++  return web_mips2c_call(Slot, args);
++}
++
++using WebGoalFn = u64 (*)(u64, u64, u64, u64, u64, u64, u64, u64);
++template <int... Slots>
++constexpr auto make_adapters(std::integer_sequence<int, Slots...>) {
++  return std::array<WebGoalFn, sizeof...(Slots)>{&web_mips2c_adapter<Slots>...};
++}
++const auto g_web_mips2c_adapters =
++    make_adapters(std::make_integer_sequence<int, kMaxMips2cFunctions>{});
++}  // namespace
++#endif
++
+ void LinkedFunctionTable::reg(const std::string& name, u64 (*exec)(void*), u32 stack_size) {
+   const auto& it = m_executes.insert({name, {exec, Ptr<u8>()}});
+   if (!it.second) {
+@@ -946,7 +1013,18 @@ void LinkedFunctionTable::reg(const std::string& name, u64 (*exec)(void*), u32 s
+   u8* ptr = jump_to_asm.c();
+   int written;
+ 
+-#ifdef __aarch64__
++#if defined __EMSCRIPTEN__
++  {
++    // the function object holds the table index of this function's adapter
++    ASSERT_MSG(g_web_mips2c_count < kMaxMips2cFunctions, "too many mips2c functions");
++    const int slot = g_web_mips2c_count++;
++    g_web_mips2c[slot] = {exec, stack_size};
++    const u32 table_index = (u32)(uintptr_t)g_web_mips2c_adapters[slot];
++    memset(ptr, 0, 8);
++    memcpy(ptr, &table_index, 4);
++    written = 8;
++  }
++#elif defined __aarch64__
+   // x9 is the target, x10 is the stack size, x17 jumps to the trampoline
+   written = emit_arm64_mov64(ptr, 9, (u64)exec);
+   written += emit_arm64_mov64(ptr + written, 10, (u64)stack_size);
+diff --git a/goalc/compiler/IR_wasm.cpp b/goalc/compiler/IR_wasm.cpp
+index f7534bda..f4247fcd 100644
+--- a/goalc/compiler/IR_wasm.cpp
++++ b/goalc/compiler/IR_wasm.cpp
+@@ -178,8 +178,17 @@ void IR_FunctionCall::do_codegen_wasm(FunctionGen& gen) {
+     gen.unsupported("a float return value");
+   }
+   // the function object holds the table index of the code
+-  auto table_index = BinaryenLoad(gen.module(), 4, false, gen.mem_offset(0), 4, BinaryenTypeInt32(),
+-                                  gen.goal_addr(gen.get(m_func)), wasm_backend::kMemoryName);
++  BinaryenExpressionRef table_index =
++      BinaryenLoad(gen.module(), 4, false, gen.mem_offset(0), 4, BinaryenTypeInt32(),
++                   gen.goal_addr(gen.get(m_func)), wasm_backend::kMemoryName);
++  if (gen.mod()->options().debug_calls) {
++    const int idx = gen.add_local(BinaryenTypeInt32());
++    gen.emit(BinaryenLocalSet(gen.module(), idx, table_index));
++    gen.emit(gen.mod()->check_call(BinaryenLocalGet(gen.module(), idx, BinaryenTypeInt32()),
++                                   gen.get(m_func),
++                                   fmt::format("{}: {}", gen.function_name(), print())));
++    table_index = BinaryenLocalGet(gen.module(), idx, BinaryenTypeInt32());
++  }
+   auto call = BinaryenCallIndirect(gen.module(), wasm_backend::kTableName, table_index, args.data(),
+                                    (BinaryenIndex)args.size(),
+                                    BinaryenTypeCreate(params.data(), (BinaryenIndex)params.size()),
+diff --git a/goalc/wasm/WasmCodegen.cpp b/goalc/wasm/WasmCodegen.cpp
+index fa67036a..2a2dd281 100644
+--- a/goalc/wasm/WasmCodegen.cpp
++++ b/goalc/wasm/WasmCodegen.cpp
+@@ -67,6 +67,10 @@ GameVersion FunctionGen::version() const {
+   return m_mod->version();
+ }
+ 
++std::string FunctionGen::function_name() const {
++  return m_env->name();
++}
++
+ void FunctionGen::unsupported(const std::string& what) const {
+   throw std::runtime_error(
+       fmt::format("wasm backend: {} is not supported yet (function {})", what, m_env->name()));
+@@ -422,6 +426,22 @@ ModuleGen::~ModuleGen() {
+   BinaryenModuleDispose(m_module);
+ }
+ 
++BinaryenExpressionRef ModuleGen::check_call(BinaryenExpressionRef table_index,
++                                            BinaryenExpressionRef function_object,
++                                            const std::string& where) {
++  static const char* kCheckCall = "env:check_call";
++  if (!BinaryenGetFunction(m_module, kCheckCall)) {
++    BinaryenType params[3] = {BinaryenTypeInt32(), BinaryenTypeInt64(), BinaryenTypeInt32()};
++    BinaryenAddFunctionImport(m_module, kCheckCall, kEnvModule, "check_call",
++                              BinaryenTypeCreate(params, 3), BinaryenTypeNone());
++  }
++  const int site = m_call_sites++;
++  printf("[debug-calls] %s site %d: %s\n", m_env->name().c_str(), site, where.c_str());
++  BinaryenExpressionRef args[3] = {table_index, function_object,
++                                   BinaryenConst(m_module, BinaryenLiteralInt32(site))};
++  return BinaryenCall(m_module, kCheckCall, args, 3, BinaryenTypeNone());
++}
++
+ BinaryenExpressionRef ModuleGen::import_global(const std::string& module,
+                                               const std::string& field,
+                                               const std::string& internal) {
+diff --git a/goalc/wasm/WasmCodegen.h b/goalc/wasm/WasmCodegen.h
+index f1384d30..4bea718e 100644
+--- a/goalc/wasm/WasmCodegen.h
++++ b/goalc/wasm/WasmCodegen.h
+@@ -90,6 +90,10 @@ struct Options {
+   // compile functions the backend can't handle yet to a stub that traps ("unreachable"), and
+   // list them in unsupported_report, instead of failing the whole object
+   bool trap_unsupported = false;
++  // before every call_indirect, call the imported env.check_call(table index, function object,
++  // call site) so the runtime can report a bad call instead of a bare trap (goalc-wasm
++  // --debug-calls; the call sites are printed to stdout)
++  bool debug_calls = false;
+ };
+ 
+ class ModuleGen;
+@@ -112,6 +116,14 @@ class FunctionGen {
+   BinaryenExpressionRef set(const RegVal* rv, BinaryenExpressionRef value);
+   BinaryenType type_of(const RegVal* rv) const;
+ 
++  std::string function_name() const;
++
++  // a new local, for temporaries
++  int add_local(BinaryenType type) {
++    m_local_types.push_back(type);
++    return (int)m_local_types.size() - 1;
++  }
++
+   // emission into the current block
+   void emit(BinaryenExpressionRef e) { m_cur_exprs.push_back(e); }
+   void set_conditional_branch(int target_ir, BinaryenExpressionRef cond);
+@@ -176,6 +188,11 @@ class ModuleGen {
+   std::vector<u8> run();
+ 
+   BinaryenModuleRef module() const { return m_module; }
++  const Options& options() const { return m_options; }
++  // Options::debug_calls: call env.check_call before an indirect call
++  BinaryenExpressionRef check_call(BinaryenExpressionRef table_index,
++                                   BinaryenExpressionRef function_object,
++                                   const std::string& where);
+   GameVersion version() const { return m_version; }
+ 
+   BinaryenExpressionRef s7();
+@@ -200,6 +217,7 @@ class ModuleGen {
+   FileEnv* m_env;
+   GameVersion m_version;
+   Options m_options;
++  int m_call_sites = 0;
+   BinaryenModuleRef m_module;
+   std::unordered_map<std::string, std::string> m_imported_globals;  // module.field -> internal
+   const Layout* m_layout = nullptr;
+diff --git a/goalc/wasm/goalc_wasm_main.cpp b/goalc/wasm/goalc_wasm_main.cpp
+index faa8cb5d..cff58592 100644
+--- a/goalc/wasm/goalc_wasm_main.cpp
++++ b/goalc/wasm/goalc_wasm_main.cpp
+@@ -54,6 +54,8 @@ int main(int argc, char** argv) {
+       options.trap_unsupported = true;
+     } else if (a == "--out-dir" && i + 1 < argc) {
+       out_dir = fs::path(argv[++i]);
++    } else if (a == "--debug-calls") {
++      options.debug_calls = true;
+     } else if (a == "--print-ir") {
+       print_ir = true;
+     } else {
+diff --git a/web/goal_kernel_web.cpp b/web/goal_kernel_web.cpp
+index f910b33f..2b390d39 100644
+--- a/web/goal_kernel_web.cpp
++++ b/web/goal_kernel_web.cpp
+@@ -82,6 +82,7 @@ EM_JS(void, js_kernel_init, (), {
+ 
+ EM_JS(uint64_t, js_get_sp, (), { return globalThis.jak.sp.value; });
+ EM_JS(void, js_set_sp, (uint64_t v), { globalThis.jak.sp.value = v; });
++EM_JS(uint64_t, js_get_pp, (), { return globalThis.jak.pp.value; });
+ 
+ // Kernel side: start (pc != 0) or wake (pc == 0) the fiber of a thread, and wait until it
+ // suspends (returns 0) or ends (returns 1).
+@@ -281,6 +282,10 @@ void set_goal_stack_pointer(u64 v) {
+   set_sp(v);
+ }
+ 
++u64 goal_process_pointer() {
++  return js_get_pp();
++}
++
+ void kernel_init() {
+   js_kernel_init();
+ }
+diff --git a/web/goal_wasm_link.cpp b/web/goal_wasm_link.cpp
+index dbff74d5..9b9d3212 100644
+--- a/web/goal_wasm_link.cpp
++++ b/web/goal_wasm_link.cpp
+@@ -56,7 +56,15 @@ EM_JS(int, jakompiled_instantiate,
+   }
+   const imports = {
+     // sp and pp are shared by every GOAL module (web/goal_kernel_web.cpp)
+-    env: { mem: wasmMemory, table: wasmTable, s7: BigInt(s7), sp: globalThis.jak.sp, pp: globalThis.jak.pp },
++    env: { mem: wasmMemory, table: wasmTable, s7: BigInt(s7), sp: globalThis.jak.sp, pp: globalThis.jak.pp,
++           // goalc-wasm --debug-calls: report an indirect call that would trap
++           check_call: (index, fobj, site) => {
++             const f = index > 0 && index < wasmTable.length ? wasmTable.get(index) : null;
++             if (!f || f.length !== 8) {
++               err(`[jakompiled] ${objName}: bad call at site ${site}: function object ` +
++                   `0x${fobj.toString(16)}, table index ${index}` + (f ? `, ${f.length} params` : ""));
++             }
++           } },
+     seg: { main: BigInt(seg_main), debug: BigInt(seg_debug), "top-level": BigInt(seg_top) },
+     sym: {},
+   };
+-- 
+2.43.0
+
