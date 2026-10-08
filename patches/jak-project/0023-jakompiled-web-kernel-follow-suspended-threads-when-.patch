@@ -1,0 +1,158 @@
+From d6f3ab494c112b8729b6df2170c757bbe93a9108 Mon Sep 17 00:00:00 2001
+From: RubenGGBC <rgallego007@ikasle.ehu.eus>
+Date: Thu, 8 Oct 2026 10:34:08 +0200
+Subject: [PATCH 23/24] jakompiled: web kernel: follow suspended threads when
+ their process is relocated
+
+The process heap compaction relocates processes, and their cpu-threads,
+while they are suspended. The web kernel keeps the JSPI fiber (and C stack)
+of a suspended thread by thread address, so after a relocation the kernel
+resumed a thread that had no fiber and the process stopped running
+("thread-resume: thread ... has no suspended stack" on every frame).
+
+The relocate method of cpu-thread now calls jakompiled-thread-relocate in
+the wasm build, which moves the fiber to the new address. The end of a
+fiber and its crash handler use its current address.
+---
+ goal_src/jak2/engine/entity/relocate.gc |  4 ++
+ goal_src/jak2/kernel/gkernel.gc         |  1 +
+ web/goal_kernel_web.cpp                 | 53 +++++++++++++++++++++----
+ 3 files changed, 51 insertions(+), 7 deletions(-)
+
+diff --git a/goal_src/jak2/engine/entity/relocate.gc b/goal_src/jak2/engine/entity/relocate.gc
+index 759a08ac..ebd4f7e7 100644
+--- a/goal_src/jak2/engine/entity/relocate.gc
++++ b/goal_src/jak2/engine/entity/relocate.gc
+@@ -101,6 +101,10 @@
+ 
+ (defmethod relocate ((this cpu-thread) (arg0 int))
+   (&+! (-> this process) arg0)
++  ;; Jakompiled: the web kernel keeps the wasm stack of a suspended thread by thread address
++  (#when (eq? INSTRUCTION_SET 'wasm)
++    (jakompiled-thread-relocate this (the-as cpu-thread (&+ this arg0)))
++    )
+   this
+   )
+ 
+diff --git a/goal_src/jak2/kernel/gkernel.gc b/goal_src/jak2/kernel/gkernel.gc
+index 09c3fd01..bbc3ef36 100644
+--- a/goal_src/jak2/kernel/gkernel.gc
++++ b/goal_src/jak2/kernel/gkernel.gc
+@@ -448,6 +448,7 @@
+ (define-extern jakompiled-thread-restart (function function object object object object pointer none))
+ (define-extern jakompiled-thread-resume (function cpu-thread pointer pointer none))
+ (define-extern jakompiled-thread-suspend (function none))
++(define-extern jakompiled-thread-relocate (function cpu-thread cpu-thread none))
+ (define-extern jakompiled-call-on-stack (function function pointer object))
+ (define-extern jakompiled-catch (function catch-frame function (pointer uint64) object))
+ (define-extern jakompiled-throw (function catch-frame object none))
+diff --git a/web/goal_kernel_web.cpp b/web/goal_kernel_web.cpp
+index f67ea49f..ca37bb84 100644
+--- a/web/goal_kernel_web.cpp
++++ b/web/goal_kernel_web.cpp
+@@ -12,6 +12,9 @@
+ //      ThreadExit     return-from-thread, return-from-thread-dead, abandon-thread
+ //      ThreadRestart  go, from the main thread: restart the thread on the new state's code
+ //      GoalThrow      throw-dispatch: return a value from a catch frame
++//  - Fibers are kept by thread address. The process heap compaction relocates processes (and
++//    their threads) while they are suspended, so the relocate method of cpu-thread tells the
++//    runtime (jakompiled-thread-relocate) to move the fiber to the new address.
+ //  - Each fiber has its own C stack (Emscripten's __stack_pointer), switched on every resume
+ //    and suspend: C++ frames of a suspended fiber must not be overwritten by the kernel.
+ //  - The GOAL stack pointer and pp are wasm globals shared by all GOAL modules (env.sp, env.pp);
+@@ -104,13 +107,15 @@ EM_ASYNC_JS(int, js_resume, (uint32_t thread, uint32_t pc, uint32_t c_stack_top)
+       wake();
+     } else {
+       // a new fiber (also when set-to-run reset a suspended thread: its old stack is dropped)
+-      J.fibers.set(thread, {wake : null, sp : 0});
++      const fiber = {wake : null, sp : 0};
++      J.fibers.set(thread, fiber);
+       J.fiberMain ??= WebAssembly.promising(wasmExports['jakompiled_fiber_main']);
+       stackRestore(c_stack_top);
+       J.fiberMain(thread, pc).catch((e) => {
+         // the stack names the GOAL functions (each GOAL wasm module has a name section)
+         err(`[jakompiled] process thread 0x${thread.toString(16)} crashed: ${e}\n${e?.stack ?? ""}`);
+-        J.fibers.delete(thread);
++        // by identity: the thread may have been relocated since it started
++        for (const [k, v] of J.fibers) if (v === fiber) J.fibers.delete(k);
+         J.kernelWake?.(1);
+       });
+     }
+@@ -133,6 +138,16 @@ EM_ASYNC_JS(void, js_suspend, (uint32_t thread), {
+ });
+ // clang-format on
+ 
++// The thread of a fiber moved (process relocation).
++EM_JS(void, js_relocate, (uint32_t from, uint32_t to), {
++  const J = globalThis.jak;
++  const f = J.fibers.get(from);
++  if (f) {
++    J.fibers.delete(from);
++    J.fibers.set(to, f);
++  }
++});
++
+ // Fiber side: the fiber's code ended, the kernel can continue.
+ EM_JS(void, js_fiber_done, (uint32_t thread), {
+   const J = globalThis.jak;
+@@ -231,9 +246,31 @@ void jakompiled_thread_suspend() {
+   if (!g_current_fiber_thread) {
+     lg::die("jakompiled: suspend outside of a process main thread");
+   }
+-  const u32 me = g_current_fiber_thread;
+-  js_suspend(me);
+-  g_current_fiber_thread = me;
++  js_suspend(g_current_fiber_thread);
++  // no need to restore g_current_fiber_thread: the kernel set it before waking us, with our
++  // current address (we may have been relocated while suspended)
++}
++
++void jakompiled_thread_relocate(u64 from, u64 to) {
++  const u32 f = (u32)from;
++  const u32 t = (u32)to;
++  if (f == t) {
++    return;
++  }
++  auto it = g_fiber_c_stacks.find(f);
++  if (it != g_fiber_c_stacks.end()) {
++    u8* stack = it->second;
++    g_fiber_c_stacks.erase(it);
++    auto& dst = g_fiber_c_stacks[t];
++    if (dst) {
++      free(dst);  // left by a thread that died while suspended at that address
++    }
++    dst = stack;
++  }
++  js_relocate(f, t);
++  if (g_current_fiber_thread == f) {
++    g_current_fiber_thread = t;
++  }
+ }
+ 
+ }  // namespace
+@@ -265,11 +302,11 @@ extern "C" EMSCRIPTEN_KEEPALIVE uint64_t jakompiled_fiber_main(uint32_t thread,
+       break;
+     } catch (GoalThrow& t) {
+       lg::error("jakompiled: throw to catch frame 0x{:x} escaped process thread 0x{:x}", t.frame,
+-                thread);
++                g_current_fiber_thread);
+       break;
+     }
+   }
+-  js_fiber_done(thread);
++  js_fiber_done(g_current_fiber_thread);  // our address now, not necessarily `thread`
+   return 0;
+ }
+ 
+@@ -298,6 +335,8 @@ void register_kernel_primitives() {
+   make_function_symbol_from_c("jakompiled-thread-restart", GOAL_C_FN(jakompiled_thread_restart));
+   make_function_symbol_from_c("jakompiled-thread-resume", GOAL_C_FN(jakompiled_thread_resume));
+   make_function_symbol_from_c("jakompiled-thread-suspend", GOAL_C_FN(jakompiled_thread_suspend));
++  make_function_symbol_from_c("jakompiled-thread-relocate",
++                              GOAL_C_FN(jakompiled_thread_relocate));
+   make_function_symbol_from_c("jakompiled-call-on-stack", GOAL_C_FN(jakompiled_call_on_stack));
+   make_function_symbol_from_c("jakompiled-catch", GOAL_C_FN(jakompiled_catch));
+   make_function_symbol_from_c("jakompiled-throw", GOAL_C_FN(jakompiled_throw));
+-- 
+2.50.1 (Apple Git-155)
+

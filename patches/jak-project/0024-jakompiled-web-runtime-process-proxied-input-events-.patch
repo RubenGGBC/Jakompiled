@@ -1,0 +1,44 @@
+From 5ee5c8948162cb63daae79338443e26b4242ec1b Mon Sep 17 00:00:00 2001
+From: RubenGGBC <rgallego007@ikasle.ehu.eus>
+Date: Thu, 8 Oct 2026 10:34:08 +0200
+Subject: [PATCH 24/24] jakompiled: web runtime: process proxied input events
+ every frame
+
+The browser's keyboard events reach SDL as calls proxied from the main
+browser thread to the graphics thread, which never returns to the worker's
+event loop. Process the queue before polling SDL events.
+---
+ game/graphics/pipelines/opengl.cpp | 10 ++++++++++
+ 1 file changed, 10 insertions(+)
+
+diff --git a/game/graphics/pipelines/opengl.cpp b/game/graphics/pipelines/opengl.cpp
+index 9dec7a20..3dc1974b 100644
+--- a/game/graphics/pipelines/opengl.cpp
++++ b/game/graphics/pipelines/opengl.cpp
+@@ -46,6 +46,10 @@
+ 
+ #include "third-party/stb_image/stb_image.h"
+ 
++#ifdef __EMSCRIPTEN__
++#include <emscripten/threading.h>
++#endif
++
+ constexpr bool run_dma_copy = false;
+ 
+ constexpr PerGameVersion<int> fr3_level_count(jak1::LEVEL_TOTAL,
+@@ -596,6 +600,12 @@ void render_game_frame(int game_width,
+ }
+ 
+ void GLDisplay::process_sdl_events() {
++#ifdef __EMSCRIPTEN__
++  // Jakompiled web: the browser's input events reach SDL as calls proxied from the main browser
++  // thread to this one, which only run when this thread processes its queue. The graphics loop
++  // never returns to the worker's event loop, so do it here, once per frame.
++  emscripten_current_thread_process_queued_calls();
++#endif
+   SDL_Event evt;
+   while (SDL_PollEvent(&evt) != 0) {
+     if (evt.type == SDL_EVENT_QUIT) {
+-- 
+2.50.1 (Apple Git-155)
+

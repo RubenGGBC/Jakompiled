@@ -20,24 +20,29 @@ Idioma del proyecto: castellano (docs, mensajes, scripts). Código y comentarios
 | Extracción de la ISO en el navegador (`extract.html`) | ✅ con la ISO real (NTSC v2.01, SCUS-97265): ~2,5 min, pico de 5,3 GB (extractor en wasm64) |
 | Montaje de los DGO/CGO desde la ISO (`--web-build`) | ✅ los 150 que monta el build nativo (`game.gp`), 0 objetos sin encontrar |
 | Runtime leyendo de OPFS | ✅ con la ISO real: carga `GAME.CGO`, los `.fr3` y llega a `play-boot!` |
-| Renderer en WebGL 2 | ⚠️ pinta la pantalla de carga del juego (datos de la ISO); el juego se para antes del primer nivel |
-| Input (teclado/mando), sonido | ❌ pendiente |
+| Renderer en WebGL 2 | ✅ logos de la intro, pantalla de título ("Press the Start Button") y menú principal |
+| Teclado | ✅ Enter abre el menú (parche 0024); sin probar más allá |
+| Mando, sonido | ❌ pendiente (mando: falta `sdl_controller_db.txt`; sonido: `Cubeb init failed`) |
 
-## Siguiente paso: el renderer llama a código GOAL desde el hilo de gráficos
+## Siguiente paso: empezar partida (New Game) y llegar al primer nivel jugable
 
-Arreglado (parche 0021): las listas estáticas de los objetos wasm quedaban mal enlazadas (`lookup-level-info` se salía de la memoria). Ahora el motor carga el nivel `title`.
+Arreglado en esta sesión:
+- 0022: el renderer simulaba la interrupción VIF1 llamando a código GOAL desde el hilo de gráficos (donde no existen los módulos wasm). En jak2 ese handler solo hace profiling de buckets: en la web no se llama.
+- 0023: la compactación del heap de procesos mueve procesos (y sus `cpu-thread`) mientras están suspendidos; el kernel web guardaba la fibra JSPI por dirección del hilo y la perdía (`thread-resume: thread ... has no suspended stack` en cada fotograma; esos procesos dejaban de ejecutarse). Ahora `relocate` de `cpu-thread` llama a `jakompiled-thread-relocate` (cambia código GOAL: hay que recompilar CODE.PAK y volver a montar los DGO con `steps=build`).
+- 0024: el bucle de gráficos no vuelve al event loop del worker; procesa en cada fotograma las llamadas que el navegador le reenvía (teclado de SDL).
 
-Fallo actual: en el primer fotograma, `OpenGLRenderer::dispatch_buckets_jak2` → `vif_interrupt_callback` (`game/kernel/common/kmachine.cpp`) → `call_goal` del handler VIF1 de GOAL (`vif1-handler`, `goal_src/jak2/engine/gfx/hw/display.gc`, instalado con `install-handler 5`). Ese código corre en el hilo de gráficos, pero los módulos wasm de GOAL, su tabla y `globalThis.jak` (sp/pp) solo existen en el worker del hilo EE → `TypeError ... reading 'sp'` en `js_get_sp` y `std::terminate`. Opciones: no llamar al handler en la web (solo hace profiling de buckets; comprobarlo) o reenviar la llamada al hilo EE.
+Pendiente conocido: las fibras de procesos que mueren mientras están suspendidos no se liberan (256 KB de pila C cada una) salvo que otro hilo reutilice la dirección. Vigilar la memoria en partidas largas.
 
 Para ver excepciones JS dentro de los workers: CDP con pausa en excepciones (Chromium con `--remote-debugging-port=0` y el puerto leído de `DevToolsActivePort` de su propio perfil; nunca un puerto fijo, puede ser el Chrome del usuario).
 
-Recompilar: `gk`/extractor con Docker `emscripten/emsdk:6.0.11`; `goalc-wasm` (y `KERNEL.CGO`, `CODE.PAK`, `GAME.CGO` con `backend/build_*.sh`) en una imagen Ubuntu 24.04 con clang, lld, cmake, ninja, nasm, python3, libssl-dev (en Windows los `.sh` del repo tienen CRLF: convertirlos dentro del contenedor).
+Recompilar: `gk`/extractor con Docker `emscripten/emsdk:6.0.11` (instalar `ninja-build` dentro); `goalc-wasm` (y `KERNEL.CGO`, `CODE.PAK`, `GAME.CGO` con `backend/build_*.sh`, el GAME.CGO servido con `EMPTY_TPAGE_DIR=1`) en una imagen Ubuntu 24.04 con clang, lld, cmake, ninja, nasm, python3, libssl-dev (en Windows los `.sh` del repo tienen CRLF: convertirlos dentro del contenedor). En un Mac con Apple Silicon la imagen tiene que ser `--platform linux/amd64` (en aarch64 el CMake de jak-project pasa `-mavx`); `goalc-wasm` enlaza con `.so` por RPATH absoluto, así que hay que montar el árbol en la misma ruta al compilarlo y al usarlo. El árbol de trabajo (jak-project + parches) va en `web/work/`, ignorado por git.
 
 Probar (la ISO va en `iso/`, ignorada por git; en Windows no hay WSL, se compila con Docker `emscripten/emsdk:6.0.11`):
 
 ```sh
 cd listo-para-probar && node serve.mjs . 8080      # en otra terminal
 # PROFILE: perfil persistente (un contexto efímero no tiene cuota de OPFS para 4 GB)
+# CHANNEL=chrome: usa el Chrome instalado (con el perfil de PROFILE, no el del usuario)
 PROFILE=/tmp/perfil PLAYWRIGHT=$(npm root -g)/playwright/index.js node ../web/tests/test-flow.mjs   http://localhost:8080 ../iso/jak2.iso iso,extract,build "calling play-boot" 1800
 ```
 
@@ -46,7 +51,7 @@ Con `steps=build` (o `extract,build`) se repite solo una parte sobre lo que ya h
 Lo aprendido con la ISO real:
 - El descompilador necesita ~5,3 GB: el extractor se compila en wasm64 (`-DJAKOMPILED_MEMORY64=ON`, `build-web64/`); `gk` sigue en wasm32.
 - Los tamaños de los `.fr3` y de la cabecera zstd van siempre en 8 bytes (antes dependían de `size_t`).
-- Pendiente aparte: input (teclado/mando: falta `sdl_controller_db.txt`) y sonido.
+- Pendiente aparte: mando (falta `sdl_controller_db.txt`) y sonido.
 
 ## Estructura
 

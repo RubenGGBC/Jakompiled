@@ -1,0 +1,34 @@
+From 18a16f763763db0ff1f3edf443777a38d3701ba2 Mon Sep 17 00:00:00 2001
+From: RubenGGBC <rgallego007@ikasle.ehu.eus>
+Date: Thu, 8 Oct 2026 09:38:29 +0200
+Subject: [PATCH] jakompiled: web runtime: skip the GOAL VIF1 handler on the
+ graphics thread
+
+The renderer fakes VIF1 interrupts from the graphics thread, but the GOAL
+wasm modules and their registers only exist in the EE worker. The jak2
+handler only records bucket profiling, so it is skipped on the web.
+---
+ game/kernel/common/kmachine.cpp | 7 +++++++
+ 1 file changed, 7 insertions(+)
+
+diff --git a/game/kernel/common/kmachine.cpp b/game/kernel/common/kmachine.cpp
+index 7bef5721..87a10766 100644
+--- a/game/kernel/common/kmachine.cpp
++++ b/game/kernel/common/kmachine.cpp
+@@ -417,6 +417,13 @@ void DecodeTime(u32 ptr) {
+ 
+ void vif_interrupt_callback(int bucket_id) {
+   // added for the PC port for faking VIF interrupts from the graphics system.
++#ifdef __EMSCRIPTEN__
++  // This runs on the graphics thread, but the GOAL wasm modules (and their stack/process
++  // registers) only exist in the EE worker. The jak2 handler only records per-bucket profiling
++  // (vif1-handler-debug; vif1-handler is empty), so skip it.
++  (void)bucket_id;
++  return;
++#endif
+   if (vif1_interrupt_handler && MasterExit == RuntimeExitStatus::RUNNING) {
+     call_goal(Ptr<Function>(vif1_interrupt_handler), bucket_id, 0, 0, s7.offset, g_ee_main_mem);
+   }
+-- 
+2.50.1 (Apple Git-155)
+

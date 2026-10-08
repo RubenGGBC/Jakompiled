@@ -10,11 +10,13 @@ const { chromium } = pw.chromium ? pw : pw.default;
 const [base, isoPath, steps, okRegex, timeoutS = "300"] = process.argv.slice(2);
 const timeout = Number(timeoutS) * 1000;
 const args = ["--use-angle=swiftshader", "--enable-unsafe-swiftshader"];
+// CHANNEL=chrome: usa el Chrome instalado en vez del Chromium de Playwright (con su propio perfil)
+const opts = { args, ...(process.env.CHANNEL ? { channel: process.env.CHANNEL } : {}) };
 // PROFILE=dir: perfil persistente. Con una ISO real hace falta: un contexto efímero (incógnito)
 // tiene una cuota de OPFS muy pequeña para los ~4,4 GB de la ISO más lo extraído.
 const context = process.env.PROFILE
-  ? await chromium.launchPersistentContext(process.env.PROFILE, { args })
-  : await (await chromium.launch({ args })).newContext();
+  ? await chromium.launchPersistentContext(process.env.PROFILE, opts)
+  : await (await chromium.launch(opts)).newContext();
 const browser = { close: () => context.close() };
 
 function waitFor(page, regex) {
