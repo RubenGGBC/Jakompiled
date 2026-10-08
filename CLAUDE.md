@@ -25,7 +25,15 @@ Idioma del proyecto: castellano (docs, mensajes, scripts). Código y comentarios
 | Sonido | ✅ parche 0028: cubeb sobre Web Audio (`web/cubeb_web.cpp`: hilo productor → búfer circular en la memoria de wasm → AudioWorklet); arranca con la primera tecla/clic (`[audio] running`). Probado por el usuario: suena bien |
 | Mando | ❓ sin probar. El aviso de `sdl_controller_db.txt` no debería importar: SDL3 mapea los mandos con mapping "standard" del navegador |
 
-## En curso (2026-10-08): rayas de las partículas 3D y rendimiento (40–47 fps)
+## Continuación del 2026-10-08 (Windows)
+
+- Rayas de partículas: no reproducidas en las secuencias capturadas en Chrome de Windows. La réplica CPU y transform feedback en GPU coinciden dentro del error numérico; `camera`, `hvdf_offset` y `pfog0` se leen de WebGL idénticos a los subidos, con error GL 0. No hay arreglo del shader confirmado. Diagnóstico y capturas en `web/work/`, ignorado; no distribuirlos.
+- Rendimiento: 0030 sustituye la espera normal por `requestAnimationFrame` del worker y usa `MessageChannel` en las rutas sin pacing. El problema adicional era `Atomics.wait`: pedir 1 o 5 ms tarda ~15,6 ms en este Windows. Test de título antes: mediana 39,5 fps; después: 60,0 / 60,0 / 60,0. Cinco tests del reloj pasan. El log `[perf]` ahora incluye input, eventos, GUI, otros y ajustes efectivos. El modo avanzado de lag conserva su limitador.
+- Solo cambian los binarios `gk`; no cambia CODE.PAK ni hace falta volver a extraer.
+- El usuario autoriza continuar y ejecutar diagnósticos automáticos sin volver a pedir confirmación.
+- Fibras corregidas en 0031 y verificadas sin ISO (160 procesos, cero fibras retenidas). Pendiente: recorrido más allá de la cárcel y mando físico si está disponible.
+
+## Contexto anterior: rayas de las partículas 3D y rendimiento (40–47 fps)
 
 **Rayas de colores ("glow bugeados")** en la pantalla de título (Jak transformándose, antorchas) y en el juego: triángulos larguísimos que salen en abanico desde un punto.
 - Culpable aislado: renderer `particles` (Sprite3), **solo los sprites 3D** (`rendermode 3` en `sprite3_3d.vert`). Desactivando `m_3d_enable` la imagen sale limpia; ni merc, ni generic, ni glow, ni los sprites 2D.
@@ -52,13 +60,13 @@ Arreglado en esta sesión:
 - 0026: índices de merc y hfrag (ver arriba).
 - 0025: los vertex shaders de tfrag/tie/shrub/hfrag declaran el índice de color como `int` y el renderer lo pasa sin signo: WebGL 2 rechazaba todos sus draws. `web/glsl_es.py` los declara sin signo en las versiones GLSL ES (`UNSIGNED_ATTRIBUTES`); `gl_web.cpp` traduce `GL_UNSIGNED_INT_8_8_8_8` y los formatos internos sin tamaño (`GL_RED`, `GL_RG`, `GL_DEPTH_COMPONENT`).
 
-Pendiente conocido: las fibras de procesos que mueren mientras están suspendidos no se liberan (256 KB de pila C cada una) salvo que otro hilo reutilice la dirección.
+Corregido en 0031: `deactivate` libera la fibra JSPI y su pila C cuando otro proceso la mata suspendida; la autodesactivación conserva su pila hasta ThreadExit. Prueba de 160 procesos: 160 fibras retenidas antes, cero después. Regresión suspend/catch/estados correcta. Recompilados runtime, CODE.PAK, KERNEL.CGO y GAME.CGO; reconstruir DGO en OPFS con `steps=build` para actualizar el kernel del juego.
 
 Depurar el renderer:
 - Los errores de WebGL salen en la consola del worker que tiene el OffscreenCanvas, no en la de la página. Con CDP: `Target.setAutoAttach` a nivel de navegador (`flatten`; navegar de `about:blank` a la página con COOP/COEP cambia de proceso y de target) y `Log.enable` en cada sesión; Chrome solo imprime los 32 primeros errores por contexto.
 - Para saber qué renderer falla: envolver en `gl_web.cpp` `glUseProgram`/`glDrawElements`/`glDrawArrays` y contar draws y `glGetError` por shader (nombre desde `Shader::Shader`). Se usó y se quitó; está en el historial de esta sesión, no en el repo.
 - Teclas por defecto: Enter = Start, Espacio = X, flechas = cruceta, WASD = stick izquierdo. Para llegar a la cárcel: Enter, Espacio (New Game), Espacio (aviso de guardado) y esperar. Con Playwright: el input lee el estado del teclado una vez por fotograma, así que hay que mantener la tecla pulsada ~1,5 s, y conviene guiarse por la consola (`Load soundbank menu1` = menú abierto, `introcst` = partida empezada) en vez de por tiempos.
-- `web/tests/play.mjs` juega con un guion (`wait:`, `key:`, `shot:`, `audio`) sobre un perfil ya extraído. El usuario prefiere probar él mismo en su Chrome: no lanzar sesiones de juego automáticas sin preguntar (para capturas de diagnóstico dio permiso).
+- `web/tests/play.mjs` juega con un guion (`wait:`, `key:`, `shot:`, `audio`) sobre un perfil ya extraído. El usuario autoriza ahora las sesiones automáticas de diagnóstico y pruebas (08/10/2026); usar perfiles propios, sin tocar su Chrome personal.
 - Para mirar dentro de OPFS (tamaños de los `.fr3`, logs del extractor en `/log`): una página del mismo origen con `navigator.storage.getDirectory()`.
 - Trazas temporales en GOAL (p. ej. `format 0` en `link-art!`): recompilar CODE.PAK (~10 min emulado), copiarlo a `listo-para-probar/data` y volver a montar los DGO (`steps=build`). Restaurar el CODE.PAK limpio después (se puede comprobar con `cmp` contra el de git).
 - Para regenerar los shaders: `python3 web/glsl_es.py glslang spirv-cross <jak-project>/game/graphics/opengl_renderer/shaders <jak-project>/game/graphics/opengl_renderer/shaders_es/jak2 jak2` en un Ubuntu con `glslang-tools` y `spirv-cross`.
@@ -91,3 +99,7 @@ Lo aprendido con la ISO real:
 - `docs/` — plan y diario de cada fase.
 
 Compilar desde cero necesita git, cmake, ninja, clang, nasm, python3 y emsdk 6.0.11 activo (en Windows, WSL).
+
+Pruebas de continuación: `web/tests/test-web-frame-clock.mjs` (5 casos), `test-frame-pacing.mjs` (ISO en PROFILE), `test-fiber-cleanup.mjs` (kernel con `backend/tests/runtime/fiber-cleanup.gc`, sin ISO). Parches 0030 y 0031.
+
+Validación del 0031 con ISO real: DGO reconstruidos correctamente, título e introducción a 60 fps; en la cárcel, múltiples ventanas estables de 60 fps, movimiento, golpe, salto y muerte/reaparición por teclado sin excepciones registradas. AudioContext activo. Ningún mando conectado (`getGamepads`: cuatro entradas vacías). El recorrido completo más allá de la cárcel sigue pendiente.

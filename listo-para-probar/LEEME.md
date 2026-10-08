@@ -55,7 +55,8 @@ Si actualizas esta carpeta y solo ha cambiado `gk.wasm`, basta con recargar la p
 ### Qué esperar
 
 - Funciona: intro, título, menú, New Game, cinemáticas y la cárcel, con escenario y personajes.
-- Todavía no: **sonido** y **mando**. Más allá de la cárcel está sin probar.
+- Sonido por Web Audio, probado por el usuario: se activa con la primera tecla o clic.
+- Pendiente: probar el mando y jugar más allá de la cárcel. Las rayas de partículas 3D reportadas anteriormente siguen pendientes de reproducir en el equipo afectado. El título alcanza 60 fps de mediana en el Chrome de Windows probado (parche 0030).
 - Si algo se ve mal, haz una captura y copia lo que salga en la consola de Chrome (Cmd+Opción+J / Ctrl+Mayús+J), sobre todo las líneas con `WebGL` o `GL_INVALID`.
 
 Para parar el servidor, cierra la ventana negra (Terminal o símbolo del sistema).
@@ -65,3 +66,5 @@ Para parar el servidor, cierra la ventana negra (Terminal o símbolo del sistema
 - *"Falta aislamiento cross-origin"*: has abierto el HTML directamente. Ábrelo con `abrir-mac.command` / `abrir-windows.bat`, desde `http://localhost:8080`.
 - *"Falta Node.js"*: instálalo desde nodejs.org y vuelve a abrir el script.
 - La pestaña se cierra o se queda sin memoria: dímelo con lo último que salió en el registro.
+
+Actualización 0031: corregida la retención de pilas de procesos suspendidos. Si ya tienes la ISO extraída, abre `http://localhost:8080/extract.html?steps=build` y selecciona de nuevo tu ISO para iniciar la reconstrucción e incorporar el nuevo kernel, reutilizando los datos de OPFS.

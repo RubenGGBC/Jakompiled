@@ -5,6 +5,15 @@
 
 ---
 
+## Trabajo pendiente, por orden (2026-10-08)
+
+1. Partículas 3D: diagnosticar las rayas con la réplica CPU del shader y verificar el arreglo visualmente.
+2. Rendimiento: completada la medición del bucle y corregidas las esperas (0030); título a 60 fps de mediana en Chrome de Windows. Introducción y cárcel también estables a 60 fps; faltan otros niveles.
+3. Procesos: corregido en 0031. La prueba de 160 procesos suspendidos termina con cero fibras retenidas; regresión de suspend/catch/estados correcta.
+4. Validación manual: mando y juego más allá de la cárcel.
+
+La extracción con ISO real, OPFS, el teclado y el sonido ya están probados. Los hitos históricos de abajo conservan lo que aún requiere validación completa.
+
 ## 1. Por qué Jak 2 (y no Jak 3)
 
 | Criterio | Jak 1 | Jak 2 | Jak 3 |
@@ -84,7 +93,7 @@ ISO del usuario → extractor → decompilador → código .gc (GOAL)
 ### Fase 2 — Runtime en Emscripten (2–4 semanas)
 - [x] Compilar `gk` con `-pthread` ([fase2-runtime.md](fase2-runtime.md))
 - [x] Renderer y audio en stub; carga de objetos GOAL desactivada
-- [x] Sistema de ficheros: preload para pruebas y OPFS más adelante (preload hecho; OPFS pendiente)
+- [x] Sistema de ficheros: preload para pruebas y OPFS más adelante (preload y OPFS hechos)
 - [x] Servidor local con cabeceras COOP/COEP
 
 **Salida:** el kernel C++ arranca en el navegador e intenta cargar el primer DGO.
@@ -108,9 +117,9 @@ ISO del usuario → extractor → decompilador → código .gc (GOAL)
 
 ### Fase 5 — Jak 2 jugable (2–3 meses)
 - [ ] Renderers propios de Jak 2
-- [ ] Audio: SDL → Web Audio
+- [x] Audio: cubeb → Web Audio (0028, probado por el usuario)
 - [ ] Input: Gamepad API
-- [ ] Extracción de la ISO y persistencia en OPFS (adelantada: [extraccion-iso.md](extraccion-iso.md), falta probarla con la ISO real)
+- [x] Extracción de la ISO y persistencia en OPFS (probada con la ISO real NTSC v2.01: [extraccion-iso.md](extraccion-iso.md))
 - [ ] Optimización con el profiler del navegador: draw calls, tamaño de módulos, tiempos de carga
 
 **Salida:** Jak 2 completable de principio a fin en Chrome de escritorio a un framerate estable.

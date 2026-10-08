@@ -1,0 +1,85 @@
+From 0000000000000000000000000000000000000031 Mon Sep 17 00:00:00 2001
+From: Jakompiled <jakompiled@localhost>
+Date: Thu, 8 Oct 2026 21:30:00 +0200
+Subject: [PATCH] jakompiled: dispose suspended fibers when processes die
+
+Remove the JSPI fiber and free its C stack before returning a deactivated
+process to its pool. Defer self-disposal to the existing ThreadExit path,
+which still runs on that stack. Only persistent main-thread fibers need
+this cleanup; temporary threads use synchronous call-on-stack.
+
+A source-only regression kills 160 suspended processes. Retained fibers
+drop from 160 to zero. Rebuild CODE.PAK and KERNEL.CGO with this runtime.
+
+diff --git a/goal_src/jak2/kernel/gkernel.gc b/goal_src/jak2/kernel/gkernel.gc
+index bbc3ef36..8c8d20e0 100644
+--- a/goal_src/jak2/kernel/gkernel.gc
++++ b/goal_src/jak2/kernel/gkernel.gc
+@@ -449,6 +449,7 @@
+ (define-extern jakompiled-thread-resume (function cpu-thread pointer pointer none))
+ (define-extern jakompiled-thread-suspend (function none))
+ (define-extern jakompiled-thread-relocate (function cpu-thread cpu-thread none))
++(define-extern jakompiled-thread-dispose (function cpu-thread none))
+ (define-extern jakompiled-call-on-stack (function function pointer object))
+ (define-extern jakompiled-catch (function catch-frame function (pointer uint64) object))
+ (define-extern jakompiled-throw (function catch-frame object none))
+@@ -3000,6 +3001,12 @@
+           )
+         )
+ 
++      ;; In wasm a thread killed by another process can still own a suspended
++      ;; JSPI stack and a C stack. Release them before its GOAL memory is reused.
++      (#when (eq? INSTRUCTION_SET 'wasm)
++        (jakompiled-thread-dispose (-> this main-thread))
++        )
++
+       ;; return process memory to the pool
+       (return-process (-> this pool) this)
+ 
+diff --git a/web/goal_kernel_web.cpp b/web/goal_kernel_web.cpp
+index ca37bb84..81297940 100644
+--- a/web/goal_kernel_web.cpp
++++ b/web/goal_kernel_web.cpp
+@@ -148,6 +148,12 @@ EM_JS(void, js_relocate, (uint32_t from, uint32_t to), {
+   }
+ });
+ 
++// Kernel side: a different process killed this suspended thread. Dropping its
++// only wake callback lets JSPI collect the unreachable suspended wasm stack.
++EM_JS(void, js_dispose, (uint32_t thread), {
++  globalThis.jak.fibers.delete(thread);
++});
++
+ // Fiber side: the fiber's code ended, the kernel can continue.
+ EM_JS(void, js_fiber_done, (uint32_t thread), {
+   const J = globalThis.jak;
+@@ -251,6 +257,21 @@ void jakompiled_thread_suspend() {
+   // current address (we may have been relocated while suspended)
+ }
+ 
++void jakompiled_thread_dispose(u64 thread) {
++  const u32 t = (u32)thread;
++  // Self-deactivation is still executing on this C stack. The normal exit path
++  // releases it after ThreadExit unwinds back to js_resume.
++  if (t == g_current_fiber_thread) {
++    return;
++  }
++  js_dispose(t);
++  auto it = g_fiber_c_stacks.find(t);
++  if (it != g_fiber_c_stacks.end()) {
++    free(it->second);
++    g_fiber_c_stacks.erase(it);
++  }
++}
++
+ void jakompiled_thread_relocate(u64 from, u64 to) {
+   const u32 f = (u32)from;
+   const u32 t = (u32)to;
+@@ -337,6 +358,7 @@ void register_kernel_primitives() {
+   make_function_symbol_from_c("jakompiled-thread-suspend", GOAL_C_FN(jakompiled_thread_suspend));
+   make_function_symbol_from_c("jakompiled-thread-relocate",
+                               GOAL_C_FN(jakompiled_thread_relocate));
++  make_function_symbol_from_c("jakompiled-thread-dispose", GOAL_C_FN(jakompiled_thread_dispose));
+   make_function_symbol_from_c("jakompiled-call-on-stack", GOAL_C_FN(jakompiled_call_on_stack));
+   make_function_symbol_from_c("jakompiled-catch", GOAL_C_FN(jakompiled_catch));
+   make_function_symbol_from_c("jakompiled-throw", GOAL_C_FN(jakompiled_throw));

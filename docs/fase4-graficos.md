@@ -1,6 +1,6 @@
 # Fase 4: gráficos en WebGL 2
 
-> **Estado: con la ISO real el juego se ve y se juega con teclado hasta la cárcel.** Logos de la intro, pantalla de título con Haven City de fondo, menú principal, New Game, cinemáticas y la cárcel con escenario, personajes (Jak), sombras y efectos. Chrome no informa de ningún error de WebGL desde el arranque hasta la cárcel. Falta el sonido, el mando y probar más allá de la cárcel. Detalles en [4.2](#42-con-la-iso-real-lo-que-webgl-2-no-acepta).
+> **Estado: con la ISO real el juego se ve y se juega con teclado hasta la cárcel.** Logos de la intro, pantalla de título con Haven City de fondo, menú principal, New Game, cinemáticas y la cárcel con escenario, personajes (Jak), sombras y efectos. Chrome no informa de ningún error de WebGL desde el arranque hasta la cárcel. El sonido por Web Audio está implementado y probado por el usuario (0028). Falta probar el mando y más allá de la cárcel; las partículas 3D presentan rayas de colores pendientes de diagnóstico. Detalles en [4.2](#42-con-la-iso-real-lo-que-webgl-2-no-acepta).
 
 Antes (sin datos de la ISO): `gk` crea un contexto WebGL 2 desde su hilo principal (una pthread), compila los **92 shaders** del renderer traducidos a GLSL ES y ejecuta el bucle de render a la vez que el EE arranca el kernel.
 
@@ -115,7 +115,41 @@ Teclas por defecto de OpenGOAL:
 
 ## Lo siguiente
 
-- Sonido (`Cubeb init failed`: no hay backend de audio en la web).
-- Mando (falta `sdl_controller_db.txt` en `/data/game/assets`).
+- Diagnosticar las rayas de las partículas 3D: reproducir en CPU los cálculos de `sprite3_3d.vert`, comprobar uniforms y clipping. Desactivar los sprites 3D elimina las rayas; las pruebas de cuaterniones no muestran errores.
+- Completar la medición del bucle de render. El log `[perf]` (0029) mide unos 47 fps en el título: EE 0,8 ms, render 4,3 ms y swap 5,6 ms; faltan partes del bucle por medir.
+- Probar el mando. SDL3 usa el mapping estándar del navegador; la ausencia de `sdl_controller_db.txt` no demuestra un fallo.
 - Jugar más allá de la cárcel y anotar lo que falle.
-- Medir el rendimiento con un nivel real (draw calls, `glMultiDrawElements` en bucle) en un navegador con GPU.
+
+El parche 0028 implementa cubeb sobre Web Audio: hilo productor → búfer circular en memoria wasm → AudioWorklet. El audio arranca con la primera tecla o clic (`[audio] running`) y el usuario ha confirmado que suena bien. El parche 0029 usa `GL_NEAREST` para muestrear profundidad en glow; corrige su oclusión, pero no las rayas de los sprites 3D.
+
+## 4.4 Diagnóstico de partículas en Windows (2026-10-08)
+
+Se repitió el flujo con la ISO local y un perfil aislado de Chrome: 150 DGO/CGO, 0 objetos faltantes y arranque desde OPFS. Se capturaron secuencias de la introducción y del título. En estas capturas no se reprodujo el abanico de triángulos descrito anteriormente; eso no demuestra que esté arreglado en otros equipos.
+
+La réplica CPU de `sprite3_3d.vert` detecta quads próximos al plano de cámara y esquinas con `w` de signos distintos. Una comparación independiente mediante transform feedback en WebGL 2 reproduce las posiciones CPU dentro del error de coma flotante, incluso para esos quads. La lectura de `camera`, `hvdf_offset` y `pfog0` con `glGetUniformfv` coincide exactamente con lo enviado; tanto las subidas como las lecturas devuelven error GL 0.
+
+No se cambia el shader sin una reproducción del fallo. La instrumentación y las capturas permanecen en `web/work/` (ignorado por git); las capturas y las trazas derivadas de la ISO no se distribuyen.
+
+## 4.5 Ritmo de fotogramas en Windows (parche 0030)
+
+La prueba `web/tests/test-frame-pacing.mjs`, con un perfil de Chrome aislado y la ISO ya extraída, fallaba con una mediana de 39,5 fps. Las nuevas medidas completan el bucle: input, eventos, GUI y tiempo restante, además de render, limitador y presentación.
+
+Dos esperas añadían retrasos que no eran trabajo del motor: los temporizadores encadenados de `SDL_GL_SwapWindow` costaban unos 4,8 ms por fotograma; `std::this_thread::sleep_for` usa `Atomics.wait` en Emscripten, y en este Windows una espera solicitada de 1 o 5 ms tarda unos 15,6 ms.
+
+El runtime web usa `requestAnimationFrame` del worker para el limitador habitual, conservando el objetivo de FPS con plazos acumulados. Tras una pausa larga reinicia el plazo. Sin limitador, o con el modo avanzado de lag, cede mediante `MessageChannel`; el limitador avanzado y el build nativo conservan su implementación. La opción de vsync nativa no controla la presentación de WebGL. El ritmo normal queda limitado por la frecuencia de presentación del navegador.
+
+Resultado del mismo test: **60,0 / 60,0 / 60,0 fps**, mediana **60,0** (umbral: 55). EE: 0,2–0,4 ms; render: 6,0–7,4 ms; GUI: 2,5–3,4 ms; limitador/presentación: el resto hasta 16,7 ms. No es una medida del resto de niveles.
+
+También pasan cinco pruebas deterministas (`node web/tests/test-web-frame-clock.mjs`): objetivos de 30 y 60 fps, pantalla de 144 Hz, pausa larga y cambio de objetivo. El test de rendimiento requiere `PROFILE`, `CHANNEL=chrome` y `PLAYWRIGHT`, igual que `play.mjs`.
+
+Solo cambian `gk.js` y `gk.wasm`: no hace falta extraer de nuevo ni reconstruir los DGO.
+
+## 4.6. Fibras de procesos desactivados (2026-10-08)
+
+El parche 0031 elimina la entrada JSPI y libera la pila C antes de devolver un proceso desactivado a su pool. Cuando el proceso se mata a sí mismo, ThreadExit conserva la responsabilidad de liberar la pila al salir. Una prueba sin ISO crea y mata 160 procesos suspendidos: antes retenía 160 fibras y después quedan cero. También pasa la regresión de suspensión, catch, cambio de estado y autodesactivación.
+
+Distribución recompilada con el nuevo kernel. Como cambia código GOAL, hay que reconstruir los DGO en OPFS (`extract.html?steps=build`); selecciona de nuevo la ISO en esa página para iniciar el proceso, que reutiliza los datos ya extraídos.
+
+Validación del 0031 con ISO real: DGO reconstruidos correctamente, título e introducción a 60 fps; en la cárcel, múltiples ventanas estables de 60 fps, movimiento, golpe, salto y muerte/reaparición por teclado sin excepciones registradas. AudioContext activo. Ningún mando conectado (`getGamepads`: cuatro entradas vacías). El recorrido completo más allá de la cárcel sigue pendiente.
+
+Revisión independiente: sin hallazgos importantes. La prueba automática cuenta las fibras JSPI; no mide directamente la memoria de las pilas C. La liberación y eliminación de su mapa se han revisado en el código.

@@ -1,0 +1,197 @@
+From 0000000000000000000000000000000000000030 Mon Sep 17 00:00:00 2001
+From: Jakompiled <jakompiled@localhost>
+Date: Thu, 8 Oct 2026 20:17:00 +0200
+Subject: [PATCH] jakompiled: web runtime: pace frames on the browser clock
+
+The native frame limiter sleeps through Atomics.wait. On Windows Chrome,
+a requested 1 or 5 ms wait can take 15.6 ms. SDL also yields through a
+chained setTimeout(0), adding about 4.8 ms to each frame.
+
+Use worker requestAnimationFrame for normal web frame limiting, carrying
+the target deadline forward across display refreshes and resetting after
+long stalls. Use MessageChannel to yield when browser pacing is disabled.
+The native build and the advanced accurate-lag mode retain their limiter.
+
+Complete [perf] with input, events, GUI, unaccounted time and settings.
+On the same isolated Chrome profile, the title improves from a median
+39.5 fps to 60.0 fps (three steady samples); input and sound still require
+normal browser gestures. No GOAL code or ISO data changes are required.
+
+---
+diff --git a/game/graphics/pipelines/opengl.cpp b/game/graphics/pipelines/opengl.cpp
+index b122bebf..dbc9c2af 100644
+--- a/game/graphics/pipelines/opengl.cpp
++++ b/game/graphics/pipelines/opengl.cpp
+@@ -47,6 +47,7 @@
+ #include "third-party/stb_image/stb_image.h"
+ 
+ #ifdef __EMSCRIPTEN__
++#include <emscripten.h>
+ #include <emscripten/threading.h>
+ #endif
+ 
+@@ -105,11 +106,40 @@ std::unique_ptr<GraphicsData> g_gfx_data;
+ // Jakompiled web: where each frame's time goes on the graphics thread, logged every few seconds
+ // ([perf] in the console). "ee" is the game's own time (GOAL code) between the end of a render and
+ // the next DMA chain; the graphics thread waits for it in "wait".
++// SDL's Emscripten swap only yields with emscripten_sleep(0). Chained timers have a
++// minimum delay in Chrome; a posted message yields to the worker's event loop without it.
++// Use this path when browser pacing is disabled (including the advanced lag mode).
++EM_ASYNC_JS(void, web_yield_frame, (), {
++  const yieldFrame = globalThis.jakompiledYieldFrame || (globalThis.jakompiledYieldFrame = (() => {
++    const channel = new MessageChannel();
++    let resume;
++    channel.port1.onmessage = () => { const done = resume; resume = null; done(); };
++    return () => new Promise((resolve) => { resume = resolve; channel.port2.postMessage(0); });
++  })());
++  await yieldFrame();
++});
++
++// Atomics.wait (used by the native limiter) can round even a 1 ms sleep up to
++// about 15.6 ms on Windows. Use the browser presentation clock for web vsync.
++// Carry the deadline forward to support target rates below the display rate;
++// after a long stall reset it instead of trying to catch up with a burst.
++EM_ASYNC_JS(void, web_limit_frame, (double interval), {
++  const clock = globalThis.jakompiledFrameClock ||
++      (globalThis.jakompiledFrameClock = {next: 0, interval: 0});
++  if (clock.interval !== interval) { clock.next = 0; clock.interval = interval; }
++  let stamp;
++  do { stamp = await new Promise((resolve) => requestAnimationFrame(resolve)); }
++  while (stamp < clock.next - 0.5);
++  clock.next = clock.next > 0 && stamp - clock.next < interval
++      ? clock.next + interval : stamp + interval;
++});
++
+ struct WebFrameStats {
+   Timer since_log;
+   Timer frame;
+   int frames = 0;
+   double wait = 0, render = 0, limiter = 0, swap = 0, ee = 0, worst = 0;
++  double input = 0, events = 0, gui = 0;
+ 
+   void end_frame() {
+     double t = frame.getSeconds();
+@@ -120,9 +150,12 @@ struct WebFrameStats {
+     if (elapsed >= 5.0) {
+       auto ms = [&](double x) { return 1000.0 * x / frames; };
+       lg::info("[perf] {:.1f} fps | ms/frame: wait-for-ee {:.1f} (ee {:.1f}), render {:.1f}, "
+-               "limiter {:.1f}, swap {:.1f}, worst frame {:.1f}",
+-               frames / elapsed, ms(wait), ms(ee), ms(render), ms(limiter), ms(swap),
+-               1000.0 * worst);
++               "input {:.1f}, events {:.1f}, gui {:.1f}, limiter {:.1f}, swap {:.1f}, other {:.1f}, "
++               "worst frame {:.1f}, target {:.0f}, vsync {}",
++               frames / elapsed, ms(wait), ms(ee), ms(render), ms(input), ms(events), ms(gui),
++               ms(limiter), ms(swap),
++               1000.0 * elapsed / frames - ms(wait + render + input + events + gui + limiter + swap),
++               1000.0 * worst, Gfx::g_global_settings.target_fps, Gfx::g_global_settings.vsync);
+       *this = WebFrameStats();
+     }
+   }
+@@ -674,6 +707,9 @@ void GLDisplay::process_sdl_events() {
+  * Main function called to render graphics frames. This is called in a loop.
+  */
+ void GLDisplay::render() {
++#ifdef __EMSCRIPTEN__
++  Timer input_timer;
++#endif
+   // Before we process the current frames SDL events we for keyboard/mouse button inputs.
+   //
+   // This technically means that keyboard/mouse button inputs will be a frame behind but the
+@@ -695,6 +731,10 @@ void GLDisplay::render() {
+     m_input_manager->finish_polling();
+   }
+   // Now process SDL Events
++#ifdef __EMSCRIPTEN__
++  g_web_stats.input += input_timer.getSeconds();
++  Timer events_timer;
++#endif
+   process_sdl_events();
+   // Also process any display related events received from the EE (the game)
+   // this is done here so they run from the perspective of the graphics thread
+@@ -707,6 +747,10 @@ void GLDisplay::render() {
+     m_input_manager->process_ee_events();
+   }
+ 
++#ifdef __EMSCRIPTEN__
++  g_web_stats.events += events_timer.getSeconds();
++  Timer gui_timer;
++#endif
+   // imgui start of frame
+   {
+     auto p = scoped_prof("imgui-new-frame");
+@@ -715,6 +759,9 @@ void GLDisplay::render() {
+     ImGui::NewFrame();
+   }
+ 
++#ifdef __EMSCRIPTEN__
++  g_web_stats.gui += gui_timer.getSeconds();
++#endif
+   // framebuffer size
+   int fbuf_w, fbuf_h;
+   SDL_GetWindowSizeInPixels(m_window, &fbuf_w, &fbuf_h);
+@@ -756,6 +803,9 @@ void GLDisplay::render() {
+     }
+   }
+ 
++#ifdef __EMSCRIPTEN__
++  gui_timer.start();
++#endif
+   // render debug
+   if (is_imgui_visible()) {
+     auto p = scoped_prof("debug-gui");
+@@ -770,13 +820,25 @@ void GLDisplay::render() {
+   // actual vsync
+   g_gfx_data->debug_gui.finish_frame();
+ #ifdef __EMSCRIPTEN__
++  g_web_stats.gui += gui_timer.getSeconds();
+   Timer limiter_timer;
++#endif
++#ifdef __EMSCRIPTEN__
++  const bool browser_paced = Gfx::g_global_settings.framelimiter &&
++      !Gfx::g_global_settings.experimental_accurate_lag;
+ #endif
+   if (Gfx::g_global_settings.framelimiter) {
+     auto p = scoped_prof("frame-limiter");
+-    g_gfx_data->frame_limiter.run(
+-        Gfx::g_global_settings.target_fps, Gfx::g_global_settings.experimental_accurate_lag,
+-        Gfx::g_global_settings.sleep_in_frame_limiter, g_gfx_data->last_engine_time);
++#ifdef __EMSCRIPTEN__
++    if (browser_paced) {
++      web_limit_frame(1000.0 / Gfx::g_global_settings.target_fps);
++    } else
++#endif
++    {
++      g_gfx_data->frame_limiter.run(
++          Gfx::g_global_settings.target_fps, Gfx::g_global_settings.experimental_accurate_lag,
++          Gfx::g_global_settings.sleep_in_frame_limiter, g_gfx_data->last_engine_time);
++    }
+   }
+ 
+ #ifdef __EMSCRIPTEN__
+@@ -785,7 +847,13 @@ void GLDisplay::render() {
+ #endif
+   {
+     auto p = scoped_prof("swap-buffers");
++#ifdef __EMSCRIPTEN__
++    if (!browser_paced) {
++      web_yield_frame();
++    }
++#else
+     SDL_GL_SwapWindow(m_window);
++#endif
+   }
+ #ifdef __EMSCRIPTEN__
+   g_web_stats.swap += swap_timer.getSeconds();
+diff --git a/web/CMakeLists.txt b/web/CMakeLists.txt
+index 2a504f15..4de4ec6a 100644
+--- a/web/CMakeLists.txt
++++ b/web/CMakeLists.txt
+@@ -124,7 +124,7 @@ target_link_options(gk PRIVATE
+   # JSPI: GOAL process threads are suspendable wasm stacks (web/goal_kernel_web.cpp)
+   -sJSPI
+   # WebGL 2 on the canvas, transferred as an OffscreenCanvas to main()'s pthread, which runs the
+-  # render loop; each SDL_GL_SwapWindow yields to the browser (emscripten_sleep through JSPI)
++  # render loop; RAF pacing or MessageChannel yields to the browser through JSPI
+   -sMAX_WEBGL_VERSION=2
+   -sMIN_WEBGL_VERSION=2
+   -sOFFSCREENCANVAS_SUPPORT

@@ -1,8 +1,8 @@
 # Extracción de la ISO en el navegador
 
-> **Estado: lista para probar con una ISO real.** Desde la ISO hasta el juego: la página extrae y descompila la ISO, monta los 168 DGO/CGO del juego (código wasm + datos de la ISO) y el runtime los usa desde OPFS.
+> **Estado: probada con una ISO real de Jak II NTSC v2.01 (SCUS-97265).** Extracción en el navegador en unos 2,5 minutos, con un pico de memoria de 5,3 GB y extractor wasm64. El montaje sigue `game.gp`: 150 DGO/CGO, sin objetos faltantes. El runtime lee los datos desde OPFS y llega a la cárcel.
 >
-> Antes: Con una ISO de prueba (sin datos del juego), la página lee el sistema de ficheros ISO9660, copia los ficheros a OPFS byte a byte y arranca el extractor de OpenGOAL compilado a wasm. El extractor valida la versión y se detiene porque el ejecutable de la ISO de prueba no es el de Jak II. Falta comprobar la descompilación con la ISO real, que solo puede hacerse en la máquina del usuario.
+> Las pruebas con ISO sintética descritas abajo son anteriores y sirven para comprobar ISO9660 y OPFS sin datos del juego.
 
 En el plan esta tarea estaba en la fase 5. La adelanto porque es lo que separa el motor, que ya corre en el navegador (fase 3.6), de los datos del juego.
 
@@ -55,7 +55,7 @@ Después de descompilar, el extractor (`--web-build`, [`web/build_game_web.cpp`]
 | `dir-tpages.go` | Compilador de datos de `goalc`, desde la salida del descompilador |
 | `*COMMON.TXT` (texto del juego) | Ídem, con `game_text.txt` del descompilador y los JSON del proyecto |
 | `*SUBTI2.TXT` (subtítulos) | Ídem, con los JSON del proyecto |
-| Los 168 DGO/CGO de `goal_src/jak2/dgos/*.gd` | Código: `CODE.PAK`, servido con la página. Datos: `raw_obj` del descompilador (tu ISO) |
+| Los 150 DGO/CGO seleccionados por `goal_src/jak2/game.gp` | Código: `CODE.PAK`, servido con la página. Datos: `raw_obj` del descompilador (tu ISO) |
 
 `CODE.PAK` ([`backend/build_code.sh`](../backend/build_code.sh)) contiene **todo el código del juego compilado a wasm**: kernel, motor y niveles, **839 objetos y 18.475 funciones, sin ninguna trampa**, 21 MB. Se compilan en el orden de `goal_src/jak2/game.gp` ([`backend/code_sources.py`](../backend/code_sources.py)).
 
@@ -109,6 +109,6 @@ Es el mismo resultado que daría el extractor nativo con esa ISO.
 
 ## Riesgos pendientes
 
-- **Memoria**: el descompilador carga todos los DGO a la vez. En wasm32 el límite es 4 GB. Si no cabe, se descompilará por grupos de DGO (la configuración permite limitar las entradas).
+- **Memoria**: la ISO real supera el límite de 4 GB de wasm32; se usa el extractor wasm64 (pico medido de 5,3 GB). El runtime sigue en wasm32.
 - **Tiempo**: el extractor nativo tarda unos minutos. En wasm será algo más lento; la extracción solo se hace una vez.
-- **Ficheros de datos aún sin probar**: el montaje con datos reales, el texto del juego y el directorio de texturas solo se pueden comprobar con la ISO.
+- **Cobertura**: el montaje con datos reales está probado hasta la cárcel; falta validar el resto de niveles durante el juego.
