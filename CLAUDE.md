@@ -20,7 +20,7 @@ Idioma del proyecto: castellano (docs, mensajes, scripts). Código y comentarios
 | Extracción de la ISO en el navegador (`extract.html`) | ✅ con la ISO real (NTSC v2.01, SCUS-97265): ~2,5 min, pico de 5,3 GB (extractor en wasm64) |
 | Montaje de los DGO/CGO desde la ISO (`--web-build`) | ✅ los 150 que monta el build nativo (`game.gp`), 0 objetos sin encontrar |
 | Runtime leyendo de OPFS | ✅ con la ISO real: carga `GAME.CGO`, los `.fr3` y llega a `play-boot!` |
-| Renderer en WebGL 2 | ⚠️ menús, escenario (tfrag/tie/shrub, 0025), sombras, efectos y mallas de personajes (merc, 0026). Por comprobar en un navegador con GPU: si los personajes salen bien (en SwiftShader algunos merc salen como cajas rosas planas: ¿textura?) |
+| Renderer en WebGL 2 | ⚠️ menús, escenario (tfrag/tie/shrub, 0025), sombras, efectos y mallas de personajes (merc, 0026; comprobado en Chrome con GPU: Jak se ve) |
 | Teclado | ✅ parche 0024. Enter = Start, Espacio = X (confirmar), flechas = cruceta; New Game llega al aviso de guardado y carga los niveles de la cinemática inicial (`introcst`, `village1`, `ctyindb`, `prison`, `forexita`) sin errores |
 | Mando, sonido | ❌ pendiente (mando: falta `sdl_controller_db.txt`; sonido: `Cubeb init failed`) |
 
