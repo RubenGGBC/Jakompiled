@@ -21,10 +21,10 @@ Idioma del proyecto: castellano (docs, mensajes, scripts). Código y comentarios
 | Montaje de los DGO/CGO desde la ISO (`--web-build`) | ✅ los 150 que monta el build nativo (`game.gp`), 0 objetos sin encontrar |
 | Runtime leyendo de OPFS | ✅ con la ISO real: carga `GAME.CGO`, los `.fr3` y llega a `play-boot!` |
 | Renderer en WebGL 2 | ✅ logos de la intro, pantalla de título ("Press the Start Button") y menú principal |
-| Teclado | ✅ Enter abre el menú (parche 0024); sin probar más allá |
+| Teclado | ✅ parche 0024. Enter = Start, Espacio = X (confirmar), flechas = cruceta; New Game llega al aviso de guardado y carga los niveles de la cinemática inicial (`introcst`, `village1`, `ctyindb`, `prison`, `forexita`) sin errores |
 | Mando, sonido | ❌ pendiente (mando: falta `sdl_controller_db.txt`; sonido: `Cubeb init failed`) |
 
-## Siguiente paso: empezar partida (New Game) y llegar al primer nivel jugable
+## Siguiente paso: pasar la cinemática inicial y llegar al primer nivel jugable (verlo en el navegador, no solo por capturas)
 
 Arreglado en esta sesión:
 - 0022: el renderer simulaba la interrupción VIF1 llamando a código GOAL desde el hilo de gráficos (donde no existen los módulos wasm). En jak2 ese handler solo hace profiling de buckets: en la web no se llama.
