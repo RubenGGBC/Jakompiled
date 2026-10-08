@@ -353,8 +353,33 @@ Un `call_indirect` que falla solo dice `null function or function signature mism
 | Argumentos y retornos de 128 bits, `&var` | ✅ (3.5) |
 | Compilar `GAME.CGO` (motor del juego) con el backend | ✅ (3.5): 9.063 funciones, 0 trampas |
 | Funciones mips2c (C++ llamado desde GOAL con el ABI de la PS2) | ✅ (3.6) |
-| Cargar y ejecutar `GAME.CGO` en el runtime web | ✅ (3.6): hasta el primer objeto que necesita texturas de la ISO |
+| Cargar y ejecutar `GAME.CGO` en el runtime web | ✅ (3.6, 3.7): con la ISO real llega a la cárcel |
+| Procesos reubicados por la compactación del heap | ✅ (3.7) |
 | Rendimiento del código generado frente a x86 | Pendiente: medir con el juego en marcha (fase 4) |
+
+## 3.7 Con la ISO real: listas estáticas, handler VIF1 y procesos reubicados
+
+Con los datos de una ISO real (NTSC v2.01) el motor pasa de `play-boot!`, carga los niveles y llega a la cárcel. Por el camino salieron tres fallos que con `GAME.CGO` sin datos no se veían.
+
+### Listas estáticas enlazadas dos veces (parche 0021)
+
+El backend wasm genera cada objeto dos veces (primero para calcular el layout, luego el objeto final con el módulo dentro). `StaticPair::generate` añadía sus registros de enlace en cada llamada, así que `klink` enlazaba dos veces cada símbolo de una lista estática: la primera escribía su dirección, la segunda (sin el `-1` de marcador) su desplazamiento desde `s7`. Las listas acababan en `-7` en vez de `'()`, y `lookup-level-info` recorría `*level-load-list*` fuera de la memoria. Ahora `generate` empieza de cero cada vez.
+
+### El renderer llamaba a GOAL desde el hilo de gráficos (0022)
+
+El port de PC simula la interrupción VIF1 de la PS2 llamando al handler GOAL (`install-handler 5`) desde el renderer, que corre en el hilo de gráficos. En la web los módulos wasm de GOAL, su tabla y el estado del kernel (`globalThis.jak`: sp, pp, fibras) solo existen en el worker del EE: `TypeError ... reading 'sp'` y `std::terminate` en el primer fotograma. En Jak 2 ese handler solo hace profiling por bucket (`vif1-handler` está vacío y `vif1-handler-debug` solo rellena `*profile-interrupt-segment*`), así que en la web no se llama.
+
+### Procesos reubicados mientras están suspendidos (0023)
+
+El heap de procesos de Jak 2 se compacta: `relocate` mueve un proceso (y su `cpu-thread`, que vive en su heap) a otra dirección mientras está suspendido. El kernel web guarda la pila JSPI de cada hilo suspendido ("fibra") y su pila C indexadas por la dirección del hilo, así que después de la compactación el kernel reanudaba un hilo sin fibra (`thread-resume: thread ... has no suspended stack` en cada fotograma) y esos procesos dejaban de ejecutarse. En el título se notaba en las luces y partículas que faltaban.
+
+Guardar un identificador dentro del propio `cpu-thread` (en `rreg`, que el `thread-suspend` de wasm no usa) no basta: `relocate` copia la memoria sin borrar el origen, y las copias se solapan cuando el hueco es menor que el proceso, así que desde C no se distingue un hilo movido de una copia vieja. La solución es que GOAL avise: en el build wasm, `relocate` de `cpu-thread` llama a `jakompiled-thread-relocate` con la dirección antigua y la nueva, y el runtime mueve la fibra (JS) y su pila C. El final de una fibra y su manejador de errores usan la dirección actual del hilo, no la del arranque.
+
+Queda pendiente: la fibra de un proceso que muere mientras está suspendido no se libera (256 KB de pila C) salvo que otro hilo reutilice la misma dirección.
+
+### Ruido que no es un fallo
+
+El registro se llena de `ERROR: "<art-group>" could not find a master slot to link for #<art-joint-anim ...>`. Con una traza en `link-art!` (`goal_src/jak2/engine/load/loader.gc`) se vio que el art group maestro existe, tiene huecos libres y la animación **ya está** en su hueco: `link-art!` se llama dos veces para el mismo art group y la segunda vez avisa. No es del backend wasm.
 
 ### Reproducir
 

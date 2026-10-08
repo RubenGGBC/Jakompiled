@@ -1,6 +1,8 @@
 # Fase 4: gráficos en WebGL 2
 
-> **Estado: el renderer de OpenGOAL arranca en el navegador.** `gk` crea un contexto WebGL 2 desde su hilo principal (una pthread), compila los **92 shaders** del renderer traducidos a GLSL ES y ejecuta el bucle de render a la vez que el EE arranca el kernel. El canvas sale negro porque todavía no hay nada que pintar: las texturas y los niveles (`.fr3`) salen de la ISO del usuario.
+> **Estado: con la ISO real el juego se ve y se juega con teclado hasta la cárcel.** Logos de la intro, pantalla de título con Haven City de fondo, menú principal, New Game, cinemáticas y la cárcel con escenario, personajes (Jak), sombras y efectos. Chrome no informa de ningún error de WebGL desde el arranque hasta la cárcel. Falta el sonido, el mando y probar más allá de la cárcel. Detalles en [4.2](#42-con-la-iso-real-lo-que-webgl-2-no-acepta).
+
+Antes (sin datos de la ISO): `gk` crea un contexto WebGL 2 desde su hilo principal (una pthread), compila los **92 shaders** del renderer traducidos a GLSL ES y ejecuta el bucle de render a la vez que el EE arranca el kernel.
 
 Prueba: `index.html?display=1` (kernel) o `?boot=game&display=1` (motor).
 
@@ -68,8 +70,52 @@ glad carga todo como si fuera OpenGL 4.3. Las funciones que el navegador no tien
 
 Sin `GAME.fr3` (texturas comunes, que genera el extractor), el renderer arranca en web con un nivel común vacío y sin animaciones de textura, como Jak 1. Así se puede probar todo lo demás sin la ISO.
 
+## 4.2 Con la ISO real: lo que WebGL 2 no acepta
+
+Con los `.fr3` y los DGO montados desde la ISO (en OPFS), el renderer ya tenía datos. Lo primero que se vio fueron los menús (2D) bien y el juego en 3D casi vacío: solo partículas y brillos sobre negro, y luego el escenario sin personajes. En todos los casos la causa era la misma: OpenGL de escritorio tolera cosas que WebGL 2 rechaza, y WebGL 2 no deja que fallen en silencio: **rechaza el draw o la llamada entera** y sigue.
+
+| Síntoma | Causa | Arreglo | Parche |
+|---|---|---|---|
+| Escenario (tfrag, tie, shrub, hfrag) en negro, solo partículas | Los vertex shaders declaran el índice de color por hora del día como `int` (y `uv`, `vi` en hfrag) y el renderer lo pasa sin signo (`glVertexAttribIPointer` con `GL_UNSIGNED_SHORT/BYTE/INT`). WebGL 2 exige que el tipo base coincida: `Vertex shader input type does not match the type of the bound vertex attribute` | `web/glsl_es.py` declara esos atributos sin signo en las versiones GLSL ES y los convierte (`in uint X_u;` + `#define X int(X_u)`), lista `UNSIGNED_ATTRIBUTES` | 0025 |
+| Colores del escenario a negro | La textura de colores por hora del día se crea con `GL_UNSIGNED_INT_8_8_8_8` (sin `_REV`), que WebGL 2 no admite: la textura no se crea | `gl_web.cpp`: sin datos, `GL_UNSIGNED_BYTE` | 0025 |
+| Texturas animadas que no existen; `glGenerateMipmap` falla | `TextureAnimator` crea texturas con formato interno sin tamaño `GL_RED` | `GL_R8` (y `GL_RG` → `GL_RG8`) | 0025 |
+| Personajes invisibles (se ve la sombra de Jak pero no su malla) | El loader sube los índices de merc y hfrag con el buffer de índices enlazado a `GL_ARRAY_BUFFER`. WebGL 2 no deja enlazar un *element array buffer* a otro target: el `bindBuffer` falla, los índices van al buffer de vértices y el de índices queda a cero, así que cada triángulo es un punto | `gl_web.cpp` enlaza esos buffers a `GL_COPY_WRITE_BUFFER` (que admite cualquier buffer) y redirige los `glBufferData`/`glBufferSubData` que siguen | 0026 |
+| Glow: `glBlitFramebuffer: Depth/stencil buffer format combination not allowed` | La textura de profundidad de las sondas del glow se recrea con `GL_DEPTH_COMPONENT` sin tamaño y recibe un blit del framebuffer `D24S8`; WebGL 2 solo hace blit entre formatos idénticos | `GL_DEPTH24_STENCIL8` | 0027 |
+| Cientos de `texParameter: no texture bound to target` | `EyeRenderer` pone parámetros de textura antes de enlazar ninguna. En escritorio se aplican a la textura por defecto (sin efecto) | Se ignoran sin textura enlazada | 0027 |
+
+Lo que se descartó por el camino, para no volver a mirarlo:
+
+- Los modelos de los personajes sí están en los `.fr3` (por ejemplo `jak-highres-prison` en `ldjakbrn.fr3`) y el loader los carga; los avisos de modelo que falta solo salen en los primeros fotogramas, mientras el nivel se carga.
+- Las matrices de huesos que Merc2 lee de la memoria de GOAL son correctas (rotaciones ortonormales, traslaciones en coordenadas del mundo): el cálculo de huesos en wasm funciona.
+- El layout `std140` del bloque `ub_bones` coincide con lo que sube el C++ (128 bytes por hueso).
+
+### Cómo se depura
+
+- **Los errores de WebGL salen en la consola del worker** que tiene el OffscreenCanvas, no en la de la página, y Playwright no los ve. Con CDP: `Target.setAutoAttach` a nivel de navegador con `flatten` (navegar de `about:blank` a una página con COOP/COEP cambia de proceso y de target, así que adjuntarse a la página antes de navegar no sirve) y `Log.enable` en cada sesión. **Chrome solo informa de los 32 primeros errores por contexto**: los errores repetidos esconden los demás, por eso conviene dejar la consola limpia.
+- **Qué renderer falla**: envolver en `gl_web.cpp` `glUseProgram` y `glDrawElements`/`glDrawArrays`, y contar draws, índices y `glGetError` por shader (nombre desde `Shader::Shader`). Así se vio que shrub tenía todos sus draws rechazados y que tfrag/tie no dibujaban nada.
+- **Quién hace una llamada**: `EM_ASM({ err(new Error().stack) })` da la pila con nombres de función (el módulo se compila con `--profiling-funcs`); `emscripten_get_callstack` devuelve vacío en esta pthread.
+- **Llegar a una escena con Playwright**: el input lee el estado del teclado una vez por fotograma, así que hay que mantener la tecla ~1,5 s; y es más fiable guiarse por la consola del juego (`Load soundbank menu1` = menú abierto, `introcst` = partida empezada, `GAMEPLAY: enter prison`) que por tiempos.
+
+## 4.3 Teclado (parche 0024)
+
+Con `-sPROXY_TO_PTHREAD`, el bucle de gráficos (`Gfx::Loop`) corre en una pthread que nunca vuelve al bucle de eventos de su worker. SDL registra los eventos de teclado del navegador desde ese hilo, y Emscripten se los entrega como llamadas encoladas a ese hilo, que solo se ejecutan cuando procesa su cola. `GLDisplay::process_sdl_events` llama a `emscripten_current_thread_process_queued_calls()` antes de `SDL_PollEvent` en cada fotograma. (El cambio está en el código de OpenGOAL, no en SDL.)
+
+Teclas por defecto de OpenGOAL:
+
+| Tecla | Botón |
+|---|---|
+| Enter | Start |
+| Espacio | X (confirmar, saltar) |
+| E / F / R | Círculo / Cuadrado / Triángulo |
+| Flechas | Cruceta (menús) |
+| WASD | Stick izquierdo |
+| IJKL | Stick derecho (cámara) |
+| Q / O | L1 / R1 |
+| 1 / P | L2 / R2 |
+
 ## Lo siguiente
 
-- Comprobar que el navegador presenta los frames: con datos de la ISO habrá algo que ver.
-- Leer los `.fr3` y los DGO desde OPFS (salida del extractor).
-- Medir el rendimiento con un nivel real (draw calls, `glMultiDrawElements` en bucle).
+- Sonido (`Cubeb init failed`: no hay backend de audio en la web).
+- Mando (falta `sdl_controller_db.txt` en `/data/game/assets`).
+- Jugar más allá de la cárcel y anotar lo que falle.
+- Medir el rendimiento con un nivel real (draw calls, `glMultiDrawElements` en bucle) en un navegador con GPU.

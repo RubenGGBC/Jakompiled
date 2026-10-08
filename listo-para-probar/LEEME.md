@@ -34,7 +34,29 @@ Esta carpeta tiene el motor ya compilado: el runtime de OpenGOAL (`gk.wasm`), el
 2. Espera. Primero copia los ficheros de la ISO (barra de progreso) y luego descomprime los datos del juego. Puede tardar bastantes minutos. No cierres la pestaña.
 3. Al terminar, verás **"Extracción terminada"** o un error.
 4. **Copia todo el texto del registro** de la página (Ctrl+A / Cmd+A sobre él, o selecciónalo) y pégamelo. Si algo falla, con eso puedo arreglarlo.
-5. Si la extracción terminó, abre en Chrome **`http://localhost:8080/?boot=game&display=1`**. El juego arranca con los datos extraídos de tu ISO (solo hace falta extraer una vez). Copia también ese registro y, si se ve algo en el recuadro negro, haz una captura.
+5. Si la extracción terminó, abre en Chrome **`http://localhost:8080/?boot=game&display=1`**. El juego arranca con los datos extraídos de tu ISO (solo hace falta extraer una vez). Tarda 1–2 minutos en llegar a la pantalla de título.
+6. Haz clic en el recuadro del juego para que reciba el teclado. **Enter** abre el menú y **Espacio** confirma (New Game).
+
+Si actualizas esta carpeta y solo ha cambiado `gk.wasm`, basta con recargar la página del juego con **Cmd+Mayús+R** / **Ctrl+Mayús+R** (sin volver a extraer). Si cambian los ficheros de `data/`, vuelve a pasar por `extract.html`.
+
+### Controles (teclado)
+
+| Tecla | Botón |
+|---|---|
+| Enter | Start |
+| Espacio | X (confirmar, saltar) |
+| E / F / R | Círculo / Cuadrado / Triángulo |
+| Flechas | Cruceta (menús) |
+| WASD | Moverse |
+| IJKL | Cámara |
+| Q / O | L1 / R1 |
+| 1 / P | L2 / R2 |
+
+### Qué esperar
+
+- Funciona: intro, título, menú, New Game, cinemáticas y la cárcel, con escenario y personajes.
+- Todavía no: **sonido** y **mando**. Más allá de la cárcel está sin probar.
+- Si algo se ve mal, haz una captura y copia lo que salga en la consola de Chrome (Cmd+Opción+J / Ctrl+Mayús+J), sobre todo las líneas con `WebGL` o `GL_INVALID`.
 
 Para parar el servidor, cierra la ventana negra (Terminal o símbolo del sistema).
 
