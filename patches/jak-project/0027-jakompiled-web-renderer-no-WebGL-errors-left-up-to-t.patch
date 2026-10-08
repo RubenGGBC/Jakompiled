@@ -1,0 +1,81 @@
+From 7ee62e358cecc288a2ce69241a38c6db2cd1277d Mon Sep 17 00:00:00 2001
+From: RubenGGBC <rgallego007@ikasle.ehu.eus>
+Date: Thu, 8 Oct 2026 15:52:51 +0200
+Subject: [PATCH] jakompiled: web renderer: no WebGL errors left up to the
+ prison
+
+- Glow: its probe depth texture is re-created with an unsized
+  GL_DEPTH_COMPONENT when the resolution changes, and it's the target of a
+  depth blit from the D24S8 framebuffer; WebGL 2 only blits between
+  identical formats. Allocate it as GL_DEPTH24_STENCIL8.
+- EyeRenderer sets texture parameters before binding a texture. Desktop GL
+  applies them to the default texture (no effect); WebGL 2 reports an error
+  every frame, which used up Chrome's 32 reported errors. Ignore them.
+---
+ web/gl_web.cpp | 27 ++++++++++++++++++++++-----
+ 1 file changed, 22 insertions(+), 5 deletions(-)
+
+diff --git a/web/gl_web.cpp b/web/gl_web.cpp
+index 04aecdf4..9da58f16 100644
+--- a/web/gl_web.cpp
++++ b/web/gl_web.cpp
+@@ -12,11 +12,13 @@
+ //                                        little-endian machine
+ //   GL_UNSIGNED_INT_8_8_8_8              only to allocate textures without data (the time of day
+ //                                        colors of tfrag, tie, shrub and hfrag): GL_UNSIGNED_BYTE
+-//   unsized GL_RED, GL_RG, GL_DEPTH_COMPONENT internal formats  their sized versions
++//   unsized GL_RED, GL_RG internal formats  GL_R8, GL_RG8
++//   unsized GL_DEPTH_COMPONENT           GL_DEPTH24_STENCIL8, like the framebuffer it's blitted from
+ //   index buffer bound to GL_ARRAY_BUFFER (the loader uploads merc and hfrag indices that way;
+ //                                        WebGL 2 refuses to bind an element array buffer to another
+ //                                        target): bound to GL_COPY_WRITE_BUFFER instead, and the
+ //                                        glBufferData/glBufferSubData that follow go there
++//   glTexParameter with no texture       ignored (desktop GL sets the default texture's parameters)
+ //   glMultiDrawElements                  one glDrawElements per draw
+ //   glFramebufferTexture                 glFramebufferTexture2D
+ //   glGetTexLevelParameteriv             sizes recorded when textures are created
+@@ -101,11 +103,23 @@ void APIENTRY web_BindTexture(GLenum target, GLuint tex) {
+   orig_BindTexture(target, tex);
+ }
+ 
++// glTexParameter with no texture bound: desktop GL sets it on the default texture (no effect);
++// WebGL 2 reports an error (EyeRenderer does it every frame, and the errors hide the real ones)
++bool no_texture_bound(GLenum target) {
++  return map_target(target) == GL_TEXTURE_2D && !g_bound_2d[g_unit];
++}
++
+ void APIENTRY web_TexParameteri(GLenum target, GLenum pname, GLint param) {
++  if (no_texture_bound(target)) {
++    return;
++  }
+   orig_TexParameteri(map_target(target), pname, param);
+ }
+ 
+ void APIENTRY web_TexParameterf(GLenum target, GLenum pname, GLfloat param) {
++  if (no_texture_bound(target)) {
++    return;
++  }
+   orig_TexParameterf(map_target(target), pname, param);
+ }
+ 
+@@ -127,10 +141,13 @@ void APIENTRY web_TexImage2D(GLenum target,
+     internalformat = GL_R8;
+   } else if (internalformat == GL_RG && type == GL_UNSIGNED_BYTE) {
+     internalformat = GL_RG8;
+-  } else if (internalformat == GL_DEPTH_COMPONENT) {
+-    internalformat = type == GL_FLOAT ? GL_DEPTH_COMPONENT32F
+-                     : type == GL_UNSIGNED_SHORT ? GL_DEPTH_COMPONENT16
+-                                                 : GL_DEPTH_COMPONENT24;
++  } else if (internalformat == GL_DEPTH_COMPONENT && !data) {
++    // only the glow renderer's probe depth texture (re-created when the resolution changes). It's
++    // the target of a depth blit from the D24S8 framebuffer, and WebGL 2 only blits between
++    // identical depth/stencil formats.
++    internalformat = GL_DEPTH24_STENCIL8;
++    format = GL_DEPTH_STENCIL;
++    type = GL_UNSIGNED_INT_24_8;
+   }
+   if (type == GL_UNSIGNED_INT_8_8_8_8) {
+     // WebGL 2 rejects it, and the texture is never created (texelFetch returns black). Without
+-- 
+2.50.1 (Apple Git-155)
+

@@ -24,16 +24,17 @@ Idioma del proyecto: castellano (docs, mensajes, scripts). Código y comentarios
 | Teclado | ✅ parche 0024. Enter = Start, Espacio = X (confirmar), flechas = cruceta; New Game llega al aviso de guardado y carga los niveles de la cinemática inicial (`introcst`, `village1`, `ctyindb`, `prison`, `forexita`) sin errores |
 | Mando, sonido | ❌ pendiente (mando: falta `sdl_controller_db.txt`; sonido: `Cubeb init failed`) |
 
-## Siguiente paso: comprobar los personajes y los errores de WebGL que quedan
+## Siguiente paso: jugar más allá de la cárcel y anotar lo que falle (y sonido, mando)
 
 Los personajes no se veían porque el loader sube los índices de merc (y hfrag) con el buffer de índices enlazado a `GL_ARRAY_BUFFER`; WebGL 2 no deja enlazar un element array buffer a otro target, así que los índices iban al buffer de vértices y los de índices quedaban a cero (0026: `gl_web.cpp` lo enlaza a `GL_COPY_WRITE_BUFFER`). Descartado por el camino: los modelos sí están en los `.fr3` y se cargan (`ldjakbrn` tiene `jak-highres-prison`), las matrices de huesos que lee Merc2 de la memoria de GOAL son correctas, y el `ERROR: ... could not find a master slot to link` es ruido: `link-art!` se llama dos veces para el mismo art group y la segunda vez la animación ya está enlazada.
 
-Errores de WebGL que quedan (en la cárcel): `texParameter: no texture bound to target` (cientos), `glBlitFramebuffer: Depth/stencil buffer format combination not allowed for blit` (glow, cientos). Chrome deja de informar tras 32 errores por contexto: arreglar estos para ver si hay más detrás.
+Errores de WebGL: ninguno desde el arranque hasta la cárcel (0027 quitó los del glow y los `texParameter` de EyeRenderer). Solo quedan avisos de rendimiento por `ReadPixels`.
 
 Arreglado en esta sesión:
 - 0022: el renderer simulaba la interrupción VIF1 llamando a código GOAL desde el hilo de gráficos (donde no existen los módulos wasm). En jak2 ese handler solo hace profiling de buckets: en la web no se llama.
 - 0023: la compactación del heap de procesos mueve procesos (y sus `cpu-thread`) mientras están suspendidos; el kernel web guardaba la fibra JSPI por dirección del hilo y la perdía (`thread-resume: thread ... has no suspended stack`). Ahora `relocate` de `cpu-thread` llama a `jakompiled-thread-relocate` (cambia código GOAL: hay que recompilar CODE.PAK y volver a montar los DGO con `steps=build`).
 - 0024: el bucle de gráficos no vuelve al event loop del worker; procesa en cada fotograma las llamadas que el navegador le reenvía (teclado de SDL).
+- 0027: sin errores de WebGL hasta la cárcel: la textura de profundidad del glow se crea como `GL_DEPTH24_STENCIL8` (el blit exige el mismo formato que el framebuffer) y se ignoran los `glTexParameter` sin textura enlazada (EyeRenderer).
 - 0026: índices de merc y hfrag (ver arriba).
 - 0025: los vertex shaders de tfrag/tie/shrub/hfrag declaran el índice de color como `int` y el renderer lo pasa sin signo: WebGL 2 rechazaba todos sus draws. `web/glsl_es.py` los declara sin signo en las versiones GLSL ES (`UNSIGNED_ATTRIBUTES`); `gl_web.cpp` traduce `GL_UNSIGNED_INT_8_8_8_8` y los formatos internos sin tamaño (`GL_RED`, `GL_RG`, `GL_DEPTH_COMPONENT`).
 
