@@ -20,18 +20,31 @@ Idioma del proyecto: castellano (docs, mensajes, scripts). Código y comentarios
 | Extracción de la ISO en el navegador (`extract.html`) | ✅ con la ISO real (NTSC v2.01, SCUS-97265): ~2,5 min, pico de 5,3 GB (extractor en wasm64) |
 | Montaje de los DGO/CGO desde la ISO (`--web-build`) | ✅ los 150 que monta el build nativo (`game.gp`), 0 objetos sin encontrar |
 | Runtime leyendo de OPFS | ✅ con la ISO real: carga `GAME.CGO`, los `.fr3` y llega a `play-boot!` |
-| Renderer en WebGL 2 | ✅ logos de la intro, pantalla de título ("Press the Start Button") y menú principal |
+| Renderer en WebGL 2 | ⚠️ menús, escenario (tfrag/tie/shrub, parche 0025), sombras y efectos bien (ciudad en el título, cárcel); **los personajes (merc) no se ven**: se ve la sombra de Jak pero no su malla |
 | Teclado | ✅ parche 0024. Enter = Start, Espacio = X (confirmar), flechas = cruceta; New Game llega al aviso de guardado y carga los niveles de la cinemática inicial (`introcst`, `village1`, `ctyindb`, `prison`, `forexita`) sin errores |
 | Mando, sonido | ❌ pendiente (mando: falta `sdl_controller_db.txt`; sonido: `Cubeb init failed`) |
 
-## Siguiente paso: pasar la cinemática inicial y llegar al primer nivel jugable (verlo en el navegador, no solo por capturas)
+## Siguiente paso: los personajes (merc) no se ven
+
+En la cárcel se ve la sombra de Jak en el suelo pero no su malla, y en una esquina sale una mancha roja y blanca (¿malla deformada?). merc2 hace >1000 draws por fotograma sin errores de WebGL. Dos hipótesis, sin descartar ninguna:
+1. Animaciones sin enlazar: el registro está lleno de `ERROR: "<art-group>" could not find a master slot to link for #<art-joint-anim ...>` (`link-art!`, `goal_src/jak2/engine/load/loader.gc`). Puede ser un fallo del backend wasm (la función hace `goto` a una etiqueta dentro de la condición de un `while`) o que falte algo en los DGO montados en el navegador (`get-art-group-by-name` no encuentra el art group maestro).
+2. Matrices de huesos mal en el shader de merc (uniform buffer `ub_bones`, diferencias de layout en WebGL 2).
+
+Otros errores de WebGL pendientes (menores): `glow_depth_copy` (`glBlitFramebuffer`: adjuntos de distinto tamaño), `bindBuffer: element array buffers can not be bound to a different target` (12 veces, renderer sin identificar), `texParameter: no texture bound to target`.
 
 Arreglado en esta sesión:
 - 0022: el renderer simulaba la interrupción VIF1 llamando a código GOAL desde el hilo de gráficos (donde no existen los módulos wasm). En jak2 ese handler solo hace profiling de buckets: en la web no se llama.
-- 0023: la compactación del heap de procesos mueve procesos (y sus `cpu-thread`) mientras están suspendidos; el kernel web guardaba la fibra JSPI por dirección del hilo y la perdía (`thread-resume: thread ... has no suspended stack` en cada fotograma; esos procesos dejaban de ejecutarse). Ahora `relocate` de `cpu-thread` llama a `jakompiled-thread-relocate` (cambia código GOAL: hay que recompilar CODE.PAK y volver a montar los DGO con `steps=build`).
+- 0023: la compactación del heap de procesos mueve procesos (y sus `cpu-thread`) mientras están suspendidos; el kernel web guardaba la fibra JSPI por dirección del hilo y la perdía (`thread-resume: thread ... has no suspended stack`). Ahora `relocate` de `cpu-thread` llama a `jakompiled-thread-relocate` (cambia código GOAL: hay que recompilar CODE.PAK y volver a montar los DGO con `steps=build`).
 - 0024: el bucle de gráficos no vuelve al event loop del worker; procesa en cada fotograma las llamadas que el navegador le reenvía (teclado de SDL).
+- 0025: los vertex shaders de tfrag/tie/shrub/hfrag declaran el índice de color como `int` y el renderer lo pasa sin signo: WebGL 2 rechazaba todos sus draws. `web/glsl_es.py` los declara sin signo en las versiones GLSL ES (`UNSIGNED_ATTRIBUTES`); `gl_web.cpp` traduce `GL_UNSIGNED_INT_8_8_8_8` y los formatos internos sin tamaño (`GL_RED`, `GL_RG`, `GL_DEPTH_COMPONENT`).
 
-Pendiente conocido: las fibras de procesos que mueren mientras están suspendidos no se liberan (256 KB de pila C cada una) salvo que otro hilo reutilice la dirección. Vigilar la memoria en partidas largas.
+Pendiente conocido: las fibras de procesos que mueren mientras están suspendidos no se liberan (256 KB de pila C cada una) salvo que otro hilo reutilice la dirección.
+
+Depurar el renderer:
+- Los errores de WebGL salen en la consola del worker que tiene el OffscreenCanvas, no en la de la página. Con CDP: `Target.setAutoAttach` a nivel de navegador (`flatten`; navegar de `about:blank` a la página con COOP/COEP cambia de proceso y de target) y `Log.enable` en cada sesión; Chrome solo imprime los 32 primeros errores por contexto.
+- Para saber qué renderer falla: envolver en `gl_web.cpp` `glUseProgram`/`glDrawElements`/`glDrawArrays` y contar draws y `glGetError` por shader (nombre desde `Shader::Shader`). Se usó y se quitó; está en el historial de esta sesión, no en el repo.
+- Teclas por defecto: Enter = Start, Espacio = X, flechas = cruceta, WASD = stick izquierdo. Para llegar a la cárcel: Enter, Espacio (New Game), Espacio (aviso de guardado) y esperar.
+- Para regenerar los shaders: `python3 web/glsl_es.py glslang spirv-cross <jak-project>/game/graphics/opengl_renderer/shaders <jak-project>/game/graphics/opengl_renderer/shaders_es/jak2 jak2` en un Ubuntu con `glslang-tools` y `spirv-cross`.
 
 Para ver excepciones JS dentro de los workers: CDP con pausa en excepciones (Chromium con `--remote-debugging-port=0` y el puerto leído de `DevToolsActivePort` de su propio perfil; nunca un puerto fijo, puede ser el Chrome del usuario).
 
