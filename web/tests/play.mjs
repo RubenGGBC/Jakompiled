@@ -33,7 +33,7 @@ page.on("console", (m) => {
 page.on("pageerror", (e) => appendFileSync(`${out}/console.log`, `[pageerror] ${e}\n`));
 const t0 = Date.now();
 const log = (s) => console.log(`[play ${((Date.now() - t0) / 1000).toFixed(0)}s] ${s}`);
-await page.goto(`${base}/?boot=game&display=1`);
+await page.goto(`${base}/?boot=game&display=1${process.env.QUERY ?? ""}`);
 
 for (const step of script.split(",")) {
   const [cmd, ...a] = step.split(":");
@@ -53,7 +53,7 @@ for (const step of script.split(",")) {
   } else if (cmd === "sleep") {
     await page.waitForTimeout(Number(a[0]) * 1000);
   } else if (cmd === "shot") {
-    await page.screenshot({ path: `${out}/${a[0]}.png` });
+    await page.locator("#canvas").screenshot({ path: `${out}/${a[0]}.png` });
     log(`shot ${a[0]}`);
   } else if (cmd === "audio") {
     const r = await page.evaluate(async () => {

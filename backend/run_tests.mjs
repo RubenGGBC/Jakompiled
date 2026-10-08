@@ -68,6 +68,34 @@ function check(label, got, want) {
   console.log(`${ok ? "ok  " : "FAIL"} ${label} = ${got}${ok ? "" : `  (esperado ${want})`}`);
 }
 
+// ---- quat.gc: quaternion*! y quaternion-normalize! contra el cálculo en JS
+if (exportNames.includes("t-qmul")) {
+  const pack = (x, y, z, w) => [f32bits(x) | (f32bits(y) << 32n), f32bits(z) | (f32bits(w) << 32n)];
+  const run = (name, qa, qb) => {
+    const [a0, a1] = pack(...qa), [b0, b1] = pack(...qb);
+    const r = [0, 1].map((sel) => BigInt.asUintN(64, call(name, BigInt.asIntN(64, a0), BigInt.asIntN(64, a1), BigInt.asIntN(64, b0), BigInt.asIntN(64, b1), sel)));
+    return [bitsf32(r[0]), bitsf32(r[0] >> 32n), bitsf32(r[1]), bitsf32(r[1] >> 32n)];
+  };
+  const near = (want) => (got) => got.every((v, i) => Math.abs(v - want[i]) < 1e-4 * Math.max(1, Math.abs(want[i])));
+  const cases = [[[0.1, 0.2, 0.3, 0.927], [0.5, -0.5, 0.5, 0.5]], [[0, 0, 0.7071, 0.7071], [0.7071, 0, 0, 0.7071]],
+    [[0.3, -0.1, 0.2, 0.9], [-0.2, 0.4, 0.1, 0.88]]];
+  for (const [p, q] of cases) {
+    const [x1, y1, z1, w1] = p, [x2, y2, z2, w2] = q;
+    // Hamilton: p * q
+    const want = [w1 * x2 + x1 * w2 + y1 * z2 - z1 * y2, w1 * y2 - x1 * z2 + y1 * w2 + z1 * x2,
+      w1 * z2 + x1 * y2 - y1 * x2 + z1 * w2, w1 * w2 - x1 * x2 - y1 * y2 - z1 * z2];
+    const got = run("t-qmul", p, q);
+    const wantSwap = (() => { const [a, b, c, d] = q, [e, f, gg, h] = p;
+      return [d * e + a * h + b * gg - c * f, d * f - a * gg + b * h + c * e, d * gg + a * f - b * e + c * h, d * h - a * e - b * f - c * gg]; })();
+    check(`t-qmul ${p} ${q} -> ${got.map((v) => v.toFixed(4))}`, got, (g) => near(want)(g) || near(wantSwap)(g));
+  }
+  for (const p of [[0.1, 0.2, 0.3, 0.927], [1, 2, 3, 4], [0, 0, 0, 2]]) {
+    const n = Math.hypot(...p);
+    const got = run("t-qnorm", p, [0, 0, 0, 0]);
+    check(`t-qnorm ${p} -> ${got.map((v) => v.toFixed(4))}`, got, near(p.map((v) => v / n)));
+  }
+}
+
 // ---- tests propios de basic.gc (los demás ficheros solo se comparan con el oráculo x86)
 const isBasic = exportNames.includes("t-add");
 if (isBasic) {

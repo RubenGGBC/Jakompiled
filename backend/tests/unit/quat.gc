@@ -1,0 +1,56 @@
+;;-*-Lisp-*-
+;; quaternion*! y quaternion-normalize! (engine/math/quaternion.gc), con sus mismas
+;; instrucciones vf. Las partículas 3D (sp-process-block-3d) los usan para girar cada partícula.
+;; run_tests.mjs compara con el resultado calculado en JS.
+
+(defmacro def-q-test (name &rest body)
+  `(defun ,name ((a0 int) (a1 int) (b0 int) (b1 int) (sel int))
+     (let ((va (new 'stack-no-clear 'array 'uint64 2))
+           (vb (new 'stack-no-clear 'array 'uint64 2))
+           (vr (new 'stack-no-clear 'array 'uint64 2))
+           (v0 (new 'stack-no-clear 'array 'uint64 2)))
+       ;; vf0 = (0 0 0 1), lo que hace init-vf0-vector en el juego
+       (set! (-> v0 0) (the-as uint 0))
+       (set! (-> v0 1) (the-as uint #x3f80000000000000))
+       (set! (-> va 0) (the-as uint a0))
+       (set! (-> va 1) (the-as uint a1))
+       (set! (-> vb 0) (the-as uint b0))
+       (set! (-> vb 1) (the-as uint b1))
+       (let ((qa (-> (the-as (pointer uint128) va)))
+             (q0 (-> (the-as (pointer uint128) v0)))
+             (qb (-> (the-as (pointer uint128) vb)))
+             (qr (the-as uint128 0)))
+         ,@body
+         (set! (-> (the-as (pointer uint128) vr)) qr))
+       (the-as int (-> vr sel)))))
+
+(def-q-test t-qmul
+  (rlet ((acc :class vf) (vf0 :class vf) (vf1 :class vf) (vf2 :class vf) (vf3 :class vf)
+         (vf4 :class vf))
+    (.mov vf0 q0)
+    (.mov vf1 qa)
+    (.mov vf2 qb)
+    (.sub.vf.w vf4 vf0 vf0)
+    (.mul.vf vf3 vf1 vf2)
+    (.outer.product.a.vf acc vf1 vf2)
+    (.outer.product.b.vf vf4 vf2 vf1 acc)
+    (.mul.w.vf acc vf1 vf2)
+    (.add.mul.w.vf acc vf2 vf1 acc)
+    (.sub.mul.w.vf.w acc vf0 vf3 acc)
+    (.sub.mul.z.vf.w acc vf0 vf3 acc)
+    (.sub.mul.y.vf.w acc vf0 vf3 acc)
+    (.sub.mul.x.vf.w acc vf0 vf3 acc)
+    (.add.mul.w.vf vf1 vf4 vf0 acc)
+    (.mov qr vf1)))
+
+(def-q-test t-qnorm
+  (rlet ((acc :class vf) (Q :class vf) (vf0 :class vf) (vf1 :class vf) (vf2 :class vf))
+    (.mov vf0 q0)
+    (.mov vf1 qa)
+    (.mul.vf vf2 vf1 vf1)
+    (.add.z.vf.w acc vf2 vf2)
+    (.add.mul.y.vf.w acc vf0 vf2 acc)
+    (.add.mul.x.vf.w vf2 vf0 vf2 acc)
+    (.isqrt.vf Q vf0 vf2 :fsf #b11 :ftf #b11)
+    (.mul.vf vf2 vf1 Q)
+    (.mov qr vf2)))
