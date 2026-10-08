@@ -1,0 +1,117 @@
+From 0bb68e5f2d764111cf25dc0c801e9d451d2ee745 Mon Sep 17 00:00:00 2001
+From: RubenGGBC <rgallego007@ikasle.ehu.eus>
+Date: Thu, 8 Oct 2026 13:55:35 +0200
+Subject: [PATCH] jakompiled: web renderer: upload merc and hfrag indices
+ (characters are drawn)
+
+The loader creates the merc and hfrag index buffers bound to
+GL_ELEMENT_ARRAY_BUFFER, then uploads their contents with the buffer bound
+to GL_ARRAY_BUFFER. WebGL 2 refuses to bind an element array buffer to
+another target, so the indices went into the previously bound vertex buffer
+(or overflowed it) and the index buffers stayed zero: every merc draw was
+degenerate and no character was visible.
+
+gl_web.cpp binds such a buffer to GL_COPY_WRITE_BUFFER instead (allowed for
+any buffer), and redirects the glBufferData/glBufferSubData that follow.
+---
+ web/gl_web.cpp | 56 ++++++++++++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 56 insertions(+)
+
+diff --git a/web/gl_web.cpp b/web/gl_web.cpp
+index 0df67fa8..04aecdf4 100644
+--- a/web/gl_web.cpp
++++ b/web/gl_web.cpp
+@@ -13,6 +13,10 @@
+ //   GL_UNSIGNED_INT_8_8_8_8              only to allocate textures without data (the time of day
+ //                                        colors of tfrag, tie, shrub and hfrag): GL_UNSIGNED_BYTE
+ //   unsized GL_RED, GL_RG, GL_DEPTH_COMPONENT internal formats  their sized versions
++//   index buffer bound to GL_ARRAY_BUFFER (the loader uploads merc and hfrag indices that way;
++//                                        WebGL 2 refuses to bind an element array buffer to another
++//                                        target): bound to GL_COPY_WRITE_BUFFER instead, and the
++//                                        glBufferData/glBufferSubData that follow go there
+ //   glMultiDrawElements                  one glDrawElements per draw
+ //   glFramebufferTexture                 glFramebufferTexture2D
+ //   glGetTexLevelParameteriv             sizes recorded when textures are created
+@@ -23,6 +27,7 @@
+ #include <cstdint>
+ #include <cstring>
+ #include <unordered_map>
++#include <unordered_set>
+ #include <vector>
+ 
+ #include "common/log/log.h"
+@@ -39,6 +44,15 @@ PFNGLTEXIMAGE2DPROC orig_TexImage2D;
+ PFNGLTEXSUBIMAGE2DPROC orig_TexSubImage2D;
+ PFNGLTEXSTORAGE2DPROC orig_TexStorage2D;
+ PFNGLREADPIXELSPROC orig_ReadPixels;
++PFNGLBINDBUFFERPROC orig_BindBuffer;
++PFNGLBUFFERDATAPROC orig_BufferData;
++PFNGLBUFFERSUBDATAPROC orig_BufferSubData;
++PFNGLDELETEBUFFERSPROC orig_DeleteBuffers;
++
++// buffers that have been bound to GL_ELEMENT_ARRAY_BUFFER, and whether the GL_ARRAY_BUFFER binding
++// the renderer asked for is one of them (then it's really bound to GL_COPY_WRITE_BUFFER)
++std::unordered_set<GLuint> g_element_buffers;
++bool g_array_buffer_redirected = false;
+ PFNGLENABLEPROC orig_Enable;
+ PFNGLDISABLEPROC orig_Disable;
+ 
+@@ -171,6 +185,40 @@ void APIENTRY web_Disable(GLenum cap) {
+   }
+ }
+ 
++// ---- buffers
++
++void APIENTRY web_BindBuffer(GLenum target, GLuint buffer) {
++  if (target == GL_ELEMENT_ARRAY_BUFFER && buffer) {
++    g_element_buffers.insert(buffer);
++  } else if (target == GL_ARRAY_BUFFER) {
++    g_array_buffer_redirected = buffer && g_element_buffers.count(buffer);
++    if (g_array_buffer_redirected) {
++      orig_BindBuffer(GL_COPY_WRITE_BUFFER, buffer);
++      return;
++    }
++  }
++  orig_BindBuffer(target, buffer);
++}
++
++void APIENTRY web_DeleteBuffers(GLsizei n, const GLuint* buffers) {
++  for (GLsizei i = 0; i < n; i++) {
++    g_element_buffers.erase(buffers[i]);
++  }
++  orig_DeleteBuffers(n, buffers);
++}
++
++GLenum map_buffer_target(GLenum target) {
++  return target == GL_ARRAY_BUFFER && g_array_buffer_redirected ? GL_COPY_WRITE_BUFFER : target;
++}
++
++void APIENTRY web_BufferData(GLenum target, GLsizeiptr size, const void* data, GLenum usage) {
++  orig_BufferData(map_buffer_target(target), size, data, usage);
++}
++
++void APIENTRY web_BufferSubData(GLenum target, GLintptr offset, GLsizeiptr size, const void* data) {
++  orig_BufferSubData(map_buffer_target(target), offset, size, data);
++}
++
+ // ---- functions WebGL 2 doesn't have
+ 
+ void APIENTRY web_PrimitiveRestartIndex(GLuint index) {
+@@ -295,6 +343,14 @@ void gl_web_init() {
+   orig_TexSubImage2D = glad_glTexSubImage2D;
+   orig_TexStorage2D = glad_glTexStorage2D;
+   orig_ReadPixels = glad_glReadPixels;
++  orig_BindBuffer = glad_glBindBuffer;
++  orig_BufferData = glad_glBufferData;
++  orig_BufferSubData = glad_glBufferSubData;
++  orig_DeleteBuffers = glad_glDeleteBuffers;
++  glad_glDeleteBuffers = web_DeleteBuffers;
++  glad_glBindBuffer = web_BindBuffer;
++  glad_glBufferData = web_BufferData;
++  glad_glBufferSubData = web_BufferSubData;
+   orig_Enable = glad_glEnable;
+   orig_Disable = glad_glDisable;
+ 
+-- 
+2.50.1 (Apple Git-155)
+
