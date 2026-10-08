@@ -1,0 +1,294 @@
+From 27bbe69cb69d5d25d9904e2c076a6d333cbb2473 Mon Sep 17 00:00:00 2001
+From: RubenGGBC <rgallego007@ikasle.ehu.eus>
+Date: Thu, 8 Oct 2026 16:14:18 +0200
+Subject: [PATCH] jakompiled: web runtime: sound through Web Audio
+
+cubeb has no Emscripten backend; the stub made cubeb_init fail and the
+989snd player ran silent. web/cubeb_web.cpp implements the part of cubeb
+the player uses (one stereo S16 output stream):
+
+- a producer thread calls the data callback (Player::Tick) and writes the
+  samples into a ring buffer in wasm memory (at most ~85 ms ahead);
+- an AudioWorklet on the page reads the ring through the shared wasm
+  memory, with the read/write positions shared through Atomics.
+
+Web Audio only exists on the page's main thread, so the AudioContext is
+created there (emscripten_async_run_in_main_runtime_thread). It starts
+suspended by the autoplay policy and is resumed on the first key, click
+or touch.
+---
+ web/CMakeLists.txt       |   4 +-
+ web/cubeb_web.cpp        | 203 +++++++++++++++++++++++++++++++++++++++
+ web/stubs/cubeb_stub.cpp |  28 ------
+ 3 files changed, 205 insertions(+), 30 deletions(-)
+ create mode 100644 web/cubeb_web.cpp
+ delete mode 100644 web/stubs/cubeb_stub.cpp
+
+diff --git a/web/CMakeLists.txt b/web/CMakeLists.txt
+index 69f15012..2a504f15 100644
+--- a/web/CMakeLists.txt
++++ b/web/CMakeLists.txt
+@@ -4,7 +4,7 @@
+ #   ninja -C build-web gk
+ #
+ # Only what gk needs is built. Native-only dependencies (curl, discord-rpc,
+-# cubeb, x86 asm, libco) are replaced by the stubs and shims in web/.
++# x86 asm, libco) are replaced by the stubs and shims in web/; cubeb by Web Audio (web/cubeb_web.cpp).
+ cmake_minimum_required(VERSION 3.20)
+ project(jakompiled-web)
+ 
+@@ -95,7 +95,7 @@ target_include_directories(libco PUBLIC ${OG_ROOT}/third-party)
+ # native-only services, stubbed out (web/stubs/)
+ add_library(libcurl STATIC ${CMAKE_CURRENT_SOURCE_DIR}/stubs/curl_stub.cpp)
+ add_library(discord-rpc STATIC ${CMAKE_CURRENT_SOURCE_DIR}/stubs/discord_stub.cpp)
+-add_library(cubeb STATIC ${CMAKE_CURRENT_SOURCE_DIR}/stubs/cubeb_stub.cpp)
++add_library(cubeb STATIC ${CMAKE_CURRENT_SOURCE_DIR}/cubeb_web.cpp)
+ 
+ add_subdirectory(${OG_ROOT}/common common)
+ add_subdirectory(${OG_ROOT}/game game)
+diff --git a/web/cubeb_web.cpp b/web/cubeb_web.cpp
+new file mode 100644
+index 00000000..73cd0e92
+--- /dev/null
++++ b/web/cubeb_web.cpp
+@@ -0,0 +1,203 @@
++// Jakompiled web: a cubeb backend on Web Audio, just what the 989snd player uses (one stereo
++// S16 output stream).
++//
++// A producer thread calls the data callback (Player::Tick) and writes the samples into a ring
++// buffer in wasm memory. An AudioWorklet on the page reads the ring through the shared wasm
++// memory and plays it. The AudioContext lives on the page's main thread (Web Audio is not
++// available in workers), so it's created there with emscripten_async_run_in_main_runtime_thread. Browsers only let
++// an AudioContext start after a user gesture: it's resumed on the first key, click or touch, and
++// until then the ring stays full and the producer waits.
++#include <algorithm>
++#include <atomic>
++#include <chrono>
++#include <cstdint>
++#include <cstring>
++#include <thread>
++
++#include <emscripten.h>
++#include <emscripten/threading.h>
++
++#include "third-party/cubeb/cubeb/include/cubeb/cubeb.h"
++
++struct cubeb {
++  int unused;
++};
++
++namespace {
++// frames (stereo s16); a power of two. 8192 frames at 48 kHz = 170 ms of buffering at most.
++constexpr uint32_t kRingFrames = 8192;
++// how many frames the producer asks for per callback
++constexpr uint32_t kChunkFrames = 256;
++// the producer doesn't refill above this, to keep the latency down
++constexpr uint32_t kTargetFrames = 4096;
++}  // namespace
++
++struct cubeb_stream {
++  cubeb_data_callback data_callback;
++  cubeb_state_callback state_callback;
++  void* user;
++  uint32_t rate;
++  // frame counters, read by the AudioWorklet with Atomics (they wrap at 2^32)
++  alignas(4) std::atomic<uint32_t> write_pos{0};
++  alignas(4) std::atomic<uint32_t> read_pos{0};
++  int16_t ring[kRingFrames * 2];
++  int16_t chunk[kChunkFrames * 2];
++  std::atomic<bool> running{false};
++  std::thread producer;
++};
++
++static void produce(cubeb_stream* s) {
++  while (s->running.load()) {
++    uint32_t w = s->write_pos.load(std::memory_order_relaxed);
++    uint32_t r = s->read_pos.load(std::memory_order_acquire);
++    if (w - r + kChunkFrames > kTargetFrames) {
++      // the page can't have drained more than ~2.7 ms of audio yet
++      std::this_thread::sleep_for(std::chrono::milliseconds(2));
++      continue;
++    }
++    long n = s->data_callback(s, s->user, nullptr, s->chunk, kChunkFrames);
++    if (n <= 0) {
++      std::this_thread::sleep_for(std::chrono::milliseconds(2));
++      continue;
++    }
++    uint32_t start = w & (kRingFrames - 1);
++    uint32_t first = std::min<uint32_t>(n, kRingFrames - start);
++    memcpy(&s->ring[start * 2], s->chunk, first * 4);
++    memcpy(&s->ring[0], s->chunk + first * 2, (n - first) * 4);
++    s->write_pos.store(w + n, std::memory_order_release);
++  }
++}
++
++// clang-format off
++// runs on the page's main thread
++EM_JS(void, jakompiled_audio_start, (int rate, int16_t* ring, int frames, void* writePos,
++                                     void* readPos), {
++  const processor = `
++    registerProcessor("jakompiled-cubeb", class extends AudioWorkletProcessor {
++      constructor(options) {
++        super();
++        const o = options.processorOptions;
++        this.ring = new Int16Array(o.buffer, o.ring, o.frames * 2);
++        this.pos = new Uint32Array(o.buffer);
++        this.frames = o.frames;
++        this.w = o.writePos >> 2;
++        this.r = o.readPos >> 2;
++      }
++      process(inputs, outputs) {
++        const [left, right] = outputs[0];
++        const w = Atomics.load(this.pos, this.w);
++        let r = Atomics.load(this.pos, this.r);
++        const n = Math.min(left.length, (w - r) >>> 0);
++        for (let i = 0; i < n; i++, r++) {
++          const j = (r & (this.frames - 1)) * 2;
++          left[i] = this.ring[j] / 32768;
++          right[i] = this.ring[j + 1] / 32768;
++        }
++        left.fill(0, n);
++        right.fill(0, n);
++        Atomics.store(this.pos, this.r, r >>> 0);
++        return true;
++      }
++    });`;
++  const ctx = new AudioContext({sampleRate: rate, latencyHint: "interactive"});
++  const url = URL.createObjectURL(new Blob([processor], {type: "text/javascript"}));
++  ctx.audioWorklet.addModule(url).then(() => {
++    const node = new AudioWorkletNode(ctx, "jakompiled-cubeb", {
++      numberOfInputs: 0,
++      outputChannelCount: [2],
++      processorOptions: {buffer: HEAP16.buffer, ring, frames, writePos, readPos},
++    });
++    node.connect(ctx.destination);
++    Module.jakompiledAudioNode = node;
++  }).catch((e) => console.error("[audio] AudioWorklet:", e));
++  // autoplay policy: the context starts suspended until the user interacts with the page
++  const resume = () => {
++    if (ctx.state === "running") {
++      for (const ev of ["keydown", "pointerdown", "touchstart"]) {
++        removeEventListener(ev, resume, true);
++      }
++    } else {
++      ctx.resume();
++    }
++  };
++  for (const ev of ["keydown", "pointerdown", "touchstart"]) {
++    addEventListener(ev, resume, true);
++  }
++  ctx.onstatechange = () => console.log("[audio] " + ctx.state);
++  Module.jakompiledAudio = ctx;
++});
++
++EM_JS(void, jakompiled_audio_stop, (), {
++  if (Module.jakompiledAudio) {
++    Module.jakompiledAudio.close();
++    Module.jakompiledAudio = null;
++  }
++});
++// clang-format on
++
++extern "C" {
++int cubeb_init(cubeb** context, char const*, char const*) {
++  *context = new cubeb{};
++  return CUBEB_OK;
++}
++
++void cubeb_destroy(cubeb* context) {
++  delete context;
++}
++
++int cubeb_get_min_latency(cubeb*, cubeb_stream_params*, uint32_t* latency_frames) {
++  *latency_frames = kChunkFrames;
++  return CUBEB_OK;
++}
++
++int cubeb_stream_init(cubeb*,
++                      cubeb_stream** stream,
++                      char const*,
++                      cubeb_devid,
++                      cubeb_stream_params* input_params,
++                      cubeb_devid,
++                      cubeb_stream_params* output_params,
++                      uint32_t,
++                      cubeb_data_callback data_callback,
++                      cubeb_state_callback state_callback,
++                      void* user_ptr) {
++  *stream = nullptr;
++  if (input_params || !output_params || output_params->channels != 2 ||
++      output_params->format != CUBEB_SAMPLE_S16LE) {
++    return CUBEB_ERROR_NOT_SUPPORTED;
++  }
++  auto* s = new cubeb_stream{};
++  s->data_callback = data_callback;
++  s->state_callback = state_callback;
++  s->user = user_ptr;
++  s->rate = output_params->rate;
++  *stream = s;
++  return CUBEB_OK;
++}
++
++int cubeb_stream_start(cubeb_stream* s) {
++  if (s->running.exchange(true)) {
++    return CUBEB_OK;
++  }
++  s->producer = std::thread(produce, s);
++  // Web Audio only exists on the page's main thread
++  emscripten_async_run_in_main_runtime_thread(EM_FUNC_SIG_VIIIII, jakompiled_audio_start, s->rate,
++                                              s->ring, kRingFrames, &s->write_pos, &s->read_pos);
++  return CUBEB_OK;
++}
++
++int cubeb_stream_stop(cubeb_stream* s) {
++  if (s->running.exchange(false)) {
++    s->producer.join();
++    emscripten_async_run_in_main_runtime_thread(EM_FUNC_SIG_V, jakompiled_audio_stop);
++  }
++  return CUBEB_OK;
++}
++
++void cubeb_stream_destroy(cubeb_stream* s) {
++  if (s) {
++    cubeb_stream_stop(s);
++    delete s;
++  }
++}
++}
+diff --git a/web/stubs/cubeb_stub.cpp b/web/stubs/cubeb_stub.cpp
+deleted file mode 100644
+index 3160f53b..00000000
+--- a/web/stubs/cubeb_stub.cpp
++++ /dev/null
+@@ -1,28 +0,0 @@
+-// Jakompiled web: cubeb has no Emscripten backend. Audio goes to Web Audio in
+-// phase 5; until then cubeb_init fails and the sound player runs silent, the
+-// same path the native runtime takes when no audio device is available.
+-#include "third-party/cubeb/cubeb/include/cubeb/cubeb.h"
+-
+-extern "C" {
+-int cubeb_init(cubeb** context, char const*, char const*) {
+-  *context = nullptr;
+-  return CUBEB_ERROR;
+-}
+-void cubeb_destroy(cubeb*) {}
+-int cubeb_get_min_latency(cubeb*, cubeb_stream_params*, uint32_t*) {
+-  return CUBEB_ERROR;
+-}
+-int cubeb_stream_init(cubeb*, cubeb_stream** stream, char const*, cubeb_devid,
+-                      cubeb_stream_params*, cubeb_devid, cubeb_stream_params*, uint32_t,
+-                      cubeb_data_callback, cubeb_state_callback, void*) {
+-  *stream = nullptr;
+-  return CUBEB_ERROR;
+-}
+-void cubeb_stream_destroy(cubeb_stream*) {}
+-int cubeb_stream_start(cubeb_stream*) {
+-  return CUBEB_ERROR;
+-}
+-int cubeb_stream_stop(cubeb_stream*) {
+-  return CUBEB_ERROR;
+-}
+-}
+-- 
+2.50.1 (Apple Git-155)
+

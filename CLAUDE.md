@@ -22,9 +22,10 @@ Idioma del proyecto: castellano (docs, mensajes, scripts). Código y comentarios
 | Runtime leyendo de OPFS | ✅ con la ISO real: carga `GAME.CGO`, los `.fr3` y llega a `play-boot!` |
 | Renderer en WebGL 2 | ⚠️ menús, escenario (tfrag/tie/shrub, 0025), sombras, efectos y mallas de personajes (merc, 0026; comprobado en Chrome con GPU: Jak se ve) |
 | Teclado | ✅ parche 0024. Enter = Start, Espacio = X (confirmar), flechas = cruceta; New Game llega al aviso de guardado y carga los niveles de la cinemática inicial (`introcst`, `village1`, `ctyindb`, `prison`, `forexita`) sin errores |
-| Mando, sonido | ❌ pendiente (mando: falta `sdl_controller_db.txt`; sonido: `Cubeb init failed`) |
+| Sonido | ✅ parche 0028: cubeb sobre Web Audio (`web/cubeb_web.cpp`: hilo productor → búfer circular en la memoria de wasm → AudioWorklet); arranca con la primera tecla/clic (`[audio] running`). Probado por el usuario: suena bien |
+| Mando | ❓ sin probar. El aviso de `sdl_controller_db.txt` no debería importar: SDL3 mapea los mandos con mapping "standard" del navegador |
 
-## Siguiente paso: jugar más allá de la cárcel y anotar lo que falle (y sonido, mando)
+## Siguiente paso: jugar más allá de la cárcel y anotar lo que falle (y probar el mando)
 
 Los personajes no se veían porque el loader sube los índices de merc (y hfrag) con el buffer de índices enlazado a `GL_ARRAY_BUFFER`; WebGL 2 no deja enlazar un element array buffer a otro target, así que los índices iban al buffer de vértices y los de índices quedaban a cero (0026: `gl_web.cpp` lo enlaza a `GL_COPY_WRITE_BUFFER`). Descartado por el camino: los modelos sí están en los `.fr3` y se cargan (`ldjakbrn` tiene `jak-highres-prison`), las matrices de huesos que lee Merc2 de la memoria de GOAL son correctas, y el `ERROR: ... could not find a master slot to link` es ruido: `link-art!` se llama dos veces para el mismo art group y la segunda vez la animación ya está enlazada.
 
@@ -33,6 +34,7 @@ Errores de WebGL: ninguno desde el arranque hasta la cárcel (0027 quitó los de
 Arreglado en esta sesión:
 - 0022: el renderer simulaba la interrupción VIF1 llamando a código GOAL desde el hilo de gráficos (donde no existen los módulos wasm). En jak2 ese handler solo hace profiling de buckets: en la web no se llama.
 - 0023: la compactación del heap de procesos mueve procesos (y sus `cpu-thread`) mientras están suspendidos; el kernel web guardaba la fibra JSPI por dirección del hilo y la perdía (`thread-resume: thread ... has no suspended stack`). Ahora `relocate` de `cpu-thread` llama a `jakompiled-thread-relocate` (cambia código GOAL: hay que recompilar CODE.PAK y volver a montar los DGO con `steps=build`).
+- 0028: sonido por Web Audio (ver la tabla).
 - 0024: el bucle de gráficos no vuelve al event loop del worker; procesa en cada fotograma las llamadas que el navegador le reenvía (teclado de SDL).
 - 0027: sin errores de WebGL hasta la cárcel: la textura de profundidad del glow se crea como `GL_DEPTH24_STENCIL8` (el blit exige el mismo formato que el framebuffer) y se ignoran los `glTexParameter` sin textura enlazada (EyeRenderer).
 - 0026: índices de merc y hfrag (ver arriba).
@@ -44,6 +46,7 @@ Depurar el renderer:
 - Los errores de WebGL salen en la consola del worker que tiene el OffscreenCanvas, no en la de la página. Con CDP: `Target.setAutoAttach` a nivel de navegador (`flatten`; navegar de `about:blank` a la página con COOP/COEP cambia de proceso y de target) y `Log.enable` en cada sesión; Chrome solo imprime los 32 primeros errores por contexto.
 - Para saber qué renderer falla: envolver en `gl_web.cpp` `glUseProgram`/`glDrawElements`/`glDrawArrays` y contar draws y `glGetError` por shader (nombre desde `Shader::Shader`). Se usó y se quitó; está en el historial de esta sesión, no en el repo.
 - Teclas por defecto: Enter = Start, Espacio = X, flechas = cruceta, WASD = stick izquierdo. Para llegar a la cárcel: Enter, Espacio (New Game), Espacio (aviso de guardado) y esperar. Con Playwright: el input lee el estado del teclado una vez por fotograma, así que hay que mantener la tecla pulsada ~1,5 s, y conviene guiarse por la consola (`Load soundbank menu1` = menú abierto, `introcst` = partida empezada) en vez de por tiempos.
+- `web/tests/play.mjs` juega con un guion (`wait:`, `key:`, `shot:`, `audio`) sobre un perfil ya extraído. El usuario prefiere probar él mismo en su Chrome: no lanzar sesiones de juego automáticas sin preguntar.
 - Para mirar dentro de OPFS (tamaños de los `.fr3`, logs del extractor en `/log`): una página del mismo origen con `navigator.storage.getDirectory()`.
 - Trazas temporales en GOAL (p. ej. `format 0` en `link-art!`): recompilar CODE.PAK (~10 min emulado), copiarlo a `listo-para-probar/data` y volver a montar los DGO (`steps=build`). Restaurar el CODE.PAK limpio después (se puede comprobar con `cmp` contra el de git).
 - Para regenerar los shaders: `python3 web/glsl_es.py glslang spirv-cross <jak-project>/game/graphics/opengl_renderer/shaders <jak-project>/game/graphics/opengl_renderer/shaders_es/jak2 jak2` en un Ubuntu con `glslang-tools` y `spirv-cross`.
@@ -66,7 +69,7 @@ Con `steps=build` (o `extract,build`) se repite solo una parte sobre lo que ya h
 Lo aprendido con la ISO real:
 - El descompilador necesita ~5,3 GB: el extractor se compila en wasm64 (`-DJAKOMPILED_MEMORY64=ON`, `build-web64/`); `gk` sigue en wasm32.
 - Los tamaños de los `.fr3` y de la cabecera zstd van siempre en 8 bytes (antes dependían de `size_t`).
-- Pendiente aparte: mando (falta `sdl_controller_db.txt`) y sonido.
+- Pendiente aparte: probar el mando.
 
 ## Estructura
 
