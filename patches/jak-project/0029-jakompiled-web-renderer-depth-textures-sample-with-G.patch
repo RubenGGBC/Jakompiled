@@ -1,0 +1,230 @@
+From 9b3b30193d6e62bb856a7df3aeea2e32d226eade Mon Sep 17 00:00:00 2001
+From: RubenGGBC <rgallego007@ikasle.ehu.eus>
+Date: Thu, 8 Oct 2026 16:55:27 +0200
+Subject: [PATCH] jakompiled: web renderer: depth textures sample with
+ GL_NEAREST; frame time log
+
+- GLES 3.0 doesn't filter depth textures: one with GL_LINEAR is
+  incomplete and samples as 0. The glow renderer samples its copy of the
+  depth buffer with GL_LINEAR to decide how visible each glow is, so every
+  glow was drawn as if nothing was in front of it. gl_web.cpp records
+  which textures have a depth format and forces GL_NEAREST on them.
+- The graphics loop logs every 5 s where each frame's time goes
+  ([perf] in the console): waiting for the game (GOAL code), rendering,
+  frame limiter and swap.
+---
+ game/graphics/pipelines/opengl.cpp | 53 +++++++++++++++++++++++++++
+ web/gl_web.cpp                     | 59 ++++++++++++++++++++++++++++++
+ 2 files changed, 112 insertions(+)
+
+diff --git a/game/graphics/pipelines/opengl.cpp b/game/graphics/pipelines/opengl.cpp
+index 3dc1974b..b122bebf 100644
+--- a/game/graphics/pipelines/opengl.cpp
++++ b/game/graphics/pipelines/opengl.cpp
+@@ -101,6 +101,35 @@ struct GraphicsData {
+ 
+ std::unique_ptr<GraphicsData> g_gfx_data;
+ 
++#ifdef __EMSCRIPTEN__
++// Jakompiled web: where each frame's time goes on the graphics thread, logged every few seconds
++// ([perf] in the console). "ee" is the game's own time (GOAL code) between the end of a render and
++// the next DMA chain; the graphics thread waits for it in "wait".
++struct WebFrameStats {
++  Timer since_log;
++  Timer frame;
++  int frames = 0;
++  double wait = 0, render = 0, limiter = 0, swap = 0, ee = 0, worst = 0;
++
++  void end_frame() {
++    double t = frame.getSeconds();
++    frame.start();
++    worst = std::max(worst, t);
++    frames++;
++    double elapsed = since_log.getSeconds();
++    if (elapsed >= 5.0) {
++      auto ms = [&](double x) { return 1000.0 * x / frames; };
++      lg::info("[perf] {:.1f} fps | ms/frame: wait-for-ee {:.1f} (ee {:.1f}), render {:.1f}, "
++               "limiter {:.1f}, swap {:.1f}, worst frame {:.1f}",
++               frames / elapsed, ms(wait), ms(ee), ms(render), ms(limiter), ms(swap),
++               1000.0 * worst);
++      *this = WebFrameStats();
++    }
++  }
++};
++static WebFrameStats g_web_stats;
++#endif
++
+ static bool gl_inited = false;
+ #ifdef __EMSCRIPTEN__
+ namespace jakompiled {
+@@ -520,9 +549,19 @@ void render_game_frame(int game_width,
+     auto p = scoped_prof("wait-for-dma");
+     std::unique_lock<std::mutex> lock(g_gfx_data->dma_mutex);
+     // there's a timeout here, so imgui can still be responsive even if we don't render anything
++#ifdef __EMSCRIPTEN__
++    Timer wait_timer;
++#endif
+     got_chain = g_gfx_data->dma_cv.wait_for(lock, std::chrono::milliseconds(40),
+                                             [=] { return g_gfx_data->has_data_to_render; });
++#ifdef __EMSCRIPTEN__
++    g_web_stats.wait += wait_timer.getSeconds();
++    g_web_stats.ee += g_gfx_data->last_engine_time;
++#endif
+   }
++#ifdef __EMSCRIPTEN__
++  Timer render_timer;
++#endif
+   // render that chain.
+   if (got_chain) {
+     g_gfx_data->frame_idx_of_input_data = g_gfx_data->frame_idx;
+@@ -588,6 +627,9 @@ void render_game_frame(int game_width,
+     }
+   }
+ 
++#ifdef __EMSCRIPTEN__
++  g_web_stats.render += render_timer.getSeconds();
++#endif
+   // before vsync, mark the chain as rendered.
+   {
+     // should be fine to remove this mutex if the game actually waits for vsync to call
+@@ -727,6 +769,9 @@ void GLDisplay::render() {
+ 
+   // actual vsync
+   g_gfx_data->debug_gui.finish_frame();
++#ifdef __EMSCRIPTEN__
++  Timer limiter_timer;
++#endif
+   if (Gfx::g_global_settings.framelimiter) {
+     auto p = scoped_prof("frame-limiter");
+     g_gfx_data->frame_limiter.run(
+@@ -734,10 +779,18 @@ void GLDisplay::render() {
+         Gfx::g_global_settings.sleep_in_frame_limiter, g_gfx_data->last_engine_time);
+   }
+ 
++#ifdef __EMSCRIPTEN__
++  g_web_stats.limiter += limiter_timer.getSeconds();
++  Timer swap_timer;
++#endif
+   {
+     auto p = scoped_prof("swap-buffers");
+     SDL_GL_SwapWindow(m_window);
+   }
++#ifdef __EMSCRIPTEN__
++  g_web_stats.swap += swap_timer.getSeconds();
++  g_web_stats.end_frame();
++#endif
+ 
+   // actually wait for vsync
+   if (g_gfx_data->debug_gui.should_gl_finish()) {
+diff --git a/web/gl_web.cpp b/web/gl_web.cpp
+index 9da58f16..b3de150e 100644
+--- a/web/gl_web.cpp
++++ b/web/gl_web.cpp
+@@ -19,6 +19,7 @@
+ //                                        target): bound to GL_COPY_WRITE_BUFFER instead, and the
+ //                                        glBufferData/glBufferSubData that follow go there
+ //   glTexParameter with no texture       ignored (desktop GL sets the default texture's parameters)
++//   GL_LINEAR on a depth texture         GL_NEAREST (depth textures aren't filterable in GLES 3.0)
+ //   glMultiDrawElements                  one glDrawElements per draw
+ //   glFramebufferTexture                 glFramebufferTexture2D
+ //   glGetTexLevelParameteriv             sizes recorded when textures are created
+@@ -87,6 +88,11 @@ struct Size {
+   int w = 0, h = 0;
+ };
+ std::unordered_map<GLuint, Size> g_sizes;
++// textures with a depth format: GLES 3.0 doesn't filter them, and a depth texture with a
++// GL_LINEAR filter is incomplete (it samples as 0). The glow renderer samples its copy of the
++// depth buffer with GL_LINEAR to decide how visible each glow is: every glow came out as if
++// nothing was in front of it, even through walls and reflections.
++std::unordered_set<GLuint> g_depth_textures;
+ GLuint g_bound_2d[32];
+ int g_unit = 0;
+ 
+@@ -109,10 +115,58 @@ bool no_texture_bound(GLenum target) {
+   return map_target(target) == GL_TEXTURE_2D && !g_bound_2d[g_unit];
+ }
+ 
++bool is_depth_format(GLint internalformat) {
++  switch (internalformat) {
++    case GL_DEPTH_COMPONENT:
++    case GL_DEPTH_COMPONENT16:
++    case GL_DEPTH_COMPONENT24:
++    case GL_DEPTH_COMPONENT32F:
++    case GL_DEPTH_STENCIL:
++    case GL_DEPTH24_STENCIL8:
++    case GL_DEPTH32F_STENCIL8:
++      return true;
++    default:
++      return false;
++  }
++}
++
++void record_format(GLenum target, GLint internalformat) {
++  if (target != GL_TEXTURE_2D) {
++    return;
++  }
++  if (is_depth_format(internalformat)) {
++    g_depth_textures.insert(g_bound_2d[g_unit]);
++    // the filter may have been set before the format was known (the default min filter,
++    // GL_NEAREST_MIPMAP_LINEAR, also leaves a texture without mipmaps incomplete)
++    orig_TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
++    orig_TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
++  } else {
++    g_depth_textures.erase(g_bound_2d[g_unit]);
++  }
++}
++
++GLint filter_for_bound_texture(GLenum target, GLenum pname, GLint param) {
++  if ((pname != GL_TEXTURE_MIN_FILTER && pname != GL_TEXTURE_MAG_FILTER) ||
++      map_target(target) != GL_TEXTURE_2D || !g_depth_textures.count(g_bound_2d[g_unit])) {
++    return param;
++  }
++  switch (param) {
++    case GL_LINEAR:
++      return GL_NEAREST;
++    case GL_LINEAR_MIPMAP_LINEAR:
++    case GL_LINEAR_MIPMAP_NEAREST:
++    case GL_NEAREST_MIPMAP_LINEAR:
++      return GL_NEAREST_MIPMAP_NEAREST;
++    default:
++      return param;
++  }
++}
++
+ void APIENTRY web_TexParameteri(GLenum target, GLenum pname, GLint param) {
+   if (no_texture_bound(target)) {
+     return;
+   }
++  param = filter_for_bound_texture(target, pname, param);
+   orig_TexParameteri(map_target(target), pname, param);
+ }
+ 
+@@ -120,6 +174,7 @@ void APIENTRY web_TexParameterf(GLenum target, GLenum pname, GLfloat param) {
+   if (no_texture_bound(target)) {
+     return;
+   }
++  param = (GLfloat)filter_for_bound_texture(target, pname, (GLint)param);
+   orig_TexParameterf(map_target(target), pname, param);
+ }
+ 
+@@ -157,6 +212,9 @@ void APIENTRY web_TexImage2D(GLenum target,
+     }
+     type = GL_UNSIGNED_BYTE;
+   }
++  if (level == 0) {
++    record_format(target, internalformat);
++  }
+   orig_TexImage2D(target, level, internalformat, w, h, border, format, map_type(type), data);
+ }
+ 
+@@ -177,6 +235,7 @@ void APIENTRY web_TexStorage2D(GLenum target, GLsizei levels, GLenum fmt, GLsize
+   if (target == GL_TEXTURE_2D) {
+     g_sizes[g_bound_2d[g_unit]] = {w, h};
+   }
++  record_format(target, fmt);
+   orig_TexStorage2D(target, levels, fmt, w, h);
+ }
+ 
+-- 
+2.50.1 (Apple Git-155)
+
