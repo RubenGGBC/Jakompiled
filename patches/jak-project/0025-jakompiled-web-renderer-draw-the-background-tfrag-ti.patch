@@ -1,0 +1,161 @@
+From a24e7e2870ede823c0a3bd04833bc4d827444db5 Mon Sep 17 00:00:00 2001
+From: RubenGGBC <rgallego007@ikasle.ehu.eus>
+Date: Thu, 8 Oct 2026 11:46:18 +0200
+Subject: [PATCH] jakompiled: web renderer: draw the background (tfrag, tie,
+ shrub, hfrag)
+
+WebGL 2 rejected every draw of the background renderers: their shaders
+declare the time of day index (and hfrag's uv and vi) as int/ivec, while the
+renderers pass unsigned data (glVertexAttribIPointer with GL_UNSIGNED_*).
+Desktop GL accepts it; WebGL 2 requires the base types to match. The GLSL ES
+versions declare them unsigned and convert them (web/glsl_es.py).
+
+gl_web.cpp: GL_UNSIGNED_INT_8_8_8_8 (the time of day textures, allocated
+without data) and the unsized GL_RED, GL_RG and GL_DEPTH_COMPONENT internal
+formats (animated textures, glow depth) become types WebGL 2 accepts.
+---
+ .../opengl_renderer/shaders_es/jak2/etie.vert |  3 ++-
+ .../shaders_es/jak2/etie_base.vert            |  3 ++-
+ .../shaders_es/jak2/hfrag.vert                |  9 +++++---
+ .../shaders_es/jak2/shrub.vert                |  3 ++-
+ .../shaders_es/jak2/tfrag3.vert               |  3 ++-
+ .../shaders_es/jak2/tie_wind.vert             |  3 ++-
+ web/gl_web.cpp                                | 21 +++++++++++++++++++
+ 7 files changed, 37 insertions(+), 8 deletions(-)
+
+diff --git a/game/graphics/opengl_renderer/shaders_es/jak2/etie.vert b/game/graphics/opengl_renderer/shaders_es/jak2/etie.vert
+index d1d3128d..895772c5 100644
+--- a/game/graphics/opengl_renderer/shaders_es/jak2/etie.vert
++++ b/game/graphics/opengl_renderer/shaders_es/jak2/etie.vert
+@@ -19,7 +19,8 @@ out vec3 tex_coord;
+ out vec4 fragment_color;
+ layout(location = 4) in vec4 proto_tint;
+ layout(location = 1) in vec3 tex_coord_in;
+-layout(location = 2) in int time_of_day_index;
++layout(location = 2) in uint time_of_day_index_u;
++#define time_of_day_index int(time_of_day_index_u)
+ 
+ void main()
+ {
+diff --git a/game/graphics/opengl_renderer/shaders_es/jak2/etie_base.vert b/game/graphics/opengl_renderer/shaders_es/jak2/etie_base.vert
+index 2be5a94d..3e4fba27 100644
+--- a/game/graphics/opengl_renderer/shaders_es/jak2/etie_base.vert
++++ b/game/graphics/opengl_renderer/shaders_es/jak2/etie_base.vert
+@@ -14,7 +14,8 @@ uniform float fog_constant;
+ layout(location = 0) in vec3 position_in;
+ out float fogginess;
+ out vec4 fragment_color;
+-layout(location = 2) in int time_of_day_index;
++layout(location = 2) in uint time_of_day_index_u;
++#define time_of_day_index int(time_of_day_index_u)
+ out vec3 tex_coord;
+ layout(location = 1) in vec3 tex_coord_in;
+ 
+diff --git a/game/graphics/opengl_renderer/shaders_es/jak2/hfrag.vert b/game/graphics/opengl_renderer/shaders_es/jak2/hfrag.vert
+index 183eba7d..1f74602d 100644
+--- a/game/graphics/opengl_renderer/shaders_es/jak2/hfrag.vert
++++ b/game/graphics/opengl_renderer/shaders_es/jak2/hfrag.vert
+@@ -9,13 +9,16 @@ uniform highp sampler2D tex_T10;
+ uniform float fog_constant;
+ uniform float fog_hack_threshold;
+ 
+-layout(location = 3) in int vi;
++layout(location = 3) in uint vi_u;
++#define vi int(vi_u)
+ out vec2 tex_coord;
+-layout(location = 2) in ivec2 uv;
++layout(location = 2) in uvec2 uv_u;
++#define uv ivec2(uv_u)
+ layout(location = 0) in float position_in;
+ out float fogginess;
+ out vec4 fragment_color;
+-layout(location = 1) in int time_of_day_index;
++layout(location = 1) in uint time_of_day_index_u;
++#define time_of_day_index int(time_of_day_index_u)
+ 
+ void main()
+ {
+diff --git a/game/graphics/opengl_renderer/shaders_es/jak2/shrub.vert b/game/graphics/opengl_renderer/shaders_es/jak2/shrub.vert
+index cbea3396..e4b97248 100644
+--- a/game/graphics/opengl_renderer/shaders_es/jak2/shrub.vert
++++ b/game/graphics/opengl_renderer/shaders_es/jak2/shrub.vert
+@@ -14,7 +14,8 @@ layout(location = 0) in vec3 position_in;
+ out float fogginess;
+ out vec4 fragment_color;
+ layout(location = 2) in vec3 rgba_base;
+-layout(location = 3) in int time_of_day_index;
++layout(location = 3) in uint time_of_day_index_u;
++#define time_of_day_index int(time_of_day_index_u)
+ out vec3 tex_coord;
+ layout(location = 1) in vec3 tex_coord_in;
+ 
+diff --git a/game/graphics/opengl_renderer/shaders_es/jak2/tfrag3.vert b/game/graphics/opengl_renderer/shaders_es/jak2/tfrag3.vert
+index 4b73ec16..cbab2a02 100644
+--- a/game/graphics/opengl_renderer/shaders_es/jak2/tfrag3.vert
++++ b/game/graphics/opengl_renderer/shaders_es/jak2/tfrag3.vert
+@@ -13,7 +13,8 @@ uniform float fog_constant;
+ layout(location = 0) in vec3 position_in;
+ out float fogginess;
+ out vec4 fragment_color;
+-layout(location = 2) in int time_of_day_index;
++layout(location = 2) in uint time_of_day_index_u;
++#define time_of_day_index int(time_of_day_index_u)
+ out vec3 tex_coord;
+ layout(location = 1) in vec3 tex_coord_in;
+ 
+diff --git a/game/graphics/opengl_renderer/shaders_es/jak2/tie_wind.vert b/game/graphics/opengl_renderer/shaders_es/jak2/tie_wind.vert
+index f722f30c..f008bbc1 100644
+--- a/game/graphics/opengl_renderer/shaders_es/jak2/tie_wind.vert
++++ b/game/graphics/opengl_renderer/shaders_es/jak2/tie_wind.vert
+@@ -11,7 +11,8 @@ uniform int decal;
+ layout(location = 0) in vec3 position_in;
+ out float fogginess;
+ out vec4 fragment_color;
+-layout(location = 2) in int time_of_day_index;
++layout(location = 2) in uint time_of_day_index_u;
++#define time_of_day_index int(time_of_day_index_u)
+ out vec3 tex_coord;
+ layout(location = 1) in vec3 tex_coord_in;
+ 
+diff --git a/web/gl_web.cpp b/web/gl_web.cpp
+index 02458560..0df67fa8 100644
+--- a/web/gl_web.cpp
++++ b/web/gl_web.cpp
+@@ -10,6 +10,9 @@
+ //                                        sampler2D by web/glsl_es.py, with y = 0)
+ //   GL_UNSIGNED_INT_8_8_8_8_REV          with GL_RGBA it's the same bytes as GL_UNSIGNED_BYTE on a
+ //                                        little-endian machine
++//   GL_UNSIGNED_INT_8_8_8_8              only to allocate textures without data (the time of day
++//                                        colors of tfrag, tie, shrub and hfrag): GL_UNSIGNED_BYTE
++//   unsized GL_RED, GL_RG, GL_DEPTH_COMPONENT internal formats  their sized versions
+ //   glMultiDrawElements                  one glDrawElements per draw
+ //   glFramebufferTexture                 glFramebufferTexture2D
+ //   glGetTexLevelParameteriv             sizes recorded when textures are created
+@@ -105,6 +108,24 @@ void APIENTRY web_TexImage2D(GLenum target,
+   if (target == GL_TEXTURE_2D && level == 0) {
+     g_sizes[g_bound_2d[g_unit]] = {w, h};
+   }
++  // WebGL 2 only accepts the unsized internal formats RGB, RGBA, LUMINANCE(_ALPHA) and ALPHA
++  if (internalformat == GL_RED && type == GL_UNSIGNED_BYTE) {
++    internalformat = GL_R8;
++  } else if (internalformat == GL_RG && type == GL_UNSIGNED_BYTE) {
++    internalformat = GL_RG8;
++  } else if (internalformat == GL_DEPTH_COMPONENT) {
++    internalformat = type == GL_FLOAT ? GL_DEPTH_COMPONENT32F
++                     : type == GL_UNSIGNED_SHORT ? GL_DEPTH_COMPONENT16
++                                                 : GL_DEPTH_COMPONENT24;
++  }
++  if (type == GL_UNSIGNED_INT_8_8_8_8) {
++    // WebGL 2 rejects it, and the texture is never created (texelFetch returns black). Without
++    // data the byte order doesn't matter; with data the bytes would have to be swapped.
++    if (data) {
++      lg::warn("jakompiled: glTexImage2D with GL_UNSIGNED_INT_8_8_8_8 data isn't supported");
++    }
++    type = GL_UNSIGNED_BYTE;
++  }
+   orig_TexImage2D(target, level, internalformat, w, h, border, format, map_type(type), data);
+ }
+ 
+-- 
+2.50.1 (Apple Git-155)
+

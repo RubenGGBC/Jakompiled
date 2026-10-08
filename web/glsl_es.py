@@ -39,7 +39,35 @@ placeholders = {
 NOPERSPECTIVE_W_IS_ONE = {"sky"}  # sky.vert: gl_Position = vec4(..., 1.0)
 
 
-def postprocess(name, out):
+# Atributos que el shader declara con signo (int, ivecN) pero que el renderer pasa sin signo
+# (glVertexAttribIPointer con GL_UNSIGNED_BYTE/SHORT/INT). OpenGL de escritorio lo acepta; WebGL 2
+# exige que el tipo base coincida y rechaza el draw (GL_INVALID_OPERATION: "Vertex shader input type
+# does not match the type of the bound vertex attribute"): se declaran sin signo y se convierten.
+UNSIGNED_ATTRIBUTES = {
+    "tfrag3": ["time_of_day_index"],  # Tfrag3, Tie3: GL_UNSIGNED_SHORT
+    "etie": ["time_of_day_index"],
+    "etie_base": ["time_of_day_index"],
+    "tie_wind": ["time_of_day_index"],
+    "shrub": ["time_of_day_index"],  # Shrub: GL_UNSIGNED_SHORT
+    "hfrag": ["time_of_day_index", "uv", "vi"],  # Hfrag: GL_UNSIGNED_SHORT, _BYTE, _INT
+}
+
+
+def unsigned_attributes(name, out):
+    for attr in UNSIGNED_ATTRIBUTES.get(name, []):
+        pattern = r"(layout\(location = \d+\) in )(int|ivec([234])) " + attr + r";\n"
+        m = re.search(pattern, out)
+        if not m:
+            return None, f"no encuentro el atributo {attr}"
+        utype = "uint" if m.group(2) == "int" else "uvec" + m.group(3)
+        out = out[:m.start()] + f"{m.group(1)}{utype} {attr}_u;\n#define {attr} {m.group(2)}({attr}_u)\n" + out[m.end():]
+    return out, None
+
+
+def postprocess(name, stage, out):
+    out, err = unsigned_attributes(name, out) if stage == "vert" else (out, None)
+    if out is None:
+        return None, err
     if "noperspective" not in out:
         return out, None
     if name not in NOPERSPECTIVE_W_IS_ONE:
@@ -79,7 +107,7 @@ with tempfile.TemporaryDirectory() as tmp:
             continue
         out, err = translate(os.path.join(src_dir, name), m.group(2), tmp)
         if out is not None:
-            out, err = postprocess(m.group(1), out)
+            out, err = postprocess(m.group(1), m.group(2), out)
         if out is None:
             failed += 1
             print(f"== {name}\n{err}")
