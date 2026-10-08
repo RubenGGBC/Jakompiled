@@ -68,3 +68,5 @@ Para parar el servidor, cierra la ventana negra (Terminal o símbolo del sistema
 - La pestaña se cierra o se queda sin memoria: dímelo con lo último que salió en el registro.
 
 Actualización 0031: corregida la retención de pilas de procesos suspendidos. Si ya tienes la ISO extraída, abre `http://localhost:8080/extract.html?steps=build` y selecciona de nuevo tu ISO para iniciar la reconstrucción e incorporar el nuevo kernel, reutilizando los datos de OPFS.
+
+Guardados (0032): las partidas se conservan en localStorage de este navegador y origen. Usa siempre el mismo perfil y `http://localhost:8080`. No borres los datos de este sitio si quieres conservar las partidas. Cuando se confirma el guardado aparece «Partida guardada en este navegador»; si no hay espacio o se bloquea el almacenamiento, se muestra un error. No hace falta volver a extraer la ISO para esta actualización.

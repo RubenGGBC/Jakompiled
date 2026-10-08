@@ -72,3 +72,10 @@ var Module = {
   },
   onAbort: (what) => log(`[boot] abort: ${what}`),
 };
+
+window.addEventListener('jakompiled-save-status', ({detail}) => {
+  const el = document.getElementById('save-status');
+  el.hidden = false;
+  el.textContent = detail.message;
+  el.style.color = detail.kind === 'error' ? 'var(--err)' : 'var(--ok)';
+});

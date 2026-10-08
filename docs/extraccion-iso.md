@@ -67,7 +67,7 @@ Los nombres dentro de cada DGO siguen las reglas de la herramienta `dgo` de `goa
 - los DGO/CGO y textos montados en el navegador;
 - los ficheros de la ISO que el build nativo copia ahí (`STR`, `SBK`, `MUS`, `VAG`, `SCREEN1.*`): se enlazan, no se copian.
 
-Además, `out/jak2/fr3` apunta a los niveles extraídos. Sin ISO extraída, se usan los CGO servidos con la página. El directorio de usuario (ajustes y partidas guardadas) también está en OPFS, así que se conserva entre visitas.
+Además, `out/jak2/fr3` apunta a los niveles extraídos. Sin ISO extraída, se usan los CGO servidos con la página. El enlace del directorio de usuario a OPFS puede fallar si WasmFS ya creó `/home/web_user`. Desde 0032 las partidas se persisten explícitamente en localStorage y se restauran al arrancar, independientemente de ese enlace.
 
 Prueba del flujo completo en una misma sesión del navegador ([`web/tests/test-flow.mjs`](../web/tests/test-flow.mjs)), con la ISO de prueba:
 

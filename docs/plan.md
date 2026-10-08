@@ -158,3 +158,9 @@ ISO del usuario → extractor → decompilador → código .gc (GOAL)
 | Suspend de procesos complejo | Bloquea la fase 3 | Atacarlo pronto; JSPI con Asyncify de plan B |
 | Renderer dependiente de GL 4.x | Reescritura grande | Inventario en la fase 0; WebGPU si hace falta |
 | Cambios upstream en OpenGOAL | Merges costosos | Fijar una versión y rebasar por hitos |
+
+## Guardados (2026-10-09)
+
+0032 corrige las partidas que aparentaban guardarse pero desaparecían al reiniciar. Bancos en localStorage con confirmación síncrona, restauración inicial y reversión si se agota la cuota. Pruebas sin ISO cierran/reabren Chrome y verifican los bytes cargados; la partida anterior se conserva también dentro de la sesión tras un fallo. No hace falta reconstruir DGO.
+
+Validación real completada: partida guardada, Chrome cerrado y reabierto, «Game 1» visible y cargada hasta prison.

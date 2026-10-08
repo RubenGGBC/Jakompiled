@@ -103,3 +103,15 @@ Compilar desde cero necesita git, cmake, ninja, clang, nasm, python3 y emsdk 6.0
 Pruebas de continuación: `web/tests/test-web-frame-clock.mjs` (5 casos), `test-frame-pacing.mjs` (ISO en PROFILE), `test-fiber-cleanup.mjs` (kernel con `backend/tests/runtime/fiber-cleanup.gc`, sin ISO). Parches 0030 y 0031.
 
 Validación del 0031 con ISO real: DGO reconstruidos correctamente, título e introducción a 60 fps; en la cárcel, múltiples ventanas estables de 60 fps, movimiento, golpe, salto y muerte/reaparición por teclado sin excepciones registradas. AudioContext activo. Ningún mando conectado (`getGamepads`: cuatro entradas vacías). El recorrido completo más allá de la cárcel sigue pendiente.
+
+## Guardados en localStorage (2026-10-09)
+
+El usuario confirma que el juego funciona bien, pero detecta que las partidas no persistían. Reproducción sin ISO con `backend/tests/runtime/save-persistence.gc`: MC_save devolvía OK, pero al cerrar y reabrir Chrome MC_load no encontraba el banco. WasmFS puede crear `/home/web_user` antes del enlace a OPFS; EEXIST se ignoraba y dejaba la ruta en memoria.
+
+0032 restaura los bancos de localStorage al consultar la tarjeta y los persiste después de escribir/cerrar el banco. Cruce síncrono EE→hilo principal (`MAIN_THREAD_EM_ASM_INT`), donde `web/saves.js` accede a localStorage. Claves `jakompiled:saves:v1:jak2:0`…`:7`; bancos binarios en base64, sin datos de la ISO. Si localStorage falla, el juego recibe WRITE_ERROR; no se anuncia éxito. Recupera bancos existentes en OPFS si no hay copia localStorage. No cambia CODE.PAK: recargar la página basta.
+
+Pruebas: `node web/tests/test-save-storage.mjs` (3 casos); `PLAYWRIGHT=... node web/tests/test-save-persistence.mjs http://localhost:8081` con el kernel de la fixture. Secuencia real: guardar OK1 → cerrar Chrome → cargar bytes123/231 → actualizar a77/88 → cerrar Chrome → intentar actualizar a123/231 con cuota agotada WRITE_ERROR5 → cargar en la misma sesión conserva77/88 → cerrar Chrome → cargar conserva77/88. El banco del filesystem se restaura si localStorage rechaza la escritura. Revisión independiente sin hallazgos importantes pendientes. Los perfiles de prueba viven en web/work, ignorado. No borrar almacenamiento del usuario ni su perfil.
+
+El usuario confirma el 09/10/2026 que el resto funciona bien; el pendiente comunicado es la persistencia de guardados, corregida en0032.
+
+Verificación final con ISO real del0032: New Game genera «Partida guardada en este navegador»; cerrar Chrome, reabrir mismo perfil/origen, Load Game muestra «Game 1» y al elegirla vuelve a prison. Capturas y registros solo en web/work/game-validation (ignorado).

@@ -1,0 +1,155 @@
+From 0000000000000000000000000000000000000032 Mon Sep 17 00:00:00 2001
+From: Jakompiled <jakompiled@localhost>
+Date: Fri, 9 Oct 2026 00:30:00 +0200
+Subject: [PATCH] jakompiled: persist save banks in browser localStorage
+
+WasmFS can create /home/web_user before runtime_setup_fs attempts to link
+it to OPFS. EEXIST leaves save files in memory: the game reports success,
+but the next browser session cannot load the bank.
+
+Restore localStorage banks before probing the memory card. Persist each
+completed save through a synchronous main-thread proxy and only report
+success after localStorage accepts the write. Preserve native behavior.
+Recover existing OPFS banks when no localStorage bank is present.
+The page provides JakompiledSaveStorage (web/saves.js in Jakompiled).
+
+A source-only GOAL fixture saves, closes Chrome and loads the same bytes.
+A simulated quota error reports WRITE_ERROR and preserves the last save.
+No GOAL code or extracted ISO data changes are required.
+
+diff --git a/game/kernel/common/kmemcard.cpp b/game/kernel/common/kmemcard.cpp
+index 61ecde6f..07ea42e8 100644
+--- a/game/kernel/common/kmemcard.cpp
++++ b/game/kernel/common/kmemcard.cpp
+@@ -11,6 +11,9 @@
+ #include <array>
+ #include <cstdio>
+ #include <cstring>
++#ifdef __EMSCRIPTEN__
++#include <emscripten.h>
++#endif
+ 
+ #include "common/util/Assert.h"
+ #include "common/util/FileUtil.h"
+@@ -154,7 +157,14 @@ u32 mc_checksum(Ptr<u8> data, s32 size) {
+ /*!
+  * PC port function that returns whether a given bank ID's file exists or not.
+  */
++#ifdef __EMSCRIPTEN__
++static void web_restore_saves();
++#endif
++
+ bool file_is_present(int id, int bank = 0) {
++#ifdef __EMSCRIPTEN__
++  web_restore_saves();
++#endif
+   auto bankname = mc_get_filename(g_game_version, 4 + id * 2 + bank);
+   if (!fs::exists(bankname) ||
+       int(fs::file_size(bankname)) < mc_get_total_bank_size(g_game_version)) {
+@@ -182,6 +192,59 @@ bool file_is_present(int id, int bank = 0) {
+ /*!
+  * PC port function to set memcard info. We don't use a memory card, instead just the raw savefiles.
+  */
++#ifdef __EMSCRIPTEN__
++// localStorage belongs to the browser main thread, not to the EE worker.
++// Keep banks in the runtime filesystem for the native load/checksum code.
++static bool web_saves_restored = false;
++static void web_restore_saves() {
++  if (web_saves_restored) return;
++  web_saves_restored = true;
++  const std::string game = game_version_names[g_game_version];
++  const int size = mc_get_total_bank_size(g_game_version);
++  for (int bank = 0; bank < 8; bank++) {
++    std::vector<u8> bytes(size);
++    const int loaded = MAIN_THREAD_EM_ASM_INT({
++      try {
++        const bytes = globalThis.JakompiledSaveStorage.load(UTF8ToString($0), $1, $3);
++        if (bytes === null) return 0;
++        HEAPU8.set(bytes, $2);
++        return 1;
++      } catch (e) {
++        globalThis.JakompiledSaveStorage?.error('No se pudo leer la partida local: ' + e.message);
++        return -1;
++      }
++    }, game.c_str(), bank, bytes.data(), size);
++    const auto path = mc_get_filename(g_game_version, bank + 4);
++    if (loaded == 1) {
++      file_util::create_dir_if_needed_for_file(path.string());
++      file_util::write_binary_file(path.string(), bytes.data(), bytes.size());
++    } else if (loaded == 0 && !fs::exists(path)) {
++      // Recover banks created by older builds whose user directory did reach OPFS.
++      const auto old_path = fs::path("/opfs/user/.config/OpenGOAL") / game / "saves" /
++                            mc_get_filename_no_dir(g_game_version, bank + 4);
++      if (fs::exists(old_path) && fs::file_size(old_path) == (u64)size) {
++        bytes = file_util::read_binary_file(old_path.string());
++        file_util::create_dir_if_needed_for_file(path.string());
++        file_util::write_binary_file(path.string(), bytes.data(), bytes.size());
++      }
++    }
++  }
++}
++static bool web_persist_save(const fs::path& path, int bank) {
++  const auto bytes = file_util::read_binary_file(path.string());
++  const std::string game = game_version_names[g_game_version];
++  return MAIN_THREAD_EM_ASM_INT({
++    try {
++      globalThis.JakompiledSaveStorage.save(UTF8ToString($0), $1, HEAPU8.slice($2, $2 + $3));
++      return 1;
++    } catch (e) {
++      globalThis.JakompiledSaveStorage?.error('No se pudo guardar la partida: ' + e.message);
++      return 0;
++    }
++  }, game.c_str(), bank, bytes.data(), bytes.size());
++}
++#endif
++
+ void pc_update_card() {
+   // int highest_save_count = 0;
+   mc_last_file = -1;
+@@ -253,6 +316,11 @@ void pc_game_save_synch() {
+   mc_print("open {} for saving", mc_get_filename_no_dir(g_game_version, op.param2 * 2 + 4 + p4));
+   auto save_path = mc_get_filename(g_game_version, op.param2 * 2 + 4 + p4);
+   file_util::create_dir_if_needed_for_file(save_path.string());
++#ifdef __EMSCRIPTEN__
++  const bool had_previous_bank = fs::exists(save_path);
++  const auto previous_bank = had_previous_bank ? file_util::read_binary_file(save_path.string())
++                                               : std::vector<u8>{};
++#endif
+   auto fd = file_util::open_file(save_path.string().c_str(), "wb");
+   mc_print("synchronous save file open took {:.2f}ms\n", mc_timer.getMs());
+   if (fd) {
+@@ -273,6 +341,20 @@ void pc_game_save_synch() {
+         if (fwrite(&header, sizeof(McHeader), 1, fd) == 1) {
+           // cb_savedfooter //
+           if (fclose(fd) == 0) {
++#ifdef __EMSCRIPTEN__
++            if (!web_persist_save(save_path, op.param2 * 2 + p4)) {
++              // A rejected bank must not become loadable in this session or via OPFS.
++              if (had_previous_bank) {
++                file_util::write_binary_file(save_path.string(), previous_bank.data(),
++                                             previous_bank.size());
++              } else {
++                fs::remove(save_path);
++              }
++              op.operation = MemoryCardOperationKind::NO_OP;
++              op.result = McStatusCode::WRITE_ERROR;
++              return;
++            }
++#endif
+             // cb_closedsave //
+             mc_print("All done with saving!!");
+             op.operation = MemoryCardOperationKind::NO_OP;
+diff --git a/web/runtime_fs_web.cpp b/web/runtime_fs_web.cpp
+index b29e7cb5..9b222ba9 100644
+--- a/web/runtime_fs_web.cpp
++++ b/web/runtime_fs_web.cpp
+@@ -9,7 +9,8 @@
+ //    of the ISO, which the native build copies to out/jak2/iso. Linked, not copied.
+ //  - otherwise, the CGO files served with the page (code only), which boot.js puts in /data/served
+ //
+-// The user directory (/home/web_user: settings, save games) lives in OPFS so it persists.
++// The user directory link is best-effort: WasmFS may already have created /home/web_user.
++// Save banks are persisted explicitly through localStorage by kmemcard.cpp.
+ 
+ #include <cerrno>
+ #include <cstdio>
