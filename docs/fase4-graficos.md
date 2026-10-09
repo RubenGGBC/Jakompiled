@@ -130,6 +130,43 @@ La réplica CPU de `sprite3_3d.vert` detecta quads próximos al plano de cámara
 
 No se cambia el shader sin una reproducción del fallo. La instrumentación y las capturas permanecen en `web/work/` (ignorado por git); las capturas y las trazas derivadas de la ISO no se distribuyen.
 
+### Diagnóstico opcional en macOS (Apple M1, Chrome 146)
+
+El usuario reproduce brillos defectuosos y polígonos estirados del escenario con
+`ANGLE Metal Renderer: Apple M1`, Chrome 146.0.7680.177, macOS 26.6.2.
+El usuario confirma que `split-strips` elimina los artefactos, con una bajada de
+rendimiento. Esto acota el fallo a la ruta de dibujo con primitive restart; no
+identifica por sí solo el defecto interno de ANGLE. `gpu-diagnostics.js` permite comparar modos sobre
+el mismo perfil y origen, sin recompilar ni volver a extraer la ISO:
+
+- `?boot=game&display=1&gpu-test=split-strips`: separa los draws de tiras y abanicos
+  en los índices de reinicio. Conserva orden, winding e instancias. Lee los índices
+  cuando cambia el buffer y puede reducir el rendimiento. Permite investigar la
+  ruta de primitive restart sin cambiar las posiciones de los vértices.
+- `?boot=game&display=1&gpu-test=no-sprites3d`: oculta solo los sprites de modo 3
+  del shader `sprite3_3d`, conservando sus modos 2D/HUD y el resto de shaders.
+- `?boot=game&display=1&gpu-test=triangles`: convierte las tiras/abanicos con
+  reinicios a una lista de triángulos y realiza una llamada por draw original.
+  Conserva winding y provoking vertex, guarda las conversiones por buffer/rango
+  y las libera al actualizar o eliminar el buffer. Evita repetir la lectura,
+  conversión y subida de rangos estáticos. El usuario indica caídas junto a
+  tuberías con humo, pero la inspección posterior de Chrome confirma que la
+  pestaña seguía en `split-strips`; no valida el rendimiento de `triangles`.
+  Sprite3 sube índices con `glBufferData` cada frame:
+  ahora se copian desde la fuente CPU de esa llamada, sin leerlos de la GPU.
+  Si son idénticos se conserva la conversión; `bufferSubData` actualiza la copia
+  CPU respetando offsets y longitudes de las sobrecargas usadas por Emscripten.
+  Pendiente de medir los FPS del cambio en la escena de las tuberías.
+
+El script instala los hooks también en los pthreads que ejecutan el renderer.
+Sin esos parámetros no instala hooks. Los catorce tests de
+`node --test web/tests/test-gpu-diagnostics.mjs` comprueban la redirección de
+workers, separación de índices de 8/16/32 bits, offsets, instancias, caché e
+invalidación y selección del shader, además de conversión de triángulos,
+liberación de buffers y reutilización de mil tiras en un draw. Son tests de
+lógica con WebGL simulado; queda pendiente comparar el modo `triangles` en la
+escena del usuario.
+
 ## 4.5 Ritmo de fotogramas en Windows (parche 0030)
 
 La prueba `web/tests/test-frame-pacing.mjs`, con un perfil de Chrome aislado y la ISO ya extraída, fallaba con una mediana de 39,5 fps. Las nuevas medidas completan el bucle: input, eventos, GUI y tiempo restante, además de render, limitador y presentación.

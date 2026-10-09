@@ -25,6 +25,9 @@ if (!crossOriginIsolated) {
 }
 
 const params = new URLSearchParams(location.search);
+if (['split-strips', 'no-sprites3d', 'triangles'].includes(params.get('gpu-test'))) {
+  log(`[gpu-test] Diagnóstico solicitado: ${params.get('gpu-test')}`);
+}
 const bootGame = params.get("boot") === "game";
 const display = params.get("display") === "1";
 const gameArgs = ["-fakeiso", "-nosound", ...(bootGame ? ["-boot"] : [])];

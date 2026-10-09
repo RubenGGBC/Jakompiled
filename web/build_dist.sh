@@ -8,7 +8,8 @@ set -euo pipefail
 here="$(cd "$(dirname "$0")" && pwd)"
 dist="$here/dist"
 rm -rf "$dist" && mkdir -p "$dist/data"
-cp "$here/index.html" "$here/boot.js" "$here/extract.html" "$here/extract-worker.js" "$dist/"
+cp "$here/index.html" "$here/boot.js" "$here/player.js" "$here/saves.js" \
+  "$here/gpu-diagnostics.js" "$here/extract.html" "$here/extract-worker.js" "$dist/"
 cp "$JAK_WEB/build-web/game/gk.js" "$JAK_WEB/build-web/game/gk.wasm" "$dist/"
 cp "$JAK_WEB/build-web64/extractor.js" "$JAK_WEB/build-web64/extractor.wasm" "$dist/"
 cp "$JAK_PROJECT/out/jak2/iso/KERNEL.CGO" "$dist/data/"
