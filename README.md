@@ -7,6 +7,7 @@ OpenGOAL (Jak and Daxter 1–3) en el navegador con WebAssembly.
 **Estado (Jak II, ISO NTSC v2.01):** desde la ISO hasta el juego, todo en el navegador. La ISO se extrae en el navegador, los DGO se montan con el código compilado a wasm, y el juego arranca: intro, pantalla de título, menú, New Game, cinemáticas y la cárcel, con escenario, personajes y efectos, jugable con teclado y con sonido. Sin errores de WebGL hasta la cárcel. Falta probar el mando y más allá de la cárcel.
 
 - [Plan](docs/plan.md)
+- [Plan para Jak 3](docs/plan-jak3.md): medición inicial (1.033 objetos de código, 1.450 funciones por portar) y fases
 - [Fase 0: mapa del pipeline e inventario](docs/fase0-inventario.md)
 - [Fase 1: medición de riesgo de rendimiento](docs/fase1-benchmark.md): peor caso ~2x, se puede seguir
 - [Fase 2: el runtime en el navegador](docs/fase2-runtime.md): `gk` arranca en Chromium y carga `KERNEL.CGO`
